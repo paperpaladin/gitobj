@@ -72,5 +72,77 @@ eq "hash blob via stdin" \
 refute "hash rejects an unknown type" "$GITOBJ" hash frobnicate "$TMP/fix/hello"
 
 # =====================================================================
+# 2. reading loose objects: git cat-file is the authority
+# =====================================================================
+# The corpora are real histories. They are COPIED here rather than read in
+# place: anything in this suite that repacks would otherwise be writing into
+# a sibling repository's .git, and a reader has no business doing that.
+CORPUS_SMALL="cc tarx inflate"
+CORPUS_BIG="psh unrepro cmark httpd wasmi notally-molly"
+copy_corpus() {
+	local r
+	for r in "$@"; do
+		[ -d "$ROOT/../$r/.git" ] || continue
+		mkdir -p "$TMP/corpus"
+		cp -r "$ROOT/../$r/.git" "$TMP/corpus/$r" 2>/dev/null
+		chmod -R u+rw "$TMP/corpus/$r"
+		echo "$r"
+	done
+}
+HAVE_SMALL=$(copy_corpus $CORPUS_SMALL)
+
+# Every loose object in the small corpora, all four fields, against git.
+# `git cat-file <type> <sha>` prints the RAW payload for any type, which is
+# what `gitobj raw` must reproduce byte for byte -- including for trees,
+# whose raw form is binary and whose `-p` form is not.
+loose_shas() {
+	# -regextype matters: find's default is emacs regex, where "+" is a
+	# LITERAL plus, so the default-syntax version of this matched nothing
+	# useful and quietly handed the pack .idx/.rev files to git as object
+	# names. The guard below is what caught it.
+	find "$1/objects" -type f -regextype posix-extended \
+		-regex '.*/objects/[0-9a-f]{2}/[0-9a-f]{38}' 2>/dev/null |
+		sed -E 's|.*/([0-9a-f]{2})/([0-9a-f]+)$|\1\2|' | sort
+}
+
+nloose=0
+for r in $HAVE_SMALL; do
+	G="$TMP/corpus/$r"
+	OD="$G/objects"
+	for sha in $(loose_shas "$G"); do
+		nloose=$((nloose+1))
+		t=$("$GITOBJ" type "$OD" "$sha")
+		gt=$($GIT --git-dir="$G" cat-file -t "$sha")
+		eq "type $r/$sha" "$t" "$gt"
+		eq "size $r/$sha" "$("$GITOBJ" size "$OD" "$sha")" \
+			"$($GIT --git-dir="$G" cat-file -s "$sha")"
+		"$GITOBJ" raw "$OD" "$sha" > "$TMP/ours" 2>/dev/null
+		$GIT --git-dir="$G" cat-file "$gt" "$sha" > "$TMP/theirs"
+		assert "raw $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
+	done
+done
+[ "$nloose" -ge 20 ] && ok || no "only $nloose loose objects in the small corpora"
+
+# Refusals. A loose object file is one zlib stream and nothing else, so each
+# of these is a distinct lie about the bytes.
+OD2=$SCRATCH/.git/objects
+hb=$($SG hash-object -w --stdin < "$TMP/fix/hello")
+HBPATH="$OD2/${hb:0:2}/${hb:2}"
+mkdir -p "$TMP/bad/objects/ab"
+head -c 10 "$HBPATH" > "$TMP/bad/objects/ab/${hb:2}"
+refute "a truncated loose object is refused" \
+	"$GITOBJ" raw "$TMP/bad/objects" "ab${hb:2}"
+cp "$HBPATH" "$TMP/bad/objects/ab/${hb:2}"
+printf 'junk' >> "$TMP/bad/objects/ab/${hb:2}"
+refute "trailing bytes after the zlib stream are refused" \
+	"$GITOBJ" raw "$TMP/bad/objects" "ab${hb:2}"
+printf 'not a zlib stream at all' > "$TMP/bad/objects/ab/${hb:2}"
+refute "a non-zlib loose object is refused" \
+	"$GITOBJ" raw "$TMP/bad/objects" "ab${hb:2}"
+refute "a short object name is refused" "$GITOBJ" type "$OD2" "${hb:0:7}"
+refute "a missing object is refused" "$GITOBJ" type "$OD2" \
+	0000000000000000000000000000000000000000
+
+# =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
