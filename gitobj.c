@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 /* shortcut: die() exits without freeing, so LeakSanitizer flags it. Every
  * caller is an out-of-memory, I/O or refusal path with no useful recovery;
@@ -542,11 +543,61 @@ static void obj_read(const char *objdir, const char *hex, Obj *out) {
 	die2("object not found", hex);
 }
 
+/* ------------------------------------------------- enumerating the store */
+
+typedef struct { char (*v)[41]; size_t n, cap; } Names;
+
+static void nadd(Names *s, const char *hex) {
+	if (s->n == s->cap) {
+		s->cap = s->cap ? s->cap * 2 : 256;
+		char (*q)[41] = realloc(s->v, s->cap * 41);
+		if (!q) die("out of memory");
+		s->v = q;
+	}
+	memcpy(s->v[s->n++], hex, 41);
+}
+
+static int ishex(const char *s, size_t n) {
+	for (size_t i = 0; i < n; i++) if (unhex1((unsigned char)s[i]) < 0) return 0;
+	return s[n] == 0;
+}
+
+/* Every loose object under objdir, by name. The two-hex-digit fan-out
+ * directory is part of the name, which is why both halves are checked: a
+ * stray file in objects/ab/ that is not 38 hex characters is not an object
+ * and must not be reported as a broken one. */
+static void loose_names(const char *objdir, Names *out) {
+	DIR *d = opendir(objdir);
+	if (!d) die2("cannot open object directory", objdir);
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		if (strlen(e->d_name) != 2 || !ishex(e->d_name, 2)) continue;
+		char sub[4096];
+		if ((size_t)snprintf(sub, sizeof sub, "%s/%s", objdir, e->d_name) >= sizeof sub)
+			continue;
+		DIR *d2 = opendir(sub);
+		if (!d2) continue;
+		struct dirent *f;
+		while ((f = readdir(d2))) {
+			if (strlen(f->d_name) != 38 || !ishex(f->d_name, 38)) continue;
+			char hex[41];
+			memcpy(hex, e->d_name, 2);
+			memcpy(hex + 2, f->d_name, 39);
+			nadd(out, hex);
+		}
+		closedir(d2);
+	}
+	closedir(d);
+}
+
+static int cmpname(const void *a, const void *b) { return strcmp(a, b); }
+
 /* ------------------------------------------------------------------ main */
 
 static int usage(void) {
 	fputs("usage: gitobj hash <type> [file]\n"
-	      "       gitobj cat|raw|type|size <objdir> <sha>\n", stderr);
+	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
+	      "       gitobj ls|verify <objdir>\n", stderr);
 	return 2;
 }
 
@@ -578,6 +629,38 @@ int main(int argc, char **argv) {
 		else writeall(o.data.p, o.data.n);
 		bfree(&o.data);
 		return 0;
+	}
+
+	if (argc == 3 && (!strcmp(cmd, "ls") || !strcmp(cmd, "verify"))) {
+		int vfy = !strcmp(cmd, "verify");
+		Names ns = {0};
+		loose_names(argv[2], &ns);
+		qsort(ns.v, ns.n, 41, cmpname);
+		size_t bad = 0;
+		for (size_t i = 0; i < ns.n; i++) {
+			Obj o = {0, {0}};
+			obj_read(argv[2], ns.v[i], &o);
+			if (vfy) {
+				/* The hard invariant. The name is a SHA-1 over the whole
+				 * serialisation, so this one comparison covers the zlib
+				 * stream, the header, the length field and (later) every
+				 * delta instruction underneath. */
+				uint8_t id[20];
+				char hex[41];
+				objid(o.type, o.data.p, o.data.n, id);
+				hexify(id, hex);
+				if (strcmp(hex, ns.v[i])) {
+					printf("MISMATCH %s hashes to %s\n", ns.v[i], hex);
+					bad++;
+				}
+			} else {
+				printf("%s %s %zu\n", ns.v[i], tname(o.type), o.data.n);
+			}
+			bfree(&o.data);
+		}
+		if (vfy) printf("%zu objects, %zu mismatched\n", ns.n, bad);
+		free(ns.v);
+		return bad ? 1 : 0;
 	}
 
 	return usage();
