@@ -543,6 +543,105 @@ static void obj_read(const char *objdir, const char *hex, Obj *out) {
 	die2("object not found", hex);
 }
 
+/* ------------------------------------------------------------------ trees */
+
+/* A tree is a packed sequence of
+ *
+ *     <mode, octal ASCII, no leading zero> SP <name> NUL <20 raw bytes>
+ *
+ * and nothing else: no count, no terminator, no padding. The mode is where
+ * the surprises are. It is octal but written without the leading zero, so a
+ * directory is "40000" in the object and "040000" in every human-facing
+ * listing; git prints %06o, which is why the two differ.
+ */
+typedef struct {
+	unsigned mode;
+	const char *name;
+	const uint8_t *id;
+} Tent;
+
+/* Decode the entry at *off, advancing it. Returns NULL on success. */
+static const char *tree_next(const uint8_t *p, size_t n, size_t *off, Tent *e) {
+	size_t i = *off;
+	size_t m0 = i;
+	while (i < n && p[i] >= '0' && p[i] <= '7') i++;
+	if (i == m0) return "tree entry has no octal mode";
+	if (i - m0 > 6) return "tree entry mode is too long";
+	if (i >= n || p[i] != ' ') return "tree entry mode is not followed by a space";
+	unsigned mode = 0;
+	for (size_t k = m0; k < i; k++) mode = mode * 8 + (unsigned)(p[k] - '0');
+	i++;
+	size_t nm = i;
+	while (i < n && p[i]) i++;
+	if (i >= n) return "tree entry name is not NUL-terminated";
+	if (i == nm) return "tree entry has an empty name";
+	if (memchr(p + nm, '/', i - nm)) return "tree entry name contains a slash";
+	if (n - i - 1 < 20) return "tree entry is missing its object name";
+	e->mode = mode;
+	e->name = (const char *)p + nm;
+	e->id = p + i + 1;
+	*off = i + 1 + 20;
+	return NULL;
+}
+
+/* What git calls the entry, which is a function of the mode and not stored:
+ * 040000 is a tree, 160000 is a gitlink and therefore a commit, and
+ * everything else (100644, 100755, 120000) is a blob. */
+static const char *tree_entry_type(unsigned mode) {
+	if ((mode & 0170000) == 0040000) return "tree";
+	if ((mode & 0170000) == 0160000) return "commit";
+	return "blob";
+}
+
+/* git quote.c quote_c_style, which is what `cat-file -p` on a tree reaches
+ * through ls-tree: if any byte of the name needs escaping the whole name is
+ * wrapped in double quotes, with C escapes for the seven named control
+ * characters, a backslash or a quote, and three-digit octal for everything
+ * else outside printable ASCII.
+ *
+ * shortcut: this is core.quotePath=true, git's default, hard-coded. We do not
+ * read config, so `-c core.quotePath=false` (which prints UTF-8 names raw)
+ * cannot be reproduced. Read .git/config if that ever matters.
+ *
+ * Found by the oracle, not by reading the format: our first version printed
+ * the name raw and disagreed with git on every non-ASCII filename. */
+static void print_quoted_name(const char *s, size_t n) {
+	static const char named[] = "\a\b\t\n\v\f\r";
+	size_t need = 0;
+	for (size_t i = 0; i < n; i++) {
+		unsigned c = (unsigned char)s[i];
+		if (c < 0x20 || c > 0x7e || c == '"' || c == '\\') { need = 1; break; }
+	}
+	if (!need) { fwrite(s, 1, n, stdout); return; }
+	putchar('"');
+	for (size_t i = 0; i < n; i++) {
+		unsigned c = (unsigned char)s[i];
+		const char *k = c && c < 0x20 ? memchr(named, (int)c, 7) : NULL;
+		if (c == '"' || c == '\\') { putchar('\\'); putchar((int)c); }
+		else if (k) { putchar('\\'); putchar("abtnvfr"[k - named]); }
+		else if (c >= 0x20 && c <= 0x7e) putchar((int)c);
+		else printf("\\%03o", c);
+	}
+	putchar('"');
+}
+
+/* `git cat-file -p` on a tree. The mode is printed %06o -- six digits with
+ * the leading zero restored -- and the name is separated by a TAB, not a
+ * space, which matters because a name may contain spaces. */
+static void tree_print(const uint8_t *p, size_t n) {
+	size_t off = 0;
+	while (off < n) {
+		Tent e;
+		const char *err = tree_next(p, n, &off, &e);
+		if (err) die(err);
+		char hex[41];
+		hexify(e.id, hex);
+		printf("%06o %s %s\t", e.mode, tree_entry_type(e.mode), hex);
+		print_quoted_name(e.name, strlen(e.name));
+		putchar('\n');
+	}
+}
+
 /* ------------------------------------------------- enumerating the store */
 
 typedef struct { char (*v)[41]; size_t n, cap; } Names;
@@ -626,6 +725,8 @@ int main(int argc, char **argv) {
 		obj_read(argv[2], argv[3], &o);
 		if (!strcmp(cmd, "type")) printf("%s\n", tname(o.type));
 		else if (!strcmp(cmd, "size")) printf("%zu\n", o.data.n);
+		else if (!strcmp(cmd, "cat") && o.type == T_TREE)
+			tree_print(o.data.p, o.data.n);
 		else writeall(o.data.p, o.data.n);
 		bfree(&o.data);
 		return 0;
