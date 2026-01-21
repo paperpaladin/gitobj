@@ -642,6 +642,72 @@ static void tree_print(const uint8_t *p, size_t n) {
 	}
 }
 
+/* ----------------------------------------------------- commits and tags */
+
+/* Commits and tags share one shape: a block of "<key> SP <value> LF" header
+ * lines, a single empty line, then the message verbatim to the end of the
+ * object. Two details are where implementations part company.
+ *
+ * Folding. A header value may continue onto following lines, each of which
+ * begins with one space that is NOT part of the value. This is how "gpgsig"
+ * carries a whole PGP armor block, and it is why the blank line inside that
+ * armor is stored as a line containing exactly one space -- so the "LF LF"
+ * that ends the header block is still unambiguous. A parser that splits on
+ * the first blank line without understanding folding gets the right answer
+ * only because git was careful here.
+ *
+ * The message. It is bytes, not text: CRLF line endings and trailing
+ * whitespace are part of the object and part of its name, so nothing here
+ * trims, re-encodes or normalises anything. The "encoding" header says what
+ * those bytes mean; it does not change them.
+ */
+
+/* Offset of the message, i.e. one past the empty line. Returns n if the
+ * object is all headers and has no message at all. */
+static size_t msg_start(const uint8_t *p, size_t n) {
+	size_t i = 0;
+	while (i < n) {
+		const uint8_t *eol = memchr(p + i, '\n', n - i);
+		if (!eol) die("commit/tag header line is not LF-terminated");
+		if (eol == p + i) return i + 1;
+		i = (size_t)(eol - p) + 1;
+	}
+	return n;
+}
+
+/* Print every value of one header, unfolded, one per line. Returns how many
+ * were found: "parent" legitimately appears zero times (a root commit) or
+ * many (a merge), so the count is the answer and not an error. */
+static int hdr_print(const uint8_t *p, size_t n, const char *key) {
+	size_t klen = strlen(key), i = 0, end = msg_start(p, n);
+	int found = 0;
+	while (i < end) {
+		const uint8_t *eol = memchr(p + i, '\n', end - i);
+		if (!eol) break;
+		size_t len = (size_t)(eol - (p + i));
+		if (!len) break;
+		const uint8_t *sp = memchr(p + i, ' ', len);
+		if (!sp) die("commit/tag header line has no space after its key");
+		size_t thisk = (size_t)(sp - (p + i));
+		int match = thisk == klen && !memcmp(p + i, key, klen);
+		size_t vs = (size_t)(sp - p) + 1, ve = (size_t)(eol - p);
+		i = ve + 1;
+		if (match) { found++; writeall(p + vs, ve - vs); }
+		/* Continuation lines: one leading space, stripped. */
+		while (i < end && p[i] == ' ') {
+			const uint8_t *e2 = memchr(p + i, '\n', end - i);
+			if (!e2) die("folded header line is not LF-terminated");
+			if (match) {
+				putchar('\n');
+				writeall(p + i + 1, (size_t)(e2 - p) - i - 1);
+			}
+			i = (size_t)(e2 - p) + 1;
+		}
+		if (match) putchar('\n');
+	}
+	return found;
+}
+
 /* ------------------------------------------------- enumerating the store */
 
 typedef struct { char (*v)[41]; size_t n, cap; } Names;
@@ -696,7 +762,9 @@ static int cmpname(const void *a, const void *b) { return strcmp(a, b); }
 static int usage(void) {
 	fputs("usage: gitobj hash <type> [file]\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
-	      "       gitobj ls|verify <objdir>\n", stderr);
+	      "       gitobj ls|verify <objdir>\n"
+	      "       gitobj hdr <objdir> <sha> <key>\n"
+	      "       gitobj msg <objdir> <sha>\n", stderr);
 	return 2;
 }
 
@@ -730,6 +798,27 @@ int main(int argc, char **argv) {
 		else writeall(o.data.p, o.data.n);
 		bfree(&o.data);
 		return 0;
+	}
+
+	if (!strcmp(cmd, "msg") && argc == 4) {
+		Obj o = {0, {0}};
+		obj_read(argv[2], argv[3], &o);
+		if (o.type != T_COMMIT && o.type != T_TAG)
+			die2("not a commit or tag", argv[3]);
+		size_t m = msg_start(o.data.p, o.data.n);
+		writeall(o.data.p + m, o.data.n - m);
+		bfree(&o.data);
+		return 0;
+	}
+
+	if (!strcmp(cmd, "hdr") && argc == 5) {
+		Obj o = {0, {0}};
+		obj_read(argv[2], argv[3], &o);
+		if (o.type != T_COMMIT && o.type != T_TAG)
+			die2("not a commit or tag", argv[3]);
+		int found = hdr_print(o.data.p, o.data.n, argv[4]);
+		bfree(&o.data);
+		return found ? 0 : 1;
 	}
 
 	if (argc == 3 && (!strcmp(cmd, "ls") || !strcmp(cmd, "verify"))) {
