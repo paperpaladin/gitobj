@@ -7,8 +7,6 @@ libraries, no shelling out to git.
 
 ```
 gitobj hash   <type> [FILE]            name an object without storing it
-gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
-gitobj mktree <objdir>                 git-mktree format on stdin
 gitobj cat    <objdir> <sha>           like `git cat-file -p`
 gitobj raw    <objdir> <sha>           the payload bytes, no pretty-printing
 gitobj type   <objdir> <sha>
@@ -17,6 +15,11 @@ gitobj hdr    <objdir> <sha> <key>     a commit/tag header's value(s)
 gitobj msg    <objdir> <sha>           a commit/tag message, byte-exact
 gitobj ls     <objdir>                 every object: sha, type, size
 gitobj verify <objdir>                 hash every object against its own name
+
+Planned and NOT PRESENT -- these were listed above as though they existed:
+
+gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
+gitobj mktree <objdir>                 git-mktree format on stdin
 gitobj packls <idx>                    `git verify-pack -v` layout
 ```
 
@@ -31,6 +34,11 @@ In scope:
   directory name carried a trailing slash, so `a.c` sorts *after* `a/`.
 * **tree entry modes**: `100644`, `100755`, `120000`, `40000` (stored without
   the leading zero) and `160000` gitlinks.
+In scope and NOT YET WRITTEN. Listed here without that qualification until
+an audit pointed out there is no pack code in `gitobj.c` at all -- the only
+trace is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum, and neither constant
+is ever read:
+
 * **packfiles**: the v2 index with its fanout table and 64-bit offset
   escape, the pack header and per-object type/size varint, and both delta
   encodings -- `OFS_DELTA` with its own distinct negative-offset varint, and
@@ -39,6 +47,7 @@ In scope:
   instruction stream, including the copy instruction's optional-byte bitmap
   where an absent byte means 0 for the offset and 0x10000 for the size.
 * **delta chains of any depth**, where a base is itself a delta.
+* **writing anything.** `gitobj` is read-only today.
 
 Exit status: 0 success, 1 refused or not found, 2 the command line was wrong.
 
@@ -49,13 +58,19 @@ SHA-1 of `<type> <len>\0<payload>`, so the name is a checksum over the entire
 decode path: the zlib stream, the loose header, the pack type/size varint, the
 OFS_DELTA offset varint, every copy and insert instruction, and every link of
 the delta chain beneath it. If a single byte of any of that is wrong the hash
-does not match. The suite asserts this for every object in every corpus
-repository, loose and packed, and it is the one assertion that cannot be
-satisfied by being self-consistently wrong.
+does not match. It is the one assertion that cannot be satisfied by being
+self-consistently wrong.
 
-**And git accepts what we write.** Objects written by `gitobj write` and
-`gitobj mktree` are read back by `git cat-file -p` and vetted by `git fsck`
-in a repository git itself created.
+**It currently covers the LOOSE objects only, which is 585 of the 2468 in
+the corpus -- 24%.** Seven of the nine corpus repositories have a packfile
+whose contents are never read, because there is no pack reader. This
+section said "loose and packed" and that was the strongest claim in the
+file and the one that was not true.
+
+**And git accepts what we write** -- planned, not present. There is no
+`gitobj write` and no `gitobj mktree`, so only one direction is tested at
+all: we read what git wrote, and nothing reads what we write because we
+write nothing.
 
 ## Oracle
 
@@ -64,30 +79,23 @@ Ranked, strongest first -- by how little of it we control.
 1. **The object name itself.** Not an oracle we wrote: git chose the filename
    and the index entry, we recompute the hash. Applies to every object in
    every corpus, with no fixtures to maintain.
-2. **`git verify-pack -v`, object by object.** It prints name, type,
-   uncompressed size, size-in-packfile, offset, delta depth and base name for
-   every object in a pack. `gitobj packls` prints the same seven fields and
-   the two outputs are diffed whole. Depth and base are the columns that
-   catch an OFS_DELTA offset decoded one byte off.
-3. **`git cat-file -p` / `-t` / `-s`, object by object.** Over every object in
-   every corpus repository. The tree pretty-printer, the mode formatting and
-   the raw commit/tag bytes are all pinned here.
-4. **git reads what we write.** `gitobj write` into a repository git created,
-   then `git cat-file -p`, then `git fsck`. `gitobj mktree` against `git
-   mktree` on the same unsorted input, which is what settles the
-   trailing-slash sort rule without us asserting our own reading of it.
-5. **`git log --format=`** for the parsed commit fields (`%T`, `%P`, `%an`,
+2. **`git cat-file -p` / `-t` / `-s`, object by object.** Over every loose
+   object in every corpus repository. The tree pretty-printer, the mode
+   formatting and the raw commit/tag bytes are all pinned here.
+3. **`git log --format=`** for the parsed commit fields (`%T`, `%P`, `%an`,
    `%ae`, `%ad --date=raw`, `%e`), and `git cat-file -p` for the message
    bytes, so CRLF and trailing whitespace are checked as bytes rather than as
    a description.
-6. **Packs repacked by git on demand**, so the suite covers encodings the
-   corpus does not happen to contain: `-c pack.useDeltaBaseOffset=false` for
-   REF_DELTA, and `--depth=50 --window=250` for chains deeper than history
-   produced naturally.
-7. **ASan + UBSan over the whole suite** (`make test-asan`), plus randomly
-   mutated packs, indexes and loose objects asserting that nothing ever dies
-   on a signal and that a delta claiming a 4GB result is refused rather than
-   allocated.
+4. **ASan + UBSan over the whole suite** (`make test-asan`).
+
+The four oracles that used to be items 2, 4, 6 and 7 of this list are gone
+from it, because none of them exists: `git verify-pack -v` against a
+`packls` that is not written, `git fsck` against a `write` that is not
+written, repacking for encodings the corpus lacks, and a mutation sweep
+over packs and indexes. They are oracles for work in the commit sequence
+below, and listing them here made the suite sound four oracles stronger
+than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh`
+returns nothing.
 
 ## Non-goals
 
@@ -122,7 +130,7 @@ Ranked, strongest first -- by how little of it we control.
 - [x] the tree parser and `git cat-file -p` pretty-printing
       why: the only object type whose `-p` output is not its raw bytes, and
       the first place the mode encoding can be wrong.
-- [ ] the commit/tag header parser: `hdr`, `msg`
+- [x] the commit/tag header parser: `hdr`, `msg`
       why: multi-line folded headers (`gpgsig`) and a byte-exact message are
       where "parses my own commits" and "parses git's" diverge.
 - [ ] loose object write: zlib stored blocks, `gitobj write`

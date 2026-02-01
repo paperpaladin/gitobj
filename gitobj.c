@@ -1,7 +1,8 @@
-/* gitobj -- a reader and writer for git's object database, in one C11 file.
+/* gitobj -- a READER for git's object database, in one C11 file.
  *
- * Loose objects, the four object types, and packfiles: the v2 index, the pack
- * format, and both delta encodings. No libgit2, no zlib, no shelling out to
+ * Loose objects and the four object types.  NOT packfiles: the v2 index, the
+ * pack format and both delta encodings are planned and absent -- see
+ * README.md, which says so first.  No libgit2, no zlib, no shelling out to
  * git. git is the authority this is measured against, never a dependency.
  *
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
