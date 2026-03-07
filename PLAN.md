@@ -108,10 +108,14 @@ returns nothing.
   40-character name only.
 * **The pack `.rev`, `.mtimes`, bitmap and multi-pack index files**, cruft
   packs, promisor/partial clones, and alternates (`objects/info/alternates`).
-* **Writing with any real compression.** Loose objects are emitted as zlib
-  stored blocks, which git reads perfectly and which grow the file by ~0.03%.
-* **Being fast.** Every object is inflated from scratch with no delta base
-  cache, so walking a pack is O(objects * chain depth) inflations.
+* **Writing with any real compression.** When there is a writer, loose
+  objects will be emitted as zlib stored blocks, which git reads perfectly and
+  which grow the file by ~0.03%. There is no writer yet: `gitobj` reads, and
+  `hash` computes a name without storing anything.
+* **Being fast.** When there is a pack reader, every object will be inflated
+  from scratch with no delta base cache, so walking a pack will be
+  O(objects * chain depth) inflations. There is no pack reader either; this
+  file says so at the top and then described both in the present tense.
 
 ## Commit sequence
 
@@ -177,18 +181,21 @@ returns nothing.
       broken, but no one would use this to write a real repository.
 - [ ] a delta base cache, so a chain of depth N costs N inflations once
       rather than N inflations per object in it
-      why: `packls` on a 1163-object pack is the slowest thing in the suite,
-      and the fix is a four-entry LRU keyed on pack offset.
+      why: `packls` on a 1163-object pack would be the slowest thing in the
+      suite, and the fix is a four-entry LRU keyed on pack offset. (`packls`
+      does not exist; see the note at the head of this file.)
 - [ ] 64-bit pack offsets exercised for real
-      why: the offset64 escape in the v2 index is implemented and *cannot
-      be tested*, because it needs a pack above 4GiB. Currently dead code
-      with a hand-built index as its only coverage.
+      why: the offset64 escape in the v2 index *cannot* be tested without a
+      pack above 4GiB, so it will need a hand-built index as its only
+      coverage. There is no v2 index code at all today -- this said it was
+      implemented and dead, which would at least have been something.
 - [ ] `gitobj write` for packed input, i.e. unpack-objects
       why: the natural completion of having both halves, and it makes the
       three-hop `pack -> loose -> git fsck` round trip possible.
 - [ ] abbreviated object names, by binary search over the index fanout
       why: every human-facing git command takes a 7-character prefix, and
-      the fanout table already makes it a ten-line function.
+      once there is a fanout table this becomes a ten-line function. There is
+      no fanout table yet.
 - [ ] `objects/info/alternates`, so a repository whose objects live in a
       borrowed object store can be read at all
       why: every `git clone -s` and most CI caches look like this, and we
