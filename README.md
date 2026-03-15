@@ -10,7 +10,7 @@ $ gitobj verify ../cc/.git/objects
 
 $ make test
 verified 651 loose objects across cc tarx inflate psh unrepro cmark httpd wasmi notally-molly
-1078 passed, 0 failed
+1219 passed, 0 failed
 ```
 
 ## The oracle is the object's own name

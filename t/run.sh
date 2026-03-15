@@ -99,17 +99,37 @@ refute "hash rejects an unknown type" "$GITOBJ" hash frobnicate "$TMP/fix/hello"
 # a sibling repository's .git, and a reader has no business doing that.
 CORPUS_SMALL="cc tarx inflate"
 CORPUS_BIG="psh unrepro cmark httpd wasmi notally-molly"
+# Three things this did not do: report a repo it skipped, check that cp
+# succeeded, or tell the caller how many it got. A sibling that is not a git
+# repo was skipped in silence, and `cp -r ... 2>/dev/null` discarded both the
+# error text and the status -- so a half-copied repo was still echoed as
+# present, which happened for real during an audit when a transient file
+# vanished mid-copy. The only backstops were slack floors (nloose >= 20,
+# total_verified >= 300 against an actual 650), so 5 of the 9 repos -- 49% of
+# the objects -- could disappear and leave the suite green.
 copy_corpus() {
 	local r
 	for r in "$@"; do
-		[ -d "$ROOT/../$r/.git" ] || continue
+		if [ ! -d "$ROOT/../$r/.git" ]; then
+			echo "SKIP corpus repo $r: no .git" >&2
+			continue
+		fi
 		mkdir -p "$TMP/corpus"
-		cp -r "$ROOT/../$r/.git" "$TMP/corpus/$r" 2>/dev/null
+		if ! cp -r "$ROOT/../$r/.git" "$TMP/corpus/$r" 2>"$TMP/cp.err"; then
+			echo "SKIP corpus repo $r: cp failed: $(head -1 "$TMP/cp.err")" >&2
+			rm -rf "$TMP/corpus/$r"
+			continue
+		fi
 		chmod -R u+rw "$TMP/corpus/$r"
 		echo "$r"
 	done
 }
 HAVE_SMALL=$(copy_corpus $CORPUS_SMALL)
+# And the count is pinned, so a repo that silently stopped being copied is a
+# failure rather than a smaller corpus.
+eq "the small corpus has all its repos" \
+	"$(printf '%s\n' $HAVE_SMALL | grep -c .)" \
+	"$(printf '%s\n' $CORPUS_SMALL | grep -c .)"
 
 # Every loose object in the small corpora, all four fields, against git.
 # `git cat-file <type> <sha>` prints the RAW payload for any type, which is
@@ -172,6 +192,9 @@ refute "a missing object is refused" "$GITOBJ" type "$OD2" \
 # git chose these filenames; we recompute the hash. There is no fixture to
 # maintain and nothing of ours on the other side of the comparison.
 HAVE_BIG=$(copy_corpus $CORPUS_BIG)
+eq "the big corpus has all its repos" \
+	"$(printf '%s\n' $HAVE_BIG | grep -c .)" \
+	"$(printf '%s\n' $CORPUS_BIG | grep -c .)"
 total_verified=0
 for r in $HAVE_SMALL $HAVE_BIG; do
 	out=$("$GITOBJ" verify "$TMP/corpus/$r/objects")
@@ -197,8 +220,18 @@ printf 'verified %d loose objects across %s\n' "$total_verified" \
 # gitobj has no pack reader, 76% of the corpus objects are packed and
 # unread, and this comment pointed at work that was never written. See
 # README.md.
+# This is the ONLY place `gitobj ls` is compared against git over a whole
+# repository, and the skip below is silent -- so when every corpus repo has a
+# packfile (7 of the 9 do today) the loop body never runs and the oracle
+# contributes nothing, with no line to say so. Counted now, and at least one
+# pack-free repo is required.
+ls_compared=0
 for r in $HAVE_SMALL $HAVE_BIG; do
-	[ -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ] && continue
+	if [ -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ]; then
+		echo "SKIP ls $r: has a packfile, so it cannot be compared whole" >&2
+		continue
+	fi
+	ls_compared=$((ls_compared + 1))
 	$GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
 		--batch-check | sort > "$TMP/theirs"
 	"$GITOBJ" ls "$TMP/corpus/$r/objects" > "$TMP/ours"
@@ -206,6 +239,11 @@ for r in $HAVE_SMALL $HAVE_BIG; do
 	nl=$(wc -l < "$TMP/theirs")
 	[ "$nl" -ge 50 ] && ok || no "ls corpus $r has only $nl objects"
 done
+if [ "$ls_compared" -gt 0 ]; then
+	ok
+else
+	no "ls: every corpus repo has a packfile, so the whole-repository ls comparison did not run"
+fi
 
 # A deliberately corrupted loose object: same filename, different content.
 # verify must notice, because that is the only thing it is for.
