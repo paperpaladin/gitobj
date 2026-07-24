@@ -12,8 +12,23 @@ $ make test
 sibling corpus (small): 3 of 3 present
 sibling corpus (big): 5 of 5 present
 verified 599 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
-2208 passed, 0 failed
+2223 passed, 0 failed
 ```
+
+## Two numbers, and which one to quote
+
+Cloned on its own this suite reports **1639 passed**, against three bare
+repositories it builds itself: 120 blobs each through one
+`hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
+plumbing, at fixed dates so the object names do not move between runs.
+
+Inside the collection it reports more -- 2223 above -- because the sibling
+repositories are an additional corpus, and more of them is strictly better
+evidence. But that number moves every time anything is committed anywhere in
+the tree, since a commit creates loose objects. It is a real count of real
+comparisons and a useless figure to quote, so the collection's table quotes
+1639: the one a reader gets by cloning this repository and running `make
+test`.
 
 ## The oracle is the object's own name
 
