@@ -25,35 +25,35 @@ gitobj packls <idx>                    `git verify-pack -v` layout
 
 In scope:
 
-* **loose objects**: zlib-wrapped `<type> <len>\0<payload>`, read and write.
-* **the four object types**: blob, tree, commit, tag. Trees are parsed and
-  pretty-printed the way `git cat-file -p` does; commits and tags are parsed
+* loose objects: zlib-wrapped `<type> <len>\0<payload>`, read and write.
+* the four object types: blob, tree, commit, tag. Trees are parsed and
+  pretty-printed the way `git cat-file -p` does. Commits and tags are parsed
   into headers (including multi-line folded ones, such as `gpgsig`) plus a
   byte-exact message.
-* **tree construction**, with git's sort order: entries compare as if a
+* tree construction, with git's sort order: entries compare as if a
   directory name carried a trailing slash, so `a.c` sorts *after* `a/`.
-* **tree entry modes**: `100644`, `100755`, `120000`, `40000` (stored without
+* tree entry modes: `100644`, `100755`, `120000`, `40000` (stored without
   the leading zero) and `160000` gitlinks.
 In scope and NOT YET WRITTEN. Listed here without that qualification until
-an audit pointed out there is no pack code in `gitobj.c` at all -- the only
+an audit pointed out there is no pack code in `gitobj.c` at all: the only
 trace is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum, and neither constant
 is ever read:
 
-* **packfiles**: the v2 index with its fanout table and 64-bit offset
+* packfiles: the v2 index with its fanout table and 64-bit offset
   escape, the pack header and per-object type/size varint, and both delta
-  encodings -- `OFS_DELTA` with its own distinct negative-offset varint, and
+  encodings: `OFS_DELTA` with its own distinct negative-offset varint, and
   `REF_DELTA` with a 20-byte base name.
-* **delta application**: base/result size varints and the copy/insert
+* delta application: base/result size varints and the copy/insert
   instruction stream, including the copy instruction's optional-byte bitmap
   where an absent byte means 0 for the offset and 0x10000 for the size.
-* **delta chains of any depth**, where a base is itself a delta.
-* **writing anything.** `gitobj` is read-only today.
+* delta chains of any depth, where a base is itself a delta.
+* writing anything. `gitobj` is read-only today.
 
 Exit status: 0 success, 1 refused or not found, 2 the command line was wrong.
 
 ## Hard invariant
 
-**Every object read hashes back to its own name.** A git object's name is the
+Every object read hashes back to its own name. A git object's name is the
 SHA-1 of `<type> <len>\0<payload>`, so the name is a checksum over the entire
 decode path: the zlib stream, the loose header, the pack type/size varint, the
 OFS_DELTA offset varint, every copy and insert instruction, and every link of
@@ -62,31 +62,31 @@ does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
 **It currently covers the LOOSE objects only, which is 585 of the 2468 in
-the corpus -- 24%.** Seven of the nine corpus repositories have a packfile
+the corpus: 24%.** Seven of the nine corpus repositories have a packfile
 whose contents are never read, because there is no pack reader. This
 section said "loose and packed" and that was the strongest claim in the
 file and the one that was not true.
 
-**And git accepts what we write** -- planned, not present. There is no
+And git accepts what we write, planned, not present. There is no
 `gitobj write` and no `gitobj mktree`, so only one direction is tested at
 all: we read what git wrote, and nothing reads what we write because we
 write nothing.
 
 ## Oracle
 
-Ranked, strongest first -- by how little of it we control.
+Ranked, strongest first, by how little of it we control.
 
-1. **The object name itself.** Not an oracle we wrote: git chose the filename
+1. The object name itself. Not an oracle we wrote: git chose the filename
    and the index entry, we recompute the hash. Applies to every object in
    every corpus, with no fixtures to maintain.
-2. **`git cat-file -p` / `-t` / `-s`, object by object.** Over every loose
+2. `git cat-file -p` / `-t` / `-s`, object by object. Over every loose
    object in every corpus repository. The tree pretty-printer, the mode
    formatting and the raw commit/tag bytes are all pinned here.
-3. **`git log --format=`** for the parsed commit fields (`%T`, `%P`, `%an`,
+3. `git log --format=` for the parsed commit fields (`%T`, `%P`, `%an`,
    `%ae`, `%ad --date=raw`, `%e`), and `git cat-file -p` for the message
-   bytes, so CRLF and trailing whitespace are checked as bytes rather than as
+   bytes, so CRLF and trailing whitespace are checked as bytes, not as
    a description.
-4. **ASan + UBSan over the whole suite** (`make test-asan`).
+4. ASan + UBSan over the whole suite (`make test-asan`).
 
 The four oracles that used to be items 2, 4, 6 and 7 of this list are gone
 from it, because none of them exists: `git verify-pack -v` against a
@@ -99,20 +99,20 @@ returns nothing.
 
 ## Non-goals
 
-* **Writing packfiles.** No delta compression, no `.idx` generation, no
+* Writing packfiles. No delta compression, no `.idx` generation, no
   `pack-objects`. Reading them is the interesting half.
-* **SHA-256 repositories.** `extensions.objectFormat = sha256` is refused.
+* SHA-256 repositories. `extensions.objectFormat = sha256` is refused.
   Everything here assumes 20-byte names.
-* **Reachability.** No ref parsing, no `rev-parse`, no abbreviated names, no
+* Reachability. No ref parsing, no `rev-parse`, no abbreviated names, no
   `--batch` protocol, no index/worktree. Objects are addressed by full
   40-character name only.
-* **The pack `.rev`, `.mtimes`, bitmap and multi-pack index files**, cruft
+* The pack `.rev`, `.mtimes`, bitmap and multi-pack index files, cruft
   packs, promisor/partial clones, and alternates (`objects/info/alternates`).
-* **Writing with any real compression.** When there is a writer, loose
+* Writing with any real compression. When there is a writer, loose
   objects will be emitted as zlib stored blocks, which git reads perfectly and
   which grow the file by ~0.03%. There is no writer yet: `gitobj` reads, and
   `hash` computes a name without storing anything.
-* **Being fast.** When there is a pack reader, every object will be inflated
+* Being fast. When there is a pack reader, every object will be inflated
   from scratch with no delta base cache, so walking a pack will be
   O(objects * chain depth) inflations. There is no pack reader either; this
   file says so at the top and then described both in the present tense.
@@ -126,7 +126,7 @@ returns nothing.
 - [x] vendor the DEFLATE decoder from `../inflate`, add RFC 1950 framing,
       read a loose object: `cat`/`raw`/`type`/`size` for blobs
       why: every object in the database is behind a zlib stream, so nothing
-      can be read until this works. The decoder travels rather than being
+      can be read until this works. The decoder travels instead of being
       rewritten because `../inflate` already owns its oracle.
 - [x] `gitobj verify`: hash every loose object against its filename
       why: this is the hard invariant, and it is cheaper to wire up now than
@@ -152,7 +152,7 @@ returns nothing.
       delta machinery, so a later failure is unambiguously a delta bug.
 - [ ] OFS_DELTA: the negative-offset varint
       why: a *different* varint from the size encoding, and the one most
-      readers get wrong -- `(ofs + 1) << 7` rather than a plain shift.
+      readers get wrong: `(ofs + 1) << 7`, not a plain shift.
 - [ ] delta application: the copy/insert instruction stream
       why: the optional-byte bitmap with its 0 and 0x10000 defaults is the
       other classic bug, and refusing an oversized result size belongs in
@@ -165,7 +165,7 @@ returns nothing.
       until every column it prints can be computed.
 - [ ] refusals: OBJ_MAX, truncation, bad varints, mutation fuzz, `test-asan`
       why: every length in a pack is attacker-chosen, and a 4GB delta
-      result must be refused rather than allocated.
+      result must be refused, not allocated.
 - [ ] the three sabotages, recorded in the README
       why: a suite whose failure has never been observed is not evidence.
       The delta copy instruction, the tree sort and the object header each
@@ -173,21 +173,21 @@ returns nothing.
 - [ ] README and PLAN
       why: a README that lists only successes is not finished.
 
-### Milestone 1 -- the gaps that bite real users
+### Milestone 1: the gaps that bite real users
 
 - [ ] a real `zinflate` for writing, or vendor `../inflate`'s encoder
       why: stored blocks mean `gitobj write` produces a loose object ~1.0003x
       the payload size where git produces ~0.3x. git reads it, so nothing is
       broken, but no one would use this to write a real repository.
-- [ ] a delta base cache, so a chain of depth N costs N inflations once
-      rather than N inflations per object in it
+- [ ] a delta base cache, so a chain of depth N costs N inflations once,
+  not N inflations per object in it
       why: `packls` on a 1163-object pack would be the slowest thing in the
       suite, and the fix is a four-entry LRU keyed on pack offset. (`packls`
       does not exist; see the note at the head of this file.)
 - [ ] 64-bit pack offsets exercised for real
       why: the offset64 escape in the v2 index *cannot* be tested without a
       pack above 4GiB, so it will need a hand-built index as its only
-      coverage. There is no v2 index code at all today -- this said it was
+      coverage. There is no v2 index code at all today, this said it was
       implemented and dead, which would at least have been something.
 - [ ] `gitobj write` for packed input, i.e. unpack-objects
       why: the natural completion of having both halves, and it makes the
