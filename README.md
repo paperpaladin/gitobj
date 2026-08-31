@@ -60,8 +60,8 @@ packed", its in-scope list described the v2 index, both delta encodings and
 delta chains of any depth, and its oracle list included `git verify-pack -v`
 diffed against a `gitobj packls`. None of that exists. The only trace of
 pack support in `gitobj.c` is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum,
-and neither constant is ever read. The commit sequence had the pack work
-correctly unchecked the whole time. The prose above it did not.
+and neither constant is ever read. Its commit sequence had the pack work
+correctly unchecked the whole time. Prose above it did not.
 
 It is read-only. No `gitobj write`, no `gitobj mktree`. So only one
 direction of the oracle runs: we read what git wrote, and nothing reads what
