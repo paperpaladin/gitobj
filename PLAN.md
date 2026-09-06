@@ -15,10 +15,11 @@ gitobj hdr    <objdir> <sha> <key>     a commit/tag header's value(s)
 gitobj msg    <objdir> <sha>           a commit/tag message, byte-exact
 gitobj ls     <objdir>                 every object: sha, type, size
 gitobj verify <objdir>                 hash every object against its own name
-
-Planned and NOT PRESENT -- these were listed above as though they existed:
-
 gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
+
+Planned and NOT PRESENT. These were listed above as though they existed, and
+`write` was one of them until it was written:
+
 gitobj mktree <objdir>                 git-mktree format on stdin
 gitobj packls <idx>                    `git verify-pack -v` layout
 ```
@@ -26,6 +27,8 @@ gitobj packls <idx>                    `git verify-pack -v` layout
 In scope:
 
 * loose objects: zlib-wrapped `<type> <len>\0<payload>`, read and write.
+  Written as stored blocks, renamed into place, and left alone if the name
+  is already there.
 * the four object types: blob, tree, commit, tag. Trees are parsed and
   pretty-printed the way `git cat-file -p` does. Commits and tags are parsed
   into headers (including multi-line folded ones, such as `gpgsig`) plus a
@@ -47,7 +50,9 @@ is ever read:
   instruction stream, including the copy instruction's optional-byte bitmap
   where an absent byte means 0 for the offset and 0x10000 for the size.
 * delta chains of any depth, where a base is itself a delta.
-* writing anything. `gitobj` is read-only today.
+* writing anything but a loose object: no `mktree`, no packfile writing, no
+  `unpack-objects`. This said `gitobj` was read-only, which it was until
+  `write` landed.
 
 Exit status: 0 success, 1 refused or not found, 2 the command line was wrong.
 
@@ -61,16 +66,17 @@ the delta chain beneath it. If a single byte of any of that is wrong the hash
 does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
-**It currently covers the LOOSE objects only, which is 585 of the 2468 in
-the corpus: 24%.** Seven of the nine corpus repositories have a packfile
+**It currently covers the LOOSE objects only, which is 497 of the 1860 in
+the corpus: 27%.** Seven of the nine corpus repositories have a packfile
 whose contents are never read, because there is no pack reader. This
 section said "loose and packed" and that was the strongest claim in the
-file and the one that was not true.
+file and the one that was not true. The counts move with every commit or
+repack in a sibling; they were 585 of 2468 a few days ago.
 
-And git accepts what we write, planned, not present. There is no
-`gitobj write` and no `gitobj mktree`, so only one direction is tested at
-all. We read what git wrote, and nothing reads what we write because we
-write nothing.
+The other half of the invariant is that git accepts what we write, and that
+half now runs for loose objects: `gitobj write` re-serialises an object and
+`git fsck --strict` and `git cat-file -p` read it back. It does not run for
+anything else, because `mktree` and pack writing are still absent.
 
 ## Oracle
 
@@ -82,20 +88,22 @@ Ranked, strongest first, by how little of it we control.
 2. `git cat-file -p` / `-t` / `-s`, object by object. Over every loose
    object in every corpus repository. The tree pretty-printer, the mode
    formatting and the raw commit/tag bytes are all pinned here.
-3. `git log --format=` for the parsed commit fields (`%T`, `%P`, `%an`,
+3. `git fsck --strict` and `git cat-file -p` over a bare repository whose
+   every object `gitobj write` put there. git inflates our zlib stream,
+   re-hashes it and parses the trees and commits, so this is the read
+   oracles run backwards, with git on the far side of the serialiser.
+4. `git log --format=` for the parsed commit fields (`%T`, `%P`, `%an`,
    `%ae`, `%ad --date=raw`, `%e`), and `git cat-file -p` for the message
    bytes, so CRLF and trailing whitespace are checked as bytes, not as
    a description.
-4. ASan + UBSan over the whole suite (`make test-asan`).
+5. ASan + UBSan over the whole suite (`make test-asan`).
 
-The four oracles that used to be items 2, 4, 6 and 7 of this list are gone
-from it, because none of them exists: `git verify-pack -v` against a
-`packls` that is not written, `git fsck` against a `write` that is not
-written, repacking for encodings the corpus lacks, and a mutation sweep
-over packs and indexes. They are oracles for work in the commit sequence
+Item 3 was one of four oracles struck off this list for not existing, and is
+the first of them to come back. The other three still do not exist:
+`git verify-pack -v` against a `packls` that is not written, repacking for
+encodings the corpus lacks, and a mutation sweep over packs and indexes. They are oracles for work in the commit sequence
 below, and listing them here made the suite sound four oracles stronger
-than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh`
-returns nothing.
+than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh` returns nothing.
 
 ## Non-goals
 
@@ -108,10 +116,10 @@ returns nothing.
   40-character name only.
 * The pack `.rev`, `.mtimes`, bitmap and multi-pack index files, cruft
   packs, promisor/partial clones, and alternates (`objects/info/alternates`).
-* Writing with any real compression. When there is a writer, loose
-  objects will be emitted as zlib stored blocks, which git reads perfectly and
-  which grow the file by ~0.03%. There is no writer yet: `gitobj` reads, and
-  `hash` computes a name without storing anything.
+* Writing with any real compression. Loose objects are emitted as zlib
+  stored blocks, which git reads perfectly and which grow the file by ~0.03%:
+  five bytes of block header per 65535 of payload, plus six of framing. That
+  is the whole of the compression side, and Milestone 1 is where it changes.
 * Being fast. When there is a pack reader, every object will be inflated
   from scratch with no delta base cache, so walking a pack will be
   O(objects * chain depth) inflations. There is no pack reader either; this
@@ -137,9 +145,27 @@ returns nothing.
 - [x] the commit/tag header parser: `hdr`, `msg`
       why: multi-line folded headers (`gpgsig`) and a byte-exact message are
       where "parses my own commits" and "parses git's" diverge.
-- [ ] loose object write: zlib stored blocks, `gitobj write`
+- [x] loose object write: zlib stored blocks, `gitobj write`
       why: the second half of the oracle. Until git can read what we write,
       only one direction is tested.
+      files: gitobj.c (zdeflate_stored, objhdr, loose_write, the `write`
+      command), t/run.sh section 6, README.md
+      proves: `git fsck --strict` and `git cat-file -p` read a bare
+      repository whose every object we wrote, and the name we print for each
+      is the name git gave it. Payload sizes 0, 1, 2 and six values around
+      the 65535-byte stored-block edge (plaintext exactly on it at 65524,
+      and twice over at 131058) go in and come out of `git cat-file blob`
+      byte for byte. 1937 assertions before, 2049 after.
+      found: ten planted defects, eight of them red. Flipping BTYPE to 01,
+      clearing BFINAL, copying LEN into NLEN instead of complementing it,
+      adding 1 to the Adler-32, dropping the header NUL and breaking the
+      zlib FCHECK each fail 43 assertions; a 65536-byte block fails 10, all
+      of them at or past the boundary; making the write a no-op fails 63.
+      The two survivors are the same mutation twice: a zlib header declaring
+      a 4KiB or a 256-byte window ({0x58,0x85}, {0x08,0x1d}) is accepted by
+      git and by us, correctly, because a stored block never references the
+      sliding window, so the field is unobservable. The first of those was
+      written as a defect and is not one.
 - [ ] tree sorting and `gitobj mktree`
       why: the trailing-slash rule is the single most commonly wrong thing in
       a git reimplementation, and `git mktree` sorts its own input, so the

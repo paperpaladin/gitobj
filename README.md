@@ -1,33 +1,34 @@
 # gitobj
 
-Reads git's object database: one C11 file, no libgit2, no shelling out to
-git. The DEFLATE decoder is vendored from the sibling `../inflate` rather
-than rewritten.
+Reads git's object database, and writes loose objects into it: one C11 file,
+no libgit2, no shelling out to git. The DEFLATE decoder is vendored from the
+sibling `../inflate` rather than rewritten; the writer emits zlib stored
+blocks, which git reads and which compress nothing.
 
 ```
 $ gitobj verify ../cc/.git/objects
-35 objects, 0 mismatched
+36 objects, 0 mismatched
 
 $ make test
 sibling corpus (small): 3 of 3 present
 sibling corpus (big): 5 of 5 present
-verified 599 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
-2223 passed, 0 failed
+verified 497 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
+2049 passed, 0 failed
 ```
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **1639 passed**, against three bare
+Cloned on its own this suite reports **1751 passed**, against three bare
 repositories it builds itself: 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs.
 
-Inside the collection it reports more: 2223 above, because the sibling
+Inside the collection it reports more: 2049 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-1639: the one a reader gets by cloning this repository and running `make
+1751: the one a reader gets by cloning this repository and running `make
 test`.
 
 ## The oracle is the object's own name
@@ -48,11 +49,22 @@ verify` over their whole object store, plus a whole-repository `gitobj ls`
 comparison for the two with no packfile. This said "nine", the size
 of the corpus, not the reach of the per-object sweep.
 
+For `gitobj write` the oracle runs the other way: every loose object of the
+tree/commit/tag fixture is re-serialised into a bare repository git created
+and nothing else has touched, and git is then made to read it back with
+`cat-file -p` and `fsck --strict`. The name gitobj prints has to be the name
+git gave the object in the first place. A write test can pass by finding its
+object already there, which is why the target repository starts empty and
+why the fan-out path is checked for a file: with the write turned into a
+no-op, 63 assertions fail.
+
 ## What does not work
 
 There is no pack reader. This is the big one. Seven of the nine corpus
-repositories have a packfile, and **656 of the 2534 objects in the corpus
-are loose: 26%**. The other 74% are never read.
+repositories have a packfile, and **497 of the 1860 objects in the corpus
+are loose: 27%**. The other 73% are never read. Those counts move whenever a
+sibling repository is committed to or repacked; they were 656 of 2534 when
+this paragraph was written.
 
 `PLAN.md` claimed otherwise until an audit went looking. Its hard invariant
 said the suite hashes "every object in every corpus repository, loose and
@@ -63,10 +75,20 @@ pack support in `gitobj.c` is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum,
 and neither constant is ever read. Its commit sequence had the pack work
 correctly unchecked the whole time. Prose above it did not.
 
-It is read-only. No `gitobj write`, no `gitobj mktree`. So only one
-direction of the oracle runs: we read what git wrote, and nothing reads what
-we write, because we write nothing. `PLAN.md` listed both commands and an
-oracle built on `git fsck` accepting our output.
+Writing compresses nothing. `gitobj write` emits a zlib stream of stored
+blocks, so a loose object it writes is about 1.0003x its payload where git's
+is nearer 0.3x. git reads it perfectly and `fsck --strict` is happy, but no
+one should write a real repository with this. A real encoder is the first
+item of `PLAN.md`'s Milestone 1.
+
+There is no `gitobj mktree`, so the only thing `write` can be handed is a
+payload somebody else built: it stores bytes under the right name, it does
+not construct trees. No packfile writing either, and no `unpack-objects`.
+
+Those two paragraphs used to be one line saying the whole thing was
+read-only, which it was until the writer landed. `PLAN.md` had listed
+`write` and `mktree` as though both existed for a good while before that,
+and `mktree` still does not.
 
 No SHA-256 repositories, no ref parsing, no abbreviated names, no
 `--batch` protocol, no index or worktree. Objects are addressed by full
@@ -82,7 +104,8 @@ Not fast. Every object is inflated from scratch.
 The house convention here is that every repo has a `README.md` stating what
 does *not* work, and this repo did not have one. `gitobj.c`'s header comment
 pointed at it (`See README.md`), and so did a comment in `t/run.sh` pointing
-at a "section 9" that does not exist either: the file stops at section 5.
+at a "section 9" that does not exist either: the file stopped at section 5,
+and stops at 6 now that there is a writer to test.
 Those two pointers and the `PLAN.md` prose were the only places the pack gap
 was acknowledged, and all three described it as finished.
 

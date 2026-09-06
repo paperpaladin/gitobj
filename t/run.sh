@@ -656,5 +656,102 @@ refute "msg refuses a blob" "$GITOBJ" msg "$BOD" "$hb"
 refute "hdr refuses a blob" "$GITOBJ" hdr "$BOD" "$hb" tree
 
 # =====================================================================
+# 6. writing loose objects: git reads what we write
+# =====================================================================
+# The other direction of the oracle, and until now the missing one: every
+# check above reads what git wrote. Here git is the reader. The target is a
+# bare repository git created and nothing else has touched, so an object that
+# can be read out of it is an object gitobj put there. The hazard with a
+# write test is that it passes by finding the thing already present.
+WREPO=$TMP/written
+$GIT init -q --bare "$WREPO"
+WOD=$WREPO/objects
+WG="$GIT --git-dir=$WREPO"
+
+# Pass 1: re-store every loose object of the mode/commit/tag fixture, which
+# holds all four types with content git itself produced. The payload comes
+# out of `git cat-file <type>`, goes in through `gitobj write`, and the name
+# gitobj prints must be the name git gave it: git chose that filename, and
+# we recompute the hash over bytes we re-serialised.
+nwritten=0
+for sha in $(loose_shas "$W/.git"); do
+	gt=$($TG cat-file -t "$sha")
+	$TG cat-file "$gt" "$sha" > "$TMP/payload"
+	got=$("$GITOBJ" write "$WOD" "$gt" "$TMP/payload")
+	eq "write $gt $sha keeps its name" "$got" "$sha"
+	assert "write $sha put a file at the fan-out path" \
+		test -f "$WOD/${sha:0:2}/${sha:2}"
+	# git reading our file, pretty-printed, against git reading its own.
+	$WG cat-file -p "$sha" > "$TMP/ours" 2>/dev/null
+	$TG cat-file -p "$sha" > "$TMP/theirs"
+	assert "git cat-file -p agrees on our $gt $sha" cmp -s "$TMP/ours" "$TMP/theirs"
+	nwritten=$((nwritten+1))
+done
+[ "$nwritten" -ge 15 ] && ok || no "only $nwritten objects re-stored"
+# All four types, or the pass above proved one of them.
+eq "the re-stored objects cover all four types" \
+	"$($WG cat-file --batch-all-objects --batch-check | awk '{print $2}' |
+		sort -u | tr '\n' ' ')" "blob commit tag tree "
+# And git holds exactly what we wrote, so the fsck below has something to
+# look at: a clean fsck of an empty repository is also clean.
+eq "git sees exactly the objects we wrote" \
+	"$($WG cat-file --batch-all-objects --batch-check | wc -l)" "$nwritten"
+
+# `git fsck --strict` is the strongest reader there is: it inflates every
+# object, re-hashes it, and parses trees and commits. Everything here is
+# unreachable (the repository has no refs), so "dangling" is expected and
+# must not be read as a failure; an error is anything else.
+$WG fsck --strict > "$TMP/fsck.out" 2>&1
+eq "git fsck --strict exits 0 over our objects" "$?" 0
+assert "git fsck --strict reports no error over our objects" \
+	sh -c "! grep -Eiv '^(notice|dangling)' '$TMP/fsck.out' | grep -q ."
+
+# Pass 2: sizes around the stored-block boundary. LEN is 16 bits, so a block
+# holds 65535 bytes and the plaintext is the payload plus an 11- or 12-byte
+# header. The sizes below put the block edge on either side of the header,
+# exactly on it, and twice over.
+for n in 0 1 2 65522 65523 65524 65525 65526 131057 131058 131059 200000; do
+	head -c "$n" /dev/urandom > "$TMP/wblob"
+	got=$("$GITOBJ" write "$WOD" blob "$TMP/wblob")
+	eq "write blob of $n bytes names it as git does" "$got" \
+		"$($SG hash-object -t blob "$TMP/wblob")"
+	$WG cat-file blob "$got" > "$TMP/ours" 2>/dev/null
+	assert "git inflates our $n-byte blob byte for byte" cmp -s "$TMP/ours" "$TMP/wblob"
+	nwritten=$((nwritten+1))
+done
+
+# stdin, and writing the same content twice.
+printf 'written from stdin\n' > "$TMP/wstdin"
+got=$("$GITOBJ" write "$WOD" blob < "$TMP/wstdin")
+eq "write reads stdin when given no file" "$got" \
+	"$($SG hash-object -t blob "$TMP/wstdin")"
+nwritten=$((nwritten+1))
+sz1=$(wc -c < "$WOD/${got:0:2}/${got:2}")
+again=$("$GITOBJ" write "$WOD" blob "$TMP/wstdin")
+eq "writing the same object twice names it the same" "$again" "$got"
+eq "and leaves the stored file alone" \
+	"$(wc -c < "$WOD/${got:0:2}/${got:2}")" "$sz1"
+$WG cat-file blob "$got" > "$TMP/ours" 2>/dev/null
+assert "git still reads it after the second write" cmp -s "$TMP/ours" "$TMP/wstdin"
+
+# Our own reader over our own writer, and the hard invariant over the lot.
+# `verify` recomputes every name from the inflated bytes, so this is the
+# whole write path checked against the names git agreed with above.
+out=$("$GITOBJ" verify "$WOD")
+eq "verify over everything we wrote exits 0" "$?" 0
+case $out in *", 0 mismatched") ok ;; *) no "verify of our own objects: $out" ;; esac
+eq "verify counted every object we wrote" "${out##*$'\n'}" "$nwritten objects, 0 mismatched"
+$WG cat-file --batch-all-objects --batch-check | sort > "$TMP/theirs"
+"$GITOBJ" ls "$WOD" > "$TMP/ours"
+assert "ls of our own store matches git batch-check" cmp -s "$TMP/ours" "$TMP/theirs"
+
+refute "write rejects an unknown type" \
+	"$GITOBJ" write "$WOD" frobnicate "$TMP/wstdin"
+refute "write refuses an object directory that does not exist" \
+	"$GITOBJ" write "$TMP/no/such/objects" blob "$TMP/wstdin"
+refute "write refuses a file it cannot read" \
+	"$GITOBJ" write "$WOD" blob "$TMP/no/such/file"
+
+# =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

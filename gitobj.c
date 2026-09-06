@@ -1,9 +1,12 @@
-/* gitobj -- a READER for git's object database, in one C11 file.
+/* gitobj. git's object database: reads loose objects, writes loose
+ * objects, in one C11 file.
  *
- * Loose objects and the four object types.  NOT packfiles: the v2 index, the
- * pack format and both delta encodings are planned and absent -- see
- * README.md, which says so first.  No libgit2, no zlib, no shelling out to
- * git. git is the authority this is measured against, never a dependency.
+ * The four object types. NOT packfiles: the v2 index, the pack format and
+ * both delta encodings are planned and absent, see README.md, which says so
+ * first. The writer compresses nothing (zlib stored blocks), which git reads
+ * and no one should use for a real repository; that is in README.md too. No
+ * libgit2, no zlib, no shelling out to git. git is the authority this is
+ * measured against, never a dependency.
  *
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
  * read is self-checking: if the bytes we reconstructed hash back to the name
@@ -15,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* shortcut: die() exits without freeing, so LeakSanitizer flags it. Every
  * caller is an out-of-memory, I/O or refusal path with no useful recovery;
@@ -303,6 +309,43 @@ static const char *zinflate(const uint8_t *p, size_t n, Buf *o, size_t *used) {
 	return NULL;
 }
 
+/* The other direction, and the only compression gitobj does: a zlib stream
+ * made entirely of stored (BTYPE 00) blocks. It is a legal DEFLATE stream,
+ * git reads it with its own zlib, and it costs five bytes per 65535 of
+ * payload, about 0.03%.
+ *
+ * shortcut: no Huffman coding, so a loose object we write is ~1.0003x its
+ * payload where git's is nearer 0.3x. git does not care, a reader of a real
+ * repository would; the upgrade path is an encoder from ../inflate, which is
+ * the first item of PLAN.md's Milestone 1.
+ *
+ * The header is 0x78 0x01: deflate, 32KiB window, no preset dictionary, and
+ * (0x78 << 8 | 0x01) % 31 == 0, which is the check zinflate() enforces above.
+ */
+static void zdeflate_stored(const uint8_t *p, size_t n, Buf *o) {
+	static const uint8_t zhdr[2] = {0x78, 0x01};
+	bwrite(o, zhdr, 2);
+	size_t i = 0;
+	do {
+		/* 65535 and not 65536: LEN is 16 bits, so a full block is one
+		 * short of the round number it looks like. */
+		size_t k = n - i > 65535 ? 65535 : n - i;
+		uint8_t b[5];
+		b[0] = (uint8_t)(i + k == n); /* BFINAL on the last, BTYPE 00 */
+		b[1] = (uint8_t)(k & 0xff);
+		b[2] = (uint8_t)(k >> 8);
+		b[3] = (uint8_t)~b[1];        /* NLEN, the one's complement */
+		b[4] = (uint8_t)~b[2];
+		bwrite(o, b, sizeof b);
+		bwrite(o, p + i, k);
+		i += k;
+	} while (i < n); /* do-while: an empty payload still needs a final block */
+	uint32_t a = adler32(p, n);
+	uint8_t t[4] = {(uint8_t)(a >> 24), (uint8_t)(a >> 16),
+	                (uint8_t)(a >> 8), (uint8_t)a};
+	bwrite(o, t, sizeof t);
+}
+
 /* -------------------------------------------------------------- SHA-1 */
 
 /* FIPS 180-1. Short enough that pulling in a dependency for it would be
@@ -433,12 +476,21 @@ static int tcode(const char *s) {
 /* The name of an object is SHA-1 over the loose-object header followed by the
  * payload -- the header is part of the hash even for packed objects, where it
  * is never stored. */
+/* "<type> <len>", with the NUL counted in the returned length. One function
+ * because the writer must emit exactly the bytes the name is hashed over: two
+ * copies of this would be two chances to disagree, and the disagreement would
+ * be an object whose name is not its own hash. */
+static size_t objhdr(char buf[64], int type, size_t n) {
+	int k = snprintf(buf, 64, "%s %zu", tname(type), n);
+	return (size_t)k + 1;
+}
+
 static void objid(int type, const uint8_t *p, size_t n, uint8_t id[20]) {
 	char hdr[64];
-	int k = snprintf(hdr, sizeof hdr, "%s %zu", tname(type), n);
+	size_t k = objhdr(hdr, type, n);
 	Sha1 s;
 	sha1_init(&s);
-	sha1_update(&s, hdr, (size_t)k + 1); /* +1 carries the NUL */
+	sha1_update(&s, hdr, k);
 	sha1_update(&s, p, n);
 	sha1_final(&s, id);
 }
@@ -542,6 +594,47 @@ static void obj_read(const char *objdir, const char *hex, Obj *out) {
 	if (unhexify(hex, want)) die2("not a 40-character object name", hex);
 	if (loose_read(objdir, hex, out)) return;
 	die2("object not found", hex);
+}
+
+/* Store an object as a loose file, the way git does: the bytes go to a
+ * temporary name in the fan-out directory and are renamed into place, so no
+ * reader ever opens a half-written file under a name that promises a
+ * particular hash. An object already present is left alone, which is what
+ * makes a second write of the same content a no-op rather than a rewrite.
+ *
+ * shortcut: the temporary name carries only the pid, so two writers in one
+ * process writing concurrently would collide. gitobj is single-threaded and
+ * writes one object per run; mkstemp if that ever stops being true. */
+static void loose_write(const char *objdir, const char *hex, int type,
+                        const uint8_t *p, size_t n) {
+	char dir[4096], path[4096], tmp[4096];
+	if ((size_t)snprintf(dir, sizeof dir, "%s/%.2s", objdir, hex) >= sizeof dir)
+		die("object path too long");
+	loose_path(path, sizeof path, objdir, hex);
+	if ((size_t)snprintf(tmp, sizeof tmp, "%s/tmp_gitobj_%ld", dir,
+	                     (long)getpid()) >= sizeof tmp)
+		die("object path too long");
+	if (mkdir(dir, 0777) && errno != EEXIST) die2("cannot create", dir);
+
+	FILE *have = fopen(path, "rb");
+	if (have) { fclose(have); return; }
+
+	Buf plain = {0}, z = {0};
+	char hdr[64];
+	bwrite(&plain, hdr, objhdr(hdr, type, n));
+	bwrite(&plain, p, n);
+	zdeflate_stored(plain.p, plain.n, &z);
+	bfree(&plain);
+
+	FILE *f = fopen(tmp, "wb");
+	if (!f) die2("cannot create", tmp);
+	int bad = z.n && fwrite(z.p, 1, z.n, f) != z.n;
+	if (fclose(f) || bad) { remove(tmp); die2("write error", tmp); }
+	bfree(&z);
+	/* rename, not link: a file that appeared under this name while we were
+	 * compressing holds the same content by definition, so replacing it is
+	 * harmless and losing the race is not worth a branch. */
+	if (rename(tmp, path)) { remove(tmp); die2("cannot store", path); }
 }
 
 /* ------------------------------------------------------------------ trees */
@@ -762,6 +855,7 @@ static int cmpname(const void *a, const void *b) { return strcmp(a, b); }
 
 static int usage(void) {
 	fputs("usage: gitobj hash <type> [file]\n"
+	      "       gitobj write <objdir> <type> [file]\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
 	      "       gitobj ls|verify <objdir>\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
@@ -783,6 +877,21 @@ int main(int argc, char **argv) {
 		char hex[41];
 		objid(t, in.p, in.n, id);
 		hexify(id, hex);
+		printf("%s\n", hex);
+		bfree(&in);
+		return 0;
+	}
+
+	if (!strcmp(cmd, "write") && (argc == 4 || argc == 5)) {
+		int t = tcode(argv[3]);
+		if (!t) die2("unknown object type", argv[3]);
+		Buf in = {0};
+		readall(argc == 5 ? argv[4] : NULL, &in);
+		uint8_t id[20];
+		char hex[41];
+		objid(t, in.p, in.n, id);
+		hexify(id, hex);
+		loose_write(argv[2], hex, t, in.p, in.n);
 		printf("%s\n", hex);
 		bfree(&in);
 		return 0;
