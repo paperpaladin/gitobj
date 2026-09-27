@@ -61,6 +61,10 @@ static void bneed(Buf *b, size_t extra) {
 	b->cap = c;
 }
 static void bwrite(Buf *b, const void *s, size_t n) {
+	/* memcpy(dst, NULL, 0) is undefined even though it copies nothing, and
+	 * the empty tree is exactly that call: a zero-length payload whose
+	 * buffer was never allocated. UBSan reports it as a null argument. */
+	if (!n) return;
 	bneed(b, n);
 	memcpy(b->p + b->n, s, n);
 	b->n += n;
@@ -736,6 +740,148 @@ static void tree_print(const uint8_t *p, size_t n) {
 	}
 }
 
+/* ------------------------------------------------------ building trees */
+
+/* `git mktree` format, one entry per line:
+ *
+ *     <mode> SP <type> SP <40 hex> TAB <name>
+ *
+ * which is exactly what `git ls-tree` and our own `cat` of a tree print, so
+ * a tree can be read out of one repository and rebuilt in another. The name
+ * is C-quoted when it needs to be, so this needs the inverse of
+ * print_quoted_name as well as the sort rule.
+ */
+typedef struct { unsigned mode; uint8_t id[20]; char *name; size_t nlen; } Ment;
+
+/* git's base_name_compare. Entries are sorted as if every directory name
+ * carried a trailing slash, so "a/" falls between "a.c" and "a0" rather than
+ * sorting with the plain names: '.' is 0x2e, '/' is 0x2f and '0' is 0x30.
+ * Getting this wrong produces a tree whose bytes git refuses -- `fsck` calls
+ * it treeNotSorted -- so it is not a cosmetic ordering.
+ *
+ * name is NUL-terminated, which is why reading name[m] is in bounds when m
+ * is the shorter length: the terminator is the byte compared against the
+ * longer name, and the slash is substituted for it only for a directory. */
+static int mentcmp(const void *va, const void *vb) {
+	const Ment *a = va, *b = vb;
+	size_t m = a->nlen < b->nlen ? a->nlen : b->nlen;
+	int c = memcmp(a->name, b->name, m);
+	if (c) return c;
+	unsigned char c1 = (unsigned char)a->name[m], c2 = (unsigned char)b->name[m];
+	if (!c1 && (a->mode & 0170000) == 0040000) c1 = '/';
+	if (!c2 && (b->mode & 0170000) == 0040000) c2 = '/';
+	return c1 < c2 ? -1 : c1 > c2;
+}
+
+/* The inverse of print_quoted_name: git quote.c unquote_c_style. A name is
+ * quoted only if it needs to be, so an unquoted line is taken verbatim --
+ * including any backslash in it, which is why the leading quote decides and
+ * not the presence of an escape. Returns a NUL-terminated buffer the caller
+ * owns, or NULL if the quoting is malformed. */
+static char *unquote_name(const char *s, size_t n, size_t *outn) {
+	char *o = malloc(n + 1);
+	if (!o) die("out of memory");
+	size_t k = 0;
+	if (!n || s[0] != '"') {
+		memcpy(o, s, n);
+		o[n] = 0;
+		*outn = n;
+		return o;
+	}
+	size_t i = 1;
+	for (;;) {
+		if (i >= n) { free(o); return NULL; }   /* no closing quote */
+		char c = s[i++];
+		if (c == '"') break;
+		if (c != '\\') { o[k++] = c; continue; }
+		if (i >= n) { free(o); return NULL; }
+		char e = s[i++];
+		switch (e) {
+		case 'a': o[k++] = '\a'; break;
+		case 'b': o[k++] = '\b'; break;
+		case 't': o[k++] = '\t'; break;
+		case 'n': o[k++] = '\n'; break;
+		case 'v': o[k++] = '\v'; break;
+		case 'f': o[k++] = '\f'; break;
+		case 'r': o[k++] = '\r'; break;
+		case '"': case '\\': o[k++] = e; break;
+		default:
+			if (e < '0' || e > '7') { free(o); return NULL; }
+			{
+				unsigned v = (unsigned)(e - '0');
+				for (int d = 0; d < 2 && i < n && s[i] >= '0' && s[i] <= '7'; d++)
+					v = v * 8 + (unsigned)(s[i++] - '0');
+				if (v > 255) { free(o); return NULL; }
+				o[k++] = (char)v;
+			}
+		}
+	}
+	if (i != n) { free(o); return NULL; }       /* trailing junk after the quote */
+	o[k] = 0;
+	*outn = k;
+	return o;
+}
+
+/* One line into one entry. Returns NULL on success.
+ *
+ * shortcut: the declared type is checked against the mode and nothing else.
+ * git mktree additionally looks the object up and refuses an entry whose
+ * stored type disagrees, while still allowing an object that is absent (that
+ * is how a gitlink to a commit in another repository is written at all). We
+ * have the object directory here and could do the same for the present ones;
+ * until then `fsck` is what catches a tree pointing at the wrong thing. */
+static const char *parse_mkline(const char *p, size_t n, Ment *e) {
+	size_t i = 0, d0 = 0;
+	unsigned mode = 0;
+	while (i < n && p[i] >= '0' && p[i] <= '7') {
+		mode = mode * 8 + (unsigned)(p[i] - '0');
+		i++;
+	}
+	if (i == d0 || i - d0 > 6) return "mktree input: entry has no octal mode";
+	if (mode != 0100644 && mode != 0100755 && mode != 0120000 &&
+	    mode != 0040000 && mode != 0160000)
+		return "mktree input: mode is not one git uses";
+	if (i >= n || p[i] != ' ') return "mktree input: mode is not followed by a space";
+	i++;
+	size_t t0 = i;
+	while (i < n && p[i] != ' ') i++;
+	if (i >= n) return "mktree input: type is not followed by a space";
+	const char *want = tree_entry_type(mode);
+	if (i - t0 != strlen(want) || memcmp(p + t0, want, i - t0))
+		return "mktree input: type does not match the mode";
+	i++;
+	if (n - i < 41 || p[i + 40] != '\t')
+		return "mktree input: object name is not 40 characters followed by a tab";
+	char hex[41];
+	memcpy(hex, p + i, 40);
+	hex[40] = 0;
+	if (unhexify(hex, e->id)) return "mktree input: object name is not hex";
+	i += 41;
+	e->name = unquote_name(p + i, n - i, &e->nlen);
+	if (!e->name) return "mktree input: name is not validly quoted";
+	if (!e->nlen) return "mktree input: entry has an empty name";
+	if (memchr(e->name, '/', e->nlen)) return "mktree input: name contains a slash";
+	if (memchr(e->name, 0, e->nlen)) return "mktree input: name contains a NUL";
+	e->mode = mode;
+	return NULL;
+}
+
+/* Build the tree object. The mode goes out as %o, so 040000 in the input is
+ * 40000 in the object: the leading zero exists only in the printed form. */
+static void tree_build(Ment *v, size_t n, Buf *out) {
+	/* qsort(NULL, 0, ...) is undefined, and the empty tree is exactly that
+	 * call. UBSan caught it: the released build happily produced
+	 * 4b825dc... while the sanitiser build refused to run at all. */
+	if (n) qsort(v, n, sizeof *v, mentcmp);
+	for (size_t i = 0; i < n; i++) {
+		char m[16];
+		int k = snprintf(m, sizeof m, "%o ", v[i].mode);
+		bwrite(out, m, (size_t)k);
+		bwrite(out, v[i].name, v[i].nlen + 1);  /* the NUL is part of the entry */
+		bwrite(out, v[i].id, 20);
+	}
+}
+
 /* ----------------------------------------------------- commits and tags */
 
 /* Commits and tags share one shape: a block of "<key> SP <value> LF" header
@@ -856,6 +1002,7 @@ static int cmpname(const void *a, const void *b) { return strcmp(a, b); }
 static int usage(void) {
 	fputs("usage: gitobj hash <type> [file]\n"
 	      "       gitobj write <objdir> <type> [file]\n"
+	      "       gitobj mktree <objdir>\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
 	      "       gitobj ls|verify <objdir>\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
@@ -893,6 +1040,45 @@ int main(int argc, char **argv) {
 		hexify(id, hex);
 		loose_write(argv[2], hex, t, in.p, in.n);
 		printf("%s\n", hex);
+		bfree(&in);
+		return 0;
+	}
+
+	if (!strcmp(cmd, "mktree") && argc == 3) {
+		Buf in = {0};
+		readall(NULL, &in);
+		Ment *v = NULL;
+		size_t nv = 0, cap = 0;
+		size_t at = 0;
+		while (at < in.n) {
+			const char *nl = memchr(in.p + at, '\n', in.n - at);
+			size_t len = nl ? (size_t)((const uint8_t *)nl - in.p) - at : in.n - at;
+			/* A blank line is skipped, not an error: that is what a
+			 * trailing newline on the last entry leaves behind. */
+			if (len) {
+				if (nv == cap) {
+					cap = cap ? cap * 2 : 16;
+					Ment *q = realloc(v, cap * sizeof *v);
+					if (!q) die("out of memory");
+					v = q;
+				}
+				const char *e = parse_mkline((const char *)in.p + at, len, &v[nv]);
+				if (e) die(e);
+				nv++;
+			}
+			at += len + (nl ? 1 : 0);
+		}
+		Buf tree = {0};
+		tree_build(v, nv, &tree);
+		uint8_t id[20];
+		char hex[41];
+		objid(T_TREE, tree.p, tree.n, id);
+		hexify(id, hex);
+		loose_write(argv[2], hex, T_TREE, tree.p, tree.n);
+		printf("%s\n", hex);
+		for (size_t i = 0; i < nv; i++) free(v[i].name);
+		free(v);
+		bfree(&tree);
 		bfree(&in);
 		return 0;
 	}
