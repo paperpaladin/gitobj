@@ -314,5 +314,184 @@ assert "mkbad can build a tree that parses" "$GITOBJ" cat "$OD2" "$b"
 eq "and git agrees it is a tree" "$($SG cat-file -t "$b")" tree
 
 # =====================================================================
+# 5. commits and tags: headers, folding, and a byte-exact message
+# =====================================================================
+# Real commits first: a root commit with no parent, then a merge with two.
+# git log --format= is the oracle for the fields; for the message bytes the
+# oracle is git cat-file itself, split in python, because %B is formatted
+# output and this has to be byte-exact.
+$TG add -A >/dev/null
+$TG commit -q -m "root commit"
+ROOT=$($TG rev-parse HEAD)
+$TG checkout -q -b side
+printf 'side\n' > "$W/side.txt"
+$TG add side.txt >/dev/null && $TG commit -q -m "on the side"
+$TG checkout -q -
+printf 'main\n' > "$W/main.txt"
+$TG add main.txt >/dev/null && $TG commit -q -m "on main"
+$TG merge -q --no-ff -m "a merge with two parents" side
+MERGE=$($TG rev-parse HEAD)
+
+# A forged commit carrying everything a real one here cannot: three parents,
+# an encoding header, a folded gpgsig whose armor contains a blank line
+# (stored as a line of exactly one space -- the detail that keeps the "LF LF"
+# ending the header block unambiguous), CRLF inside the message, and trailing
+# whitespace on a message line. git signs nothing here, so this is built byte
+# by byte and handed to git hash-object --literally; git then reads it back,
+# which is the whole point.
+# The three parents and the tree are REAL objects in this repository, because
+# git log refuses to print even %T for a commit whose parents it cannot read
+# ("Failed to traverse parents"), and losing the git-side oracle to make the
+# fixture tidier would be the wrong trade.
+P1=$ROOT
+P2=$($TG rev-parse side)
+P3=$($TG rev-parse HEAD)
+FT=$($TG rev-parse 'HEAD^{tree}')
+python3 - "$TMP/forged" "$P1" "$P2" "$P3" "$FT" <<'PYEOF2'
+import sys
+sig = ("-----BEGIN PGP SIGNATURE-----\n"
+       "\n"                       # the armor blank line
+       "iQEzBAABCgAdFiEE\n"
+       "=abcd\n"
+       "-----END PGP SIGNATURE-----")
+folded = "\n".join(" " + l if i else l for i, l in enumerate(sig.split("\n")))
+p1, p2, p3, ft = sys.argv[2:6]
+body = ("tree " + ft + "\n"
+        "parent " + p1 + "\n"
+        "parent " + p2 + "\n"
+        "parent " + p3 + "\n"
+        "author A U Thor <author@example.com> 1700000000 +0100\n"
+        "committer C O Mitter <committer@example.com> 1700000001 -0730\n"
+        "encoding ISO-8859-1\n"
+        "gpgsig " + folded + "\n"
+        "\n"
+        "subject with trailing space   \r\n"
+        "\r\n"
+        "a CRLF body line\r\n"
+        "and a line ending in a tab\t\n"
+        "\n\n")
+open(sys.argv[1], "wb").write(body.encode("latin-1"))
+PYEOF2
+FORGED=$($TG hash-object -t commit -w --literally "$TMP/forged")
+eq "git accepts the forged commit as a commit" "$($TG cat-file -t "$FORGED")" commit
+# It must be byte-identical going in and coming out, or the fixture is lying
+# about what is being parsed.
+$TG cat-file commit "$FORGED" > "$TMP/theirs"
+assert "the forged commit round-trips through git byte for byte" \
+	cmp -s "$TMP/forged" "$TMP/theirs"
+
+# A tag object, real, plus one forged with a folded signature.
+$TG tag -a -m "an annotated tag" v1 >/dev/null
+TAGOBJ=$($TG rev-parse v1)
+
+# --- the oracle loop -------------------------------------------------
+# (objdir, sha, git-dir) triples: real root, real merge, real tag, forged.
+hdr_check() { # <label> <objdir> <sha> <key> <expected>
+	got=$("$GITOBJ" hdr "$2" "$3" "$4" 2>/dev/null)
+	eq "$1 hdr $4" "$got" "$5"
+}
+for pair in "$ROOT:$W/.git" "$MERGE:$W/.git"; do
+	sha=${pair%%:*}; gd=${pair#*:}
+	hdr_check "$sha" "$gd/objects" "$sha" tree \
+		"$($GIT --git-dir="$gd" log -1 --format=%T "$sha")"
+	# %P is space-separated; we print one parent per line.
+	hdr_check "$sha" "$gd/objects" "$sha" parent \
+		"$($GIT --git-dir="$gd" log -1 --format=%P "$sha" | tr ' ' '\n')"
+	hdr_check "$sha" "$gd/objects" "$sha" author \
+		"$($GIT --git-dir="$gd" log -1 --format='%an <%ae> %ad' --date=raw "$sha")"
+	hdr_check "$sha" "$gd/objects" "$sha" committer \
+		"$($GIT --git-dir="$gd" log -1 --format='%cn <%ce> %cd' --date=raw "$sha")"
+done
+# A root commit has no parent header at all, and that is an exit-1 answer
+# rather than an empty-string answer.
+refute "a root commit has no parent header" \
+	"$GITOBJ" hdr "$W/.git/objects" "$ROOT" parent
+eq "a merge has two parents" \
+	"$("$GITOBJ" hdr "$W/.git/objects" "$MERGE" parent | wc -l)" 2
+
+# The forged commit, against git's own reading of it.
+FOD=$W/.git/objects
+eq "forged: three parents" "$("$GITOBJ" hdr "$FOD" "$FORGED" parent | wc -l)" 3
+hdr_check forged "$FOD" "$FORGED" parent \
+	"$($TG log -1 --format=%P "$FORGED" | tr ' ' '\n')"
+hdr_check forged "$FOD" "$FORGED" tree "$($TG log -1 --format=%T "$FORGED")"
+hdr_check forged "$FOD" "$FORGED" encoding "$($TG log -1 --format=%e "$FORGED")"
+hdr_check forged "$FOD" "$FORGED" author \
+	"$($TG log -1 --format='%an <%ae> %ad' --date=raw "$FORGED")"
+# The folded gpgsig, unfolded. git prints the same block with %GG only for a
+# signature it can verify, so the oracle here is git's own cat-file bytes
+# with the fold undone in python -- still git's bytes, not ours.
+$TG cat-file commit "$FORGED" | python3 -c '
+import sys
+raw = sys.stdin.buffer.read()
+hdrs = raw.split(b"\n\n", 1)[0]
+out, want = [], False
+for line in hdrs.split(b"\n"):
+    if line.startswith(b" "):
+        if want: out.append(line[1:])
+        continue
+    k, _, v = line.partition(b" ")
+    want = k == b"gpgsig"
+    if want: out.append(v)
+sys.stdout.buffer.write(b"\n".join(out) + b"\n")
+' > "$TMP/theirs"
+"$GITOBJ" hdr "$FOD" "$FORGED" gpgsig > "$TMP/ours"
+assert "forged: the folded gpgsig unfolds to git's bytes" cmp -s "$TMP/ours" "$TMP/theirs"
+assert "forged: the gpgsig armor blank line survives as an empty line" \
+	grep -qx '' "$TMP/ours"
+
+# The message, byte for byte, for every commit and tag in play. This is what
+# makes CRLF and trailing whitespace a tested claim rather than a hope.
+msgcheck() { # <label> <objdir> <sha> <git-dir>
+	$GIT --git-dir="$4" cat-file "$($GIT --git-dir="$4" cat-file -t "$3")" "$3" |
+		python3 -c 'import sys;b=sys.stdin.buffer.read();sys.stdout.buffer.write(b.split(b"\n\n",1)[1] if b"\n\n" in b else b"")' \
+		> "$TMP/theirs"
+	"$GITOBJ" msg "$2" "$3" > "$TMP/ours"
+	assert "$1 message is byte-exact" cmp -s "$TMP/ours" "$TMP/theirs"
+}
+msgcheck root "$W/.git/objects" "$ROOT" "$W/.git"
+msgcheck merge "$W/.git/objects" "$MERGE" "$W/.git"
+msgcheck tag "$W/.git/objects" "$TAGOBJ" "$W/.git"
+msgcheck forged "$FOD" "$FORGED" "$W/.git"
+# And explicitly: the CR bytes and the trailing space are still there.
+"$GITOBJ" msg "$FOD" "$FORGED" > "$TMP/ours"
+# python, not grep: the trailing space sits BEFORE the CR, so a "space at
+# end of line" grep does not see it, and the first version of this check
+# passed only because it was looking at the wrong byte.
+assert "forged message keeps trailing space, CR and tab exactly" python3 -c '
+import sys
+b = open(sys.argv[1], "rb").read()
+assert b.startswith(b"subject with trailing space   \r\n"), b[:40]
+assert b"\r\n" in b and b"a CRLF body line\r\n" in b
+assert b"and a line ending in a tab\t\n" in b
+assert b.endswith(b"\n\n")
+' "$TMP/ours"
+eq "forged message length" "$(wc -c < "$TMP/ours")" \
+	"$(python3 -c 'import sys;b=open(sys.argv[1],"rb").read();print(len(b.split(b"\n\n",1)[1]))' "$TMP/forged")"
+
+# The tag headers, against git.
+hdr_check tag "$W/.git/objects" "$TAGOBJ" object "$($TG rev-parse v1^{commit})"
+hdr_check tag "$W/.git/objects" "$TAGOBJ" type commit
+hdr_check tag "$W/.git/objects" "$TAGOBJ" tag v1
+
+# Every commit and tag in the small corpora, all four common headers.
+for r in $HAVE_SMALL; do
+	G=$TMP/corpus/$r
+	for sha in $(loose_shas "$G"); do
+		gt=$($GIT --git-dir="$G" cat-file -t "$sha")
+		[ "$gt" = commit ] || continue
+		hdr_check "$r/$sha" "$G/objects" "$sha" tree \
+			"$($GIT --git-dir="$G" log -1 --format=%T "$sha")"
+		hdr_check "$r/$sha" "$G/objects" "$sha" committer \
+			"$($GIT --git-dir="$G" log -1 --format='%cn <%ce> %cd' --date=raw "$sha")"
+		msgcheck "$r/$sha" "$G/objects" "$sha" "$G"
+	done
+done
+
+BOD=$SCRATCH/.git/objects
+refute "msg refuses a blob" "$GITOBJ" msg "$BOD" "$hb"
+refute "hdr refuses a blob" "$GITOBJ" hdr "$BOD" "$hb" tree
+
+# =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
