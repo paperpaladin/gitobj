@@ -111,7 +111,7 @@ Ranked, strongest first -- by how little of it we control.
       why: the object *name* is the project's hard invariant, so the thing
       that computes it comes first and is checked against `git hash-object`
       before anything else exists to be wrong.
-- [ ] vendor the DEFLATE decoder from `../inflate`, add RFC 1950 framing,
+- [x] vendor the DEFLATE decoder from `../inflate`, add RFC 1950 framing,
       read a loose object: `cat`/`raw`/`type`/`size` for blobs
       why: every object in the database is behind a zlib stream, so nothing
       can be read until this works. The decoder travels rather than being
