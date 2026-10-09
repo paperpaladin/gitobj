@@ -144,5 +144,59 @@ refute "a missing object is refused" "$GITOBJ" type "$OD2" \
 	0000000000000000000000000000000000000000
 
 # =====================================================================
+# 3. the hard invariant: every object hashes back to its own name
+# =====================================================================
+# git chose these filenames; we recompute the hash. There is no fixture to
+# maintain and nothing of ours on the other side of the comparison.
+HAVE_BIG=$(copy_corpus $CORPUS_BIG)
+total_verified=0
+for r in $HAVE_SMALL $HAVE_BIG; do
+	out=$("$GITOBJ" verify "$TMP/corpus/$r/objects")
+	rc=$?
+	eq "verify $r exits 0" "$rc" 0
+	n=${out##*$'\n'}
+	n=${n%% *}
+	case $(printf '%s' "$out" | tail -1) in
+	*", 0 mismatched") ok ;;
+	*) no "verify $r reported a mismatch: $(printf '%s' "$out" | tail -1)" ;;
+	esac
+	total_verified=$((total_verified + n))
+done
+# The count itself is an assertion: a verify that walked an empty directory
+# also reports zero mismatches.
+[ "$total_verified" -ge 300 ] && ok || no "only $total_verified objects verified"
+printf 'verified %d loose objects across %s\n' "$total_verified" \
+	"$(echo $HAVE_SMALL $HAVE_BIG | tr '\n' ' ')"
+
+# `gitobj ls` against `git cat-file --batch-all-objects --batch-check`, which
+# emits exactly the same three fields. Only repositories with no packfile can
+# be compared whole this way; the packed ones come back in section 9.
+for r in $HAVE_SMALL $HAVE_BIG; do
+	[ -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ] && continue
+	$GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
+		--batch-check | sort > "$TMP/theirs"
+	"$GITOBJ" ls "$TMP/corpus/$r/objects" > "$TMP/ours"
+	assert "ls $r matches git batch-check" cmp -s "$TMP/ours" "$TMP/theirs"
+	nl=$(wc -l < "$TMP/theirs")
+	[ "$nl" -ge 50 ] && ok || no "ls corpus $r has only $nl objects"
+done
+
+# A deliberately corrupted loose object: same filename, different content.
+# verify must notice, because that is the only thing it is for.
+mkdir -p "$TMP/corrupt/objects"
+cp -r "$TMP/corpus/cc/objects/"[0-9a-f][0-9a-f] "$TMP/corrupt/objects/" 2>/dev/null
+victim=$("$GITOBJ" ls "$TMP/corrupt/objects" | awk '$2=="blob"{print $1; exit}')
+printf 'tampered\n' > "$TMP/t.in"
+"$GITOBJ" hash blob "$TMP/t.in" >/dev/null
+$SG hash-object -w "$TMP/t.in" >/dev/null
+nb=$($SG hash-object "$TMP/t.in")
+cp "$SCRATCH/.git/objects/${nb:0:2}/${nb:2}" \
+	"$TMP/corrupt/objects/${victim:0:2}/${victim:2}"
+refute "verify catches a loose object whose content was swapped" \
+	"$GITOBJ" verify "$TMP/corrupt/objects"
+assert "and says which one" sh -c \
+	"'$GITOBJ' verify '$TMP/corrupt/objects' | grep -q '^MISMATCH $victim '"
+
+# =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

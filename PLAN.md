@@ -116,7 +116,7 @@ Ranked, strongest first -- by how little of it we control.
       why: every object in the database is behind a zlib stream, so nothing
       can be read until this works. The decoder travels rather than being
       rewritten because `../inflate` already owns its oracle.
-- [ ] `gitobj verify`: hash every loose object against its filename
+- [x] `gitobj verify`: hash every loose object against its filename
       why: this is the hard invariant, and it is cheaper to wire up now than
       to retrofit once the pack reader is also producing objects.
 - [ ] the tree parser and `git cat-file -p` pretty-printing
