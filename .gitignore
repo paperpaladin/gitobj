@@ -1,0 +1,4 @@
+gitobj
+gitobj-asan
+t/tmp*
+*.o
