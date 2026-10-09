@@ -119,7 +119,7 @@ Ranked, strongest first -- by how little of it we control.
 - [x] `gitobj verify`: hash every loose object against its filename
       why: this is the hard invariant, and it is cheaper to wire up now than
       to retrofit once the pack reader is also producing objects.
-- [ ] the tree parser and `git cat-file -p` pretty-printing
+- [x] the tree parser and `git cat-file -p` pretty-printing
       why: the only object type whose `-p` output is not its raw bytes, and
       the first place the mode encoding can be wrong.
 - [ ] the commit/tag header parser: `hdr`, `msg`

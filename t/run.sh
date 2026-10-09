@@ -119,6 +119,9 @@ for r in $HAVE_SMALL; do
 		"$GITOBJ" raw "$OD" "$sha" > "$TMP/ours" 2>/dev/null
 		$GIT --git-dir="$G" cat-file "$gt" "$sha" > "$TMP/theirs"
 		assert "raw $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
+		"$GITOBJ" cat "$OD" "$sha" > "$TMP/ours" 2>/dev/null
+		$GIT --git-dir="$G" cat-file -p "$sha" > "$TMP/theirs"
+		assert "cat -p $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
 	done
 done
 [ "$nloose" -ge 20 ] && ok || no "only $nloose loose objects in the small corpora"
@@ -196,6 +199,119 @@ refute "verify catches a loose object whose content was swapped" \
 	"$GITOBJ" verify "$TMP/corrupt/objects"
 assert "and says which one" sh -c \
 	"'$GITOBJ' verify '$TMP/corrupt/objects' | grep -q '^MISMATCH $victim '"
+
+# =====================================================================
+# 4. trees: all five modes, and names git has to escape
+# =====================================================================
+# The corpora only contain 100644 and 40000, so the other three modes have to
+# be built. git writes the tree, we read it: one tree carrying a regular
+# file, an executable, a symlink, a subdirectory and a gitlink.
+W=$TMP/work
+mkdir -p "$W"
+TG="$GIT -C $W"
+$TG init -q
+$TG config user.name PLACEHOLDER
+$TG config user.email placeholder@invalid
+printf 'plain\n' > "$W/plain.txt"
+printf '#!/bin/sh\necho hi\n' > "$W/run.sh"
+chmod 755 "$W/run.sh"
+ln -s plain.txt "$W/link"
+mkdir -p "$W/sub"
+printf 'nested\n' > "$W/sub/deep.txt"
+# Names that are awkward on purpose: a space, non-ASCII UTF-8, and the pair
+# that settles the sort rule -- "a.c" against the directory "a".
+printf 'spaced\n' > "$W/sp ace.txt"
+printf 'unicode\n' > "$W/naïve.txt"
+# Names that force git's C-style quoting in `cat-file -p`, which is the part
+# of the tree pretty-printer the oracle caught us getting wrong: a quote, a
+# backslash, a bell, a DEL and a high byte all escape differently.
+printf 'q\n' > "$W/$(printf 'ta"b\\x')"
+printf 'q\n' > "$W/$(printf 'bell\007x')"
+printf 'q\n' > "$W/$(printf 'del\177x')"
+printf 'q\n' > "$W/$(printf 'tab\tx')"
+printf 'dotc\n' > "$W/a.c"
+mkdir -p "$W/a"
+printf 'in a dir\n' > "$W/a/inner"
+$TG add -A
+# A gitlink: mode 160000 pointing at a commit that is not in this repository.
+# update-index --cacheinfo is the only way to make one without a submodule.
+$TG update-index --add --cacheinfo \
+	160000,0123456789abcdef0123456789abcdef01234567,gitlink
+TREE=$($TG write-tree)
+TOD=$W/.git/objects
+
+# Every tree reachable from it, plus the root, pretty-printed both ways.
+ntree=0
+for t in $($TG cat-file --batch-all-objects --batch-check |
+		awk '$2=="tree"{print $1}'); do
+	ntree=$((ntree+1))
+	"$GITOBJ" cat "$TOD" "$t" > "$TMP/ours"
+	$TG cat-file -p "$t" > "$TMP/theirs"
+	assert "tree -p $t" cmp -s "$TMP/ours" "$TMP/theirs"
+	"$GITOBJ" raw "$TOD" "$t" > "$TMP/ours"
+	$TG cat-file tree "$t" > "$TMP/theirs"
+	assert "tree raw $t" cmp -s "$TMP/ours" "$TMP/theirs"
+done
+[ "$ntree" -ge 3 ] && ok || no "only $ntree trees in the mode fixture"
+
+# The modes are asserted individually, because "cmp of two identical
+# pretty-prints" would also pass if git and gitobj both printed nothing.
+for m in 100644 100755 120000 040000 160000; do
+	assert "mode $m appears in our listing" sh -c \
+		"'$GITOBJ' cat '$TOD' '$TREE' | grep -q '^$m '"
+done
+eq "gitlink is printed as a commit" \
+	"$("$GITOBJ" cat "$TOD" "$TREE" | awk '$1=="160000"{print $2}')" commit
+eq "symlink is printed as a blob" \
+	"$("$GITOBJ" cat "$TOD" "$TREE" | awk '$1=="120000"{print $2}')" blob
+# 40000 is stored without its leading zero and printed with it. Both halves
+# are checked, because getting one right and the other wrong is the bug.
+# python rather than grep: the raw tree is binary with no line structure, so
+# an anchored grep can only ever see the first entry, and the directory
+# entry is not first -- git sorts "a" as "a/", which puts it after "a.c".
+"$GITOBJ" raw "$TOD" "$TREE" > "$TMP/rawtree"
+assert "40000 is stored without a leading zero" python3 -c \
+	'import sys;sys.exit(0 if b"40000 a\x00" in open(sys.argv[1],"rb").read() else 1)' \
+	"$TMP/rawtree"
+refute "and 040000 is NOT what is stored" python3 -c \
+	'import sys;sys.exit(0 if b"040000 a\x00" in open(sys.argv[1],"rb").read() else 1)' \
+	"$TMP/rawtree"
+assert "040000 is printed with one" sh -c \
+	"'$GITOBJ' cat '$TOD' '$TREE' | grep -q '^040000 tree'"
+
+# Malformed trees. Each is a valid object -- its name really is its own hash,
+# because git computed it -- that is not a valid tree, so these exercise the
+# parser and not the hash. The fixtures go through FILES, not command
+# substitution: $() silently drops NUL bytes, and a tree without NULs is not
+# the fixture any of these meant to build.
+# python builds the bytes, not printf: bash printf's \0nnn octal escape runs
+# into the digits that follow it, so '\00012345...' is not NUL-then-"12345"
+# and the first version of these fixtures was 31 bytes where it meant 30.
+mkbad() {
+	python3 -c 'import sys;sys.stdout.buffer.write(eval(sys.argv[1]))' "$1" \
+		> "$TMP/badtree"
+	$SG hash-object -t tree -w --literally "$TMP/badtree"
+}
+S20='b"12345678901234567890"'
+b=$(mkbad "b'40000 nonul'")
+refute "tree entry with no NUL" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'100644 short\0tooshort'")
+refute "tree entry with a truncated object name" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'nomode name\0'+$S20")
+refute "tree entry with a non-octal mode" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'100644 \0'+$S20")
+refute "tree entry with an empty name" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'100644 a/b\0'+$S20")
+refute "tree entry name containing a slash" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'1234567 name\0'+$S20")
+refute "tree entry mode of more than six digits" "$GITOBJ" cat "$OD2" "$b"
+b=$(mkbad "b'100644name\0'+$S20")
+refute "tree entry mode with no space after it" "$GITOBJ" cat "$OD2" "$b"
+# ... and the same shape as a VALID tree must still parse, so the refusals
+# above are failing for their own reason rather than because mkbad is broken.
+b=$(mkbad "b'100644 ok\0'+$S20")
+assert "mkbad can build a tree that parses" "$GITOBJ" cat "$OD2" "$b"
+eq "and git agrees it is a tree" "$($SG cat-file -t "$b")" tree
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
