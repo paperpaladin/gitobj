@@ -6,10 +6,11 @@ than rewritten.
 
 ```
 $ gitobj verify ../cc/.git/objects
-verified 585 loose objects across cc tarx inflate psh unrepro cmark httpd wasmi notally-molly
+163 objects, 0 mismatched
 
 $ make test
-999 passed, 0 failed
+verified 651 loose objects across cc tarx inflate psh unrepro cmark httpd wasmi notally-molly
+1078 passed, 0 failed
 ```
 
 ## The oracle is the object's own name
@@ -24,13 +25,17 @@ it cannot be satisfied by being self-consistently wrong. It is the reason
 this repo has no expected-output files.
 
 Everything else is `git cat-file -p` / `-t` / `-s` and `git log --format=`,
-object by object, over the loose objects of nine sibling repositories.
+object by object, over the loose objects of **three** sibling repositories --
+cc, tarx and inflate, the `CORPUS_SMALL` set. The other six get `gitobj
+verify` over their whole object store, plus a whole-repository `gitobj ls`
+comparison for the two with no packfile. This said "nine", which is the size
+of the corpus, not the reach of the per-object sweep.
 
 ## What does not work
 
 **There is no pack reader.** This is the big one. Seven of the nine corpus
-repositories have a packfile, and **585 of the 2468 objects in the corpus
-are loose -- 24%**. The other 76% are never read.
+repositories have a packfile, and **656 of the 2534 objects in the corpus
+are loose -- 26%**. The other 74% are never read.
 
 `PLAN.md` claimed otherwise until an audit went looking: its hard invariant
 said the suite hashes "every object in every corpus repository, loose and

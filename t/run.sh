@@ -26,7 +26,27 @@ ok() { pass=$((pass+1)); }
 no() { fail=$((fail+1)); printf 'FAIL %s\n' "$1"; }
 eq() { if [ "$2" = "$3" ]; then ok; else no "$1 (got '$2' want '$3')"; fi; }
 assert() { local n=$1; shift; if "$@" >/dev/null 2>&1; then ok; else no "$n"; fi; }
-refute() { local n=$1; shift; if "$@" >/dev/null 2>&1; then no "$n (succeeded)"; else ok; fi; }
+# refute NAME CMD... -- the command must exit 1 exactly.
+#
+# This was `if "$@"; then no; else ok; fi`, which accepted any nonzero status
+# as a refusal. PLAN.md:52 gives the contract as "0 success, 1 refused or not
+# found, 2 the command line was wrong" and nothing asserted it, so a crash
+# counted as a clean refusal across all 15 refusal assertions: replacing
+# die()'s exit(1) with a null-pointer store left "1002 passed, 0 failed" and
+# exit 0, with four segfaults printed by the shell.
+#
+# It also makes the Makefile's ASAN_OPTIONS=exitcode=86 true. That comment
+# says exitcode=86 is load-bearing "because t/run.sh asserts exit 1 to mean
+# cleanly refused" -- which it did not, anywhere; a sanitizer abort exiting 1
+# was indistinguishable from a refusal. Now it is.
+refute() {
+	local n=$1; shift
+	"$@" >/dev/null 2>&1
+	local rc=$?
+	if [ "$rc" -eq 1 ]; then ok
+	elif [ "$rc" -eq 0 ]; then no "$n (succeeded)"
+	else no "$n (exit $rc, not a clean refusal)"; fi
+}
 
 [ -x "$GITOBJ" ] || { echo "no $GITOBJ -- run make first"; exit 1; }
 
@@ -193,7 +213,9 @@ mkdir -p "$TMP/corrupt/objects"
 cp -r "$TMP/corpus/cc/objects/"[0-9a-f][0-9a-f] "$TMP/corrupt/objects/" 2>/dev/null
 victim=$("$GITOBJ" ls "$TMP/corrupt/objects" | awk '$2=="blob"{print $1; exit}')
 printf 'tampered\n' > "$TMP/t.in"
-"$GITOBJ" hash blob "$TMP/t.in" >/dev/null
+# (A `"$GITOBJ" hash blob` on this file used to sit here with its output sent
+# to /dev/null and its status ignored. git writes the object on the next line
+# and names it on the one after, so nothing used gitobj's answer.)
 $SG hash-object -w "$TMP/t.in" >/dev/null
 nb=$($SG hash-object "$TMP/t.in")
 cp "$SCRATCH/.git/objects/${nb:0:2}/${nb:2}" \
