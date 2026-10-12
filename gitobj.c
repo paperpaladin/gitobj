@@ -1,16 +1,20 @@
-/* gitobj. git's object database: reads loose objects, writes loose
- * objects, in one C11 file.
+/* gitobj. git's object database: reads loose objects and pack indexes,
+ * writes loose objects, in one C11 file.
  *
- * The four object types. NOT packfiles: the v2 index, the pack format and
- * both delta encodings are planned and absent, see README.md, which says so
- * first. The writer compresses nothing (zlib stored blocks), which git reads
- * and no one should use for a real repository; that is in README.md too. No
- * libgit2, no zlib, no shelling out to git. git is the authority this is
- * measured against, never a dependency.
+ * The four object types, and a packfile's v2 index. NOT the pack itself: the
+ * entry type and size varint, both delta encodings and delta chains are
+ * planned and absent, so a packed object has a name, an offset and a CRC here
+ * and no content. See README.md, which says so first. The writer compresses
+ * nothing (zlib stored blocks), which git reads and no one should use for a
+ * real repository; that is in README.md too. No libgit2, no zlib, no shelling
+ * out to git. git is the authority this is measured against, never a
+ * dependency.
  *
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
  * read is self-checking: if the bytes we reconstructed hash back to the name
- * we looked them up by, the whole decode path was right. See README.md.
+ * we looked them up by, the whole decode path was right. That covers the
+ * loose objects; an index entry has no payload to hash, so its checks are the
+ * fanout against the name list and the CRC against the pack. See README.md.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
@@ -948,6 +952,177 @@ static int hdr_print(const uint8_t *p, size_t n, const char *key) {
 	return found;
 }
 
+/* ===================================================== the pack v2 index ==
+ *
+ * A .idx is a lookup table over the .pack beside it, and nothing in it is
+ * self-describing: the object count comes from the last fanout entry and the
+ * length of the 64-bit offset table is whatever is left over once everything
+ * else has been accounted for. So the size arithmetic is the first check, not
+ * a sanity check, and every field read below happens after it.
+ *
+ *     "\377tOc"              magic, chosen to be impossible in a v1 index
+ *     uint32 2               version
+ *     uint32 fanout[256]     CUMULATIVE: fanout[i] is how many names have a
+ *                            first byte <= i, so fanout[255] is the count
+ *     uint8  name[n][20]     sorted ascending
+ *     uint32 crc[n]          CRC-32 of the object's bytes AS PACKED
+ *     uint32 off[n]          pack offset, or, with the top bit set, an index
+ *                            into the table below
+ *     uint64 off64[m]        offsets at or above 2^31
+ *     uint8  packsum[20]     the .pack's own trailing checksum
+ *     uint8  idxsum[20]      SHA-1 of everything above
+ *
+ * Three of those are cross-checks rather than data, and they are the reason
+ * the format is worth reading carefully: the fanout has to agree with the
+ * name list it indexes, the CRC has to agree with the pack, and the declared
+ * count has to agree with the file's own size.
+ */
+
+#define IDX_HDR 1032             /* magic, version, 256 fanout entries */
+#define IDX_TRAIL 40             /* the two checksums */
+#define IDX_ENT 28               /* name + crc + 32-bit offset, per object */
+
+typedef struct {
+	Buf raw;
+	size_t n, nbig;
+	const uint8_t *fan, *names, *crcs, *off32, *off64;
+	size_t via32, via64;         /* which offset path each object took */
+} Idx;
+
+static uint64_t be64(const uint8_t *p) {
+	return (uint64_t)be32(p) << 32 | be32(p + 4);
+}
+
+/* A refusal has to say where. "corrupt index" sends a reader back to a
+ * megabyte of binary with nothing to look at; an entry number or a byte
+ * offset is the whole difference between a message and a diagnosis.
+ *
+ * Two shapes, kept apart because they are not the same claim: dieat() gives a
+ * position to look at, dieval() gives the value the file declared. Reporting
+ * a count as though it were an offset is how a diagnosis starts being wrong. */
+static void dieat(const char *m, size_t at) {
+	fprintf(stderr, "gitobj: %s at %zu\n", m, at);
+	exit(1);
+}
+static void dieval(const char *m, size_t v) {
+	fprintf(stderr, "gitobj: %s: %zu\n", m, v);
+	exit(1);
+}
+
+/* Shrink an allocation to exactly what was read. readall() doubles, so a
+ * 4MB pack sits in an 8MB block and a read one byte past the end lands
+ * megabytes inside a live allocation, where ASan cannot see it. Every length
+ * in an index is a number somebody else wrote, so this is the difference
+ * between a sanitizer run that covers this parser and one that looks as
+ * though it does. */
+static void bexact(Buf *b) {
+	uint8_t *q = realloc(b->p, b->n ? b->n : 1);
+	if (q) { b->p = q; b->cap = b->n; }
+}
+
+static void idx_open(const char *path, Idx *x) {
+	memset(x, 0, sizeof *x);
+	readall(path, &x->raw);
+	bexact(&x->raw);
+	const uint8_t *p = x->raw.p;
+	size_t n = x->raw.n;
+	if (n < IDX_HDR + IDX_TRAIL) dieval("pack index shorter than its header", n);
+	/* A v1 index has no magic: it begins with fanout[0], whose top byte is
+	 * zero for any pack of fewer than 16 million objects. 0xff was picked
+	 * for the first byte of the v2 magic so the two cannot be confused. */
+	if (memcmp(p, "\377tOc", 4))
+		die("not a v2 pack index: bad magic (v1 indexes are not supported)");
+	uint32_t ver = be32(p + 4);
+	if (ver != 2) dieval("unsupported pack index version", ver);
+
+	x->fan = p + 8;
+	for (size_t i = 1; i < 256; i++)
+		if (be32(x->fan + 4 * i) < be32(x->fan + 4 * (i - 1)))
+			dieat("fanout entry goes backwards", i);
+	x->n = be32(x->fan + 4 * 255);
+
+	/* Division, not multiplication: n is a 32-bit field and n * IDX_ENT
+	 * would be the overflow this check exists to catch. */
+	size_t body = n - IDX_HDR - IDX_TRAIL;
+	if (x->n > body / IDX_ENT)
+		dieval("pack index too small for the object count it declares", x->n);
+	size_t rest = body - x->n * IDX_ENT;
+	if (rest % 8)
+		dieat("pack index ends in a partial 64-bit offset", n - IDX_TRAIL - rest % 8);
+	x->nbig = rest / 8;
+	/* git's own size check allows at most n-1 large offsets, because the
+	 * first object in a pack sits at offset 12 and can never need one. An
+	 * index with more is one `git verify-pack` calls "wrong index v2 file
+	 * size", and that is where this rule came from: an all-indirect fixture
+	 * was built here, git refused it, and the limit was news. */
+	if (x->nbig && x->nbig >= x->n)
+		dieval("more 64-bit offsets than objects that could need one", x->nbig);
+
+	x->names = p + IDX_HDR;
+	x->crcs = x->names + 20 * x->n;
+	x->off32 = x->crcs + 4 * x->n;
+	x->off64 = x->off32 + 4 * x->n;
+
+	uint8_t sum[20];
+	Sha1 s;
+	sha1_init(&s);
+	sha1_update(&s, p, n - 20);
+	sha1_final(&s, sum);
+	if (memcmp(sum, p + n - 20, 20)) dieat("pack index checksum mismatch", n - 20);
+
+	for (size_t i = 1; i < x->n; i++)
+		if (memcmp(x->names + 20 * i, x->names + 20 * (i - 1), 20) <= 0)
+			dieat("object names are not in increasing order", i);
+	/* The fanout is checked against the names rather than merely for being
+	 * monotonic: an index whose fanout is internally tidy and disagrees
+	 * with its name list is the one git's binary search silently fails to
+	 * find objects in. */
+	size_t at = 0;
+	for (size_t b = 0; b < 256; b++) {
+		size_t end = be32(x->fan + 4 * b);
+		for (; at < end; at++)
+			if (x->names[20 * at] != (uint8_t)b)
+				dieat("fanout bucket disagrees with the name it indexes", at);
+	}
+}
+
+/* The escape: an offset at or above 2^31 does not fit in the 32-bit entry, so
+ * the entry holds the top bit plus an index into the 64-bit table. A pack
+ * needing it is over two gigabytes, which is why this path is the one readers
+ * get wrong -- it is never reached by accident. */
+static uint64_t idx_offset(Idx *x, size_t i) {
+	uint32_t v = be32(x->off32 + 4 * i);
+	if (!(v & 0x80000000u)) { x->via32++; return v; }
+	size_t k = v & 0x7fffffffu;
+	if (k >= x->nbig) dieat("64-bit offset index past the end of the table", i);
+	x->via64++;
+	return be64(x->off64 + 8 * k);
+}
+
+/* CRC-32 as zlib and git compute it: reflected, polynomial 0xedb88320, both
+ * ends inverted. Bit at a time, because the whole corpus is a few megabytes
+ * and a 1KB table would be the only lookup table in the file. */
+static uint32_t crc32z(const uint8_t *p, size_t n) {
+	uint32_t c = 0xffffffffu;
+	for (size_t i = 0; i < n; i++) {
+		c ^= p[i];
+		for (int k = 0; k < 8; k++)
+			c = (c >> 1) ^ ((c & 1) ? 0xedb88320u : 0);
+	}
+	return ~c;
+}
+
+/* An object's packed bytes run from its own offset to the next offset in PACK
+ * order, and the index is sorted by NAME, so the extents only exist once the
+ * offsets have been sorted. That is what makes every CRC in the index
+ * checkable without parsing a single pack entry. */
+typedef struct { uint64_t off; uint32_t i; } Pofs;
+
+static int pofscmp(const void *a, const void *b) {
+	uint64_t x = ((const Pofs *)a)->off, y = ((const Pofs *)b)->off;
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
 /* ------------------------------------------------- enumerating the store */
 
 typedef struct { char (*v)[41]; size_t n, cap; } Names;
@@ -1005,6 +1180,8 @@ static int usage(void) {
 	      "       gitobj mktree <objdir>\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
 	      "       gitobj ls|verify <objdir>\n"
+	      "       gitobj idx <pack.idx>\n"
+	      "       gitobj idxcrc <pack.idx>\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
 	      "       gitobj msg <objdir> <sha>\n", stderr);
 	return 2;
@@ -1115,6 +1292,96 @@ int main(int argc, char **argv) {
 		int found = hdr_print(o.data.p, o.data.n, argv[4]);
 		bfree(&o.data);
 		return found ? 0 : 1;
+	}
+
+	/* `git show-index` prints exactly these three fields in exactly this
+	 * format, so stdout here is comparable with it line for line. The
+	 * census goes to stderr: a 64-bit offset test over a corpus with no
+	 * large offsets passes while that code never runs, so the number of
+	 * objects that took each path is part of the output rather than
+	 * something to be assumed. */
+	if (!strcmp(cmd, "idx") && argc == 3) {
+		Idx x;
+		idx_open(argv[2], &x);
+		char hex[41];
+		for (size_t i = 0; i < x.n; i++) {
+			uint64_t off = idx_offset(&x, i);
+			hexify(x.names + 20 * i, hex);
+			printf("%llu %s (%08x)\n", (unsigned long long)off, hex,
+			       (unsigned)be32(x.crcs + 4 * i));
+		}
+		fprintf(stderr, "%zu objects, %zu direct, %zu via the 64-bit table of %zu\n",
+		        x.n, x.via32, x.via64, x.nbig);
+		bfree(&x.raw);
+		return 0;
+	}
+
+	if (!strcmp(cmd, "idxcrc") && argc == 3) {
+		Idx x;
+		idx_open(argv[2], &x);
+		size_t pl = strlen(argv[2]);
+		if (pl < 4 || strcmp(argv[2] + pl - 4, ".idx"))
+			die2("not a .idx path", argv[2]);
+		char pp[4096];
+		if ((size_t)snprintf(pp, sizeof pp, "%.*s.pack", (int)(pl - 4), argv[2])
+		    >= sizeof pp)
+			die("pack path too long");
+		Buf pk = {0};
+		readall(pp, &pk);
+		bexact(&pk);
+		/* 12 bytes of header, 20 of trailing checksum, and at least one
+		 * byte between them for the smallest possible object. */
+		if (pk.n < 33) dieval("pack shorter than a header and a trailer", pk.n);
+		if (memcmp(pk.p, "PACK", 4)) die2("not a packfile", pp);
+		if (be32(pk.p + 4) != 2) dieval("unsupported pack version", be32(pk.p + 4));
+		if (be32(pk.p + 8) != x.n)
+			dieval("pack object count disagrees with the index", be32(pk.p + 8));
+		if (memcmp(x.raw.p + x.raw.n - 40, pk.p + pk.n - 20, 20))
+			dieat("the pack checksum in the index is not the trailer the pack carries",
+			      x.raw.n - 40);
+
+		Pofs *v = malloc(x.n ? x.n * sizeof *v : 1);
+		if (!v) die("out of memory");
+		for (size_t i = 0; i < x.n; i++) {
+			v[i].off = idx_offset(&x, i);
+			v[i].i = (uint32_t)i;
+		}
+		if (x.n) qsort(v, x.n, sizeof *v, pofscmp);
+		/* Every offset is checked before any extent is derived from one.
+		 * Checking them inside the loop below is not the same thing: an
+		 * object's length comes from the NEXT offset, so one bogus entry
+		 * makes its predecessor's extent run off the end of the pack, and
+		 * the predecessor's own offset is perfectly valid. That version
+		 * segfaulted on the first fixture that pointed an offset past the
+		 * pack, which is what the fixture was for. */
+		for (size_t k = 0; k < x.n; k++) {
+			if (v[k].off < 12 || v[k].off >= pk.n - 20)
+				dieat("index offset is outside the pack", v[k].i);
+			if (k && v[k].off == v[k - 1].off)
+				dieat("two objects share a pack offset", v[k].i);
+		}
+		size_t bad = 0;
+		char hex[41];
+		for (size_t k = 0; k < x.n; k++) {
+			uint64_t beg = v[k].off;
+			uint64_t end = k + 1 < x.n ? v[k + 1].off : pk.n - 20;
+			uint32_t got = crc32z(pk.p + beg, (size_t)(end - beg));
+			uint32_t want = be32(x.crcs + 4 * v[k].i);
+			if (got != want) {
+				hexify(x.names + 20 * v[k].i, hex);
+				printf("CRC MISMATCH %s at %llu: %08x, index says %08x\n",
+				       hex, (unsigned long long)beg, (unsigned)got,
+				       (unsigned)want);
+				bad++;
+			}
+		}
+		printf("%zu objects, %zu bad crcs\n", x.n, bad);
+		fprintf(stderr, "%zu objects, %zu direct, %zu via the 64-bit table of %zu\n",
+		        x.n, x.via32, x.via64, x.nbig);
+		free(v);
+		bfree(&pk);
+		bfree(&x.raw);
+		return bad ? 1 : 0;
 	}
 
 	if (argc == 3 && (!strcmp(cmd, "ls") || !strcmp(cmd, "verify"))) {

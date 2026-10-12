@@ -17,12 +17,19 @@ gitobj ls     <objdir>                 every object: sha, type, size
 gitobj verify <objdir>                 hash every object against its own name
 gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
 gitobj mktree <objdir>                 git-mktree format on stdin, store a tree
+gitobj idx    <pack.idx>               `git show-index` layout: offset, name, crc
+gitobj idxcrc <pack.idx>               every CRC against the pack beside it
 
 Planned and NOT PRESENT. These were listed above as though they existed, and
-`write` and `mktree` were two of them until they were written:
+`write`, `mktree` and the two index commands were four of them until they
+were written:
 
 gitobj packls <idx>                    `git verify-pack -v` layout
 ```
+
+`packls` is not `idx` under another name. Its columns are the pack entry's
+type, its inflated size and its size in the pack, none of which can be
+computed without walking the pack.
 
 In scope:
 
@@ -41,13 +48,19 @@ In scope:
   object is absent or of another type; `git fsck` is what catches that.
 * tree entry modes: `100644`, `100755`, `120000`, `40000` (stored without
   the leading zero) and `160000` gitlinks.
-In scope and NOT YET WRITTEN. Listed here without that qualification until
-an audit pointed out there is no pack code in `gitobj.c` at all. The only
-trace is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum, and neither constant
-is ever read:
+* the pack v2 index: the 256-entry cumulative fanout checked against the
+  sorted name list it indexes, the CRC of every object's packed bytes checked
+  against the pack, and both offset encodings, including the escape into the
+  64-bit table for an offset at or above 2^31. A v1 index is refused by name.
+  The pack header is read only to cross-check its object count and its
+  trailing checksum against the index; nothing else in the pack is parsed.
 
-* packfiles: the v2 index with its fanout table and 64-bit offset
-  escape, the pack header and per-object type/size varint, and both delta
+In scope and NOT YET WRITTEN. Listed here without that qualification until
+an audit pointed out there was no pack code in `gitobj.c` at all. The index
+is the first part of it to exist; `T_OFS_DELTA = 6, T_REF_DELTA = 7` are
+still in an enum and neither constant is ever read:
+
+* the pack header and per-object type/size varint, and both delta
   encodings: `OFS_DELTA` with its own distinct negative-offset varint, and
   `REF_DELTA` with a 20-byte base name.
 * delta application: base/result size varints and the copy/insert
@@ -72,14 +85,19 @@ the delta chain beneath it. If a single byte of any of that is wrong the hash
 does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
-**It currently covers the LOOSE objects only, which is 539 of the 1902 in
-the corpus: 28%.** All eight sibling repositories in the corpus have a
-packfile whose contents are never read, because there is no pack reader;
-only the three this suite builds for itself are wholly loose. This
-section said "loose and packed" and that was the strongest claim in the
-file and the one that was not true. The counts move with every commit or
-repack in a sibling; they were 497 of 1860 at the last commit and 585 of
-2468 before that.
+**It currently covers the LOOSE objects only, which is 699 of the 2062 in
+the corpus: 34%.** The eight sibling repositories have a packfile whose
+contents are still never read: the index names all 1363 packed objects and
+gives an offset and a CRC for each, and there is nothing in an index to
+hash. This section said "loose and packed" and that was the strongest claim
+in the file and the one that was not true. The counts move with every commit
+or repack in a sibling; they were 539 of 1902 at the last commit.
+
+The index has its own invariants, and they are cross-checks rather than
+hashes: the fanout must agree with the name list it indexes, the CRC must
+agree with the pack bytes between one offset and the next, and the declared
+object count must agree with the file's own size. The first and the third
+are what a reader can check with no other file open.
 
 The other half of the invariant is that git accepts what we write, and that
 half now runs for loose objects and for trees we construct ourselves:
@@ -111,14 +129,24 @@ Ranked, strongest first, by how little of it we control.
    `%ae`, `%ad --date=raw`, `%e`), and `git cat-file -p` for the message
    bytes, so CRLF and trailing whitespace are checked as bytes, not as
    a description.
-5. ASan + UBSan over the whole suite (`make test-asan`).
+5. `git show-index`, `git verify-pack` and `git index-pack -o` over a pack
+   index. The first prints an offset, a name and a CRC per object and reads
+   nothing but the index, which is the only reason a hand-built 64-bit
+   offset table can be checked at all. The second reads the index and the
+   pack together and is the authority on whether an index we accept is one
+   git accepts, including for every corrupt fixture. The third builds an
+   index from the pack alone, so a corpus index is compared against one git
+   wrote today from the same bytes.
+6. ASan + UBSan over the whole suite (`make test-asan`), with both the index
+   and the pack trimmed to exactly the bytes read, since `readall()` doubles
+   and a buffer bigger than its data turns the sanitizer off.
 
-Item 3 was one of four oracles struck off this list for not existing, and is
-the first of them to come back. The other three still do not exist:
-`git verify-pack -v` against a `packls` that is not written, repacking for
-encodings the corpus lacks, and a mutation sweep over packs and indexes. They are oracles for work in the commit sequence
-below, and listing them here made the suite sound four oracles stronger
-than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh` returns nothing.
+Item 3 was one of four oracles struck off this list for not existing, and
+item 5 is most of a second. What is still missing from item 5 is the
+`verify-pack -v` COLUMNS: type, size and size-in-pack, which need the pack
+walk. The other two struck-off oracles also still do not exist: repacking
+for encodings the corpus lacks, and a mutation sweep driven from the suite
+rather than by hand.
 
 ## Non-goals
 
@@ -218,9 +246,73 @@ than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh` returns noth
       written-object counter disagree with git's object count by one. The
       count is cross-checked against `cat-file --batch-all-objects`, which
       is the only reason it showed up.
-- [ ] the pack v2 index: fanout, names, CRCs, 32- and 64-bit offsets
+- [x] the pack v2 index: fanout, names, CRCs, 32- and 64-bit offsets
       why: the pack is unreadable without it, and the fanout table is a
       self-checking structure (it must end at the object count).
+      files: gitobj.c (be64, dieat, dieval, bexact, idx_open, idx_offset,
+      crc32z, pofscmp and the `idx` and `idxcrc` commands), t/run.sh
+      section 8, README.md
+      proves: 1486 index entries over 9 packs, offset, name and CRC each,
+      compared per object against `git show-index` rather than per pack: a
+      whole-file diff over a thousand objects says only that something
+      somewhere disagreed. Every CRC is recomputed from the pack bytes
+      between one offset and the next, which means the extents are checked
+      too, since the index is sorted by name and the extents only exist
+      once the offsets are sorted. `git verify-pack` accepts all 9 indexes
+      and `git index-pack -o` rebuilds each one byte for byte from its pack.
+      2591 assertions before, 4472 after; 1862 to 2324 cloned alone, which
+      is the number to quote.
+      proves, for the 64-bit offset table: 134 objects reach it, and the
+      same 134 in a standalone clone, because no pack in any corpus is over
+      two gigabytes and none ever will be. 122 of them are a real pack whose
+      index the suite rewrites to route every offset but the first through
+      the table: `git verify-pack` reads the pack through it, `git cat-file`
+      gets blob content out of a repository whose only index is that one,
+      and `git fsck` is clean. The other 12 are offsets no pack here could
+      have, 2^31-1 through 2^64-1, where `git show-index` is the oracle
+      because it reads the index and nothing else. The first of those is
+      BELOW 2^31 and still goes through the table, so the indirection is
+      tested apart from the magnitude.
+      proves, for refusals: 11 corrupt indexes and 4 bad index/pack pairs,
+      each refused with a position and the message asserted, not just the
+      exit status. `git verify-pack` refuses all 15; `git show-index` sees 4
+      of the 11 and the suite says which 4 and why. A fanout entry that
+      disagrees with its names is the one corruption with a consequence
+      rather than a parse error: `git cat-file -e` can no longer find the
+      object it misplaces, and that is an assertion.
+      found: `idxcrc` segfaulted on the first fixture that pointed an offset
+      past the end of the pack. It validated each offset in the loop that
+      used it, and an object's length comes from the NEXT offset, so one
+      bogus entry made its PREDECESSOR's extent run off the end of the pack
+      while the predecessor's own offset was fine. Offsets are all checked
+      before any extent is derived from one now.
+      found: git allows at most n-1 large offsets, because the first object
+      in a pack is at offset 12 and can never need one. An index routing all
+      n through the table is one `git verify-pack` calls "wrong index v2
+      file size". That was the first fixture built here and the limit was
+      news; gitobj enforces it, and the over-full index is a refusal case.
+      found: the sanitizer could not see this parser. `readall()` doubles, so
+      a 4MB pack sat in an 8MB block. Both files are trimmed to exactly what
+      was read, and with the two index size checks deleted the trimmed build
+      reports a heap-buffer-overflow on a 20-byte name comparison where the
+      untrimmed build reports nothing, reads 140 names out of the rounded-up
+      allocation, and refuses the file for an unrelated reason.
+      found: 31 mutations, 30 red, 1 survivor. Seven survived the first
+      sweep and five of those were the FIXTURES, not the code. Deleting the
+      fanout monotonic check changed nothing because the fixture put the
+      backwards step next to a non-empty bucket, where the walk over the
+      names catches it; the fixture uses an empty bucket now, which is the
+      blind spot the check is for. Three fixtures were two lies rather than
+      one (a raw-byte edit left the index checksum broken, so the checksum
+      check fired and the check under test was never reached) and every
+      fixture carries a correct checksum now. There was no duplicate-name
+      fixture at all, so relaxing the name comparison from `<=` to `<` was
+      invisible. The last two, deleting the index size arithmetic and
+      deleting the duplicate-offset check, leave the file still refused for
+      a different reason with the same exit status, and die only on the
+      message text, which is why every refusal asserts its message.
+      survivor: trimming the file buffers. No assertion fails without it,
+      by construction, and the measurement above is what it is for.
 - [ ] the pack walk: type/size varint, non-delta objects, `ls`
       why: gets `verify-pack`'s first five columns under oracle before the
       delta machinery, so a later failure is unambiguously a delta bug.
@@ -255,21 +347,24 @@ than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh` returns noth
       broken, but no one would use this to write a real repository.
 - [ ] a delta base cache, so a chain of depth N costs N inflations once,
   not N inflations per object in it
-      why: `packls` on a 1163-object pack would be the slowest thing in the
+      why: `packls` over a whole pack would be the slowest thing in the
       suite, and the fix is a four-entry LRU keyed on pack offset. (`packls`
       does not exist; see the note at the head of this file.)
-- [ ] 64-bit pack offsets exercised for real
-      why: the offset64 escape in the v2 index *cannot* be tested without a
-      pack above 4GiB, so it will need a hand-built index as its only
-      coverage. There is no v2 index code at all today, this said it was
-      implemented and dead, which would at least have been something.
+- [ ] an index git itself wrote with a 64-bit offset in it
+      why: the escape is exercised now, by an index the suite rewrites so
+      that git resolves a real pack through the table and by offsets written
+      in by hand, both with git as the oracle. What no fixture can be is a
+      pack over two gigabytes, so the one thing still untested is an index
+      git PRODUCED with a large offset: `git index-pack` choosing the escape
+      itself. That needs 2GB of pack and a suite willing to spend it.
 - [ ] `gitobj write` for packed input, i.e. unpack-objects
       why: the natural completion of having both halves, and it makes the
       three-hop `pack -> loose -> git fsck` round trip possible.
 - [ ] abbreviated object names, by binary search over the index fanout
       why: every human-facing git command takes a 7-character prefix, and
-      once there is a fanout table this becomes a ten-line function. There is
-      no fanout table yet.
+      the fanout is read now, so this is a ten-line function over `idx_open`
+      plus the ambiguity check. It also needs the loose objects, where the
+      fan-out directory does the same job.
 - [ ] `objects/info/alternates`, so a repository whose objects live in a
       borrowed object store can be read at all
       why: every `git clone -s` and most CI caches look like this, and we

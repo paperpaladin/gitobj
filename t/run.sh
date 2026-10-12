@@ -294,10 +294,10 @@ printf 'verified %d loose objects across %s\n' "$total_verified" \
 
 # `gitobj ls` against `git cat-file --batch-all-objects --batch-check`, which
 # emits exactly the same three fields. Only repositories with no packfile can
-# be compared whole this way. There is no section 9 and no packed half:
-# gitobj has no pack reader, 76% of the corpus objects are packed and
-# unread, and this comment pointed at work that was never written. See
-# README.md.
+# be compared whole this way. `ls` reads loose objects only: section 8 reads
+# the pack INDEX, which has no type or size in it, so a packed object still
+# cannot be listed. This comment used to point at a section 9 that was never
+# written. See README.md.
 # This is the ONLY place `gitobj ls` is compared against git over a whole
 # repository, and the skip below is silent -- so when every corpus repo has a
 # packfile (7 of the 9 do today) the loop body never runs and the oracle
@@ -953,6 +953,498 @@ mk_strict "an empty entry name" '100644 blob %s\t\n' "$sb"
 refute "mktree refuses an object directory that does not exist" \
 	sh -c "'$GITOBJ' mktree '$TMP/no/such/objects' < '$TMP/sortin'"
 
+# =====================================================================
+# 8. the pack v2 index: fanout, names, CRCs, and both offset widths
+# =====================================================================
+# Nothing in a .idx is self-describing. The object count is the last fanout
+# entry and the length of the 64-bit offset table is whatever is left over
+# once everything else is accounted for, so a lie about any length is a lie
+# about where every later field begins.
+#
+# Three oracles, none of which need a pack reader:
+#
+#   git show-index      offset, name and CRC for every object, and the only
+#                       one that works on an index with no pack beside it,
+#                       which is what makes a hand-built 64-bit offset
+#                       table checkable at all.
+#   git verify-pack     reads the index AND the pack, so it is the authority
+#                       on whether an index we accept is one git accepts.
+#   git index-pack      builds an index from the pack's own bytes, so the
+#                       corpus index can be compared against one git wrote
+#                       today from the same pack.
+#
+# `--object-format=sha1` is not decoration on show-index: outside a
+# repository it has no config to read the hash algorithm from and segfaults,
+# which looks exactly like a corrupt fixture.
+cat > "$TMP/idxtool.py" <<'PYIDX'
+# Reads, rebuilds and mutates a pack v2 index. The suite checks that a
+# rebuild of git's own index is byte-identical to it, so a fixture built
+# here differs from what git wrote only where it was asked to.
+import hashlib, struct, sys
+
+HDR = 1032  # magic, version, 256 fanout entries
+
+def parse(b):
+    assert b[:4] == b'\377tOc', 'not a v2 index'
+    assert struct.unpack('>I', b[4:8])[0] == 2, 'not version 2'
+    fan = list(struct.unpack('>256I', b[8:HDR]))
+    n = fan[255]
+    o = HDR
+    names = [b[o + 20 * i:o + 20 * i + 20] for i in range(n)]; o += 20 * n
+    crcs = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+    off = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+    rest = len(b) - 40 - o
+    assert rest % 8 == 0, 'trailing bytes are not whole 64-bit offsets'
+    big = list(struct.unpack('>%dQ' % (rest // 8), b[o:o + rest]))
+    return dict(fan=fan, names=names, crcs=crcs, off=off, big=big,
+                packsum=b[-40:-20])
+
+def build(d, fan=None, sum_ok=True):
+    n = len(d['names'])
+    if fan is None:
+        # Counted from the names, so a fixture that reorders names keeps a
+        # fanout that agrees with them and the defect stays the one intended.
+        c = [0] * 256
+        for nm in d['names']:
+            c[nm[0]] += 1
+        fan, t = [], 0
+        for i in range(256):
+            t += c[i]
+            fan.append(t)
+    out = b'\377tOc' + struct.pack('>I', 2) + struct.pack('>256I', *fan)
+    out += b''.join(d['names'])
+    out += struct.pack('>%dI' % n, *d['crcs'])
+    out += struct.pack('>%dI' % n, *d['off'])
+    out += struct.pack('>%dQ' % len(d['big']), *d['big'])
+    out += d['packsum']
+    return out + (hashlib.sha1(out).digest() if sum_ok else bytes(20))
+
+# Offsets that span the whole 64-bit range, including both sides of 2^31
+# (where the escape begins), both sides of 2^32, and the top bit, which is
+# where a reader holding an offset in a signed type goes negative. The first
+# value is UNDER 2^31 and still reached through the table: git follows the
+# indirection on the top bit alone, never on the magnitude.
+BIGVALS = [(1 << 31) - 1, 1 << 31, (1 << 31) + 1, (1 << 32) - 1, 1 << 32,
+           1 << 40, 1 << 48, (1 << 52) + 12345, 1 << 62, 1 << 63,
+           (1 << 63) + 7, (1 << 64) - 1]
+
+def resum(b):
+    # Every fixture carries a CORRECT trailing checksum, so each one is a
+    # single lie. Without this, a mutation of the raw bytes is two lies and
+    # the checksum is what gets caught, which makes the check it was built
+    # for impossible to tell apart from the checksum check.
+    return b[:-20] + hashlib.sha1(b[:-20]).digest()
+
+def mutate(kind, raw, d):
+    n = len(d['names'])
+    if kind == 'trunc':
+        return resum(raw[:len(raw) // 2])
+    if kind == 'magic':       # what a v1 index looks like: no magic at all
+        return resum(bytes(4) + raw[4:])
+    if kind == 'ver':
+        return resum(raw[:4] + struct.pack('>I', 3) + raw[8:])
+    if kind == 'partial8':    # four bytes where only multiples of eight fit
+        return resum(raw[:-20] + bytes(4) + raw[-20:])
+    if kind == 'idxsum':
+        return build(d, sum_ok=False)
+    if kind == 'fanback':
+        # One entry below its predecessor, with the count intact. The bucket
+        # chosen is an EMPTY one, which is where the walk over the names
+        # cannot see the decrease: it skips a bucket whose end is behind
+        # where it has already reached, and every later name still lands in
+        # the bucket that claims it. Put the decrease next to a non-empty
+        # bucket instead and the bucket check catches it, which is exactly
+        # how this fixture was built first and why deleting the monotonic
+        # check changed nothing.
+        fan = list(d['fan'])
+        k = next(i for i in range(1, 255) if fan[i] == fan[i - 1] and fan[i - 1] > 0)
+        fan[k] = fan[k - 1] - 1
+        return build(d, fan=fan)
+    if kind == 'unsorted':    # two adjacent objects exchanged, data and all
+        for key in ('names', 'crcs', 'off'):
+            d[key][0], d[key][1] = d[key][1], d[key][0]
+        return build(d)
+    if kind == 'dupname':     # the same object name twice, in order
+        d['names'][1] = d['names'][0]
+        return build(d)
+    if kind == 'fanbucket':
+        # One bucket boundary moved up by one. Monotonic, the count is
+        # unchanged, the names are still sorted, and the object at the new
+        # boundary is claimed by a bucket its first byte does not belong to.
+        fan = list(d['fan'])
+        k = next(i for i in range(255) if fan[i] < fan[i + 1])
+        fan[k] += 1
+        return build(d, fan=fan)
+    if kind == 'bigpast':     # indirection one entry past the table
+        d['off'][0] = 0x80000000 | len(d['big'])
+        return build(d)
+    if kind == 'crcbit':
+        d['crcs'][0] ^= 1
+        return build(d)
+    if kind == 'offpast':     # inside the 32-bit field, outside the pack
+        d['off'][0] = 0x7ffffffe
+        return build(d)
+    if kind == 'offdup':      # two objects claiming one offset
+        d['off'][1] = d['off'][0]
+        return build(d)
+    if kind == 'indirect':
+        # Every offset but the first through the 64-bit table. Not every
+        # offset: git's index size check allows at most n-1 large offsets,
+        # since the first object in a pack is at offset 12 and cannot need
+        # one, and it calls an index with n of them "wrong index v2 file
+        # size". `bigtoomany` below is that index.
+        d['big'] = list(d['off'][1:])
+        d['off'] = [d['off'][0]] + [0x80000000 | i for i in range(n - 1)]
+        return build(d)
+    if kind == 'bigtoomany':  # one more large offset than git will allow
+        d['big'] = list(d['off'])
+        d['off'] = [0x80000000 | i for i in range(n)]
+        return build(d)
+    if kind == 'bigoff':      # offsets no real pack here could reach
+        d['big'] = list(BIGVALS)
+        d['off'] = [0x80000000 | i if i < len(BIGVALS) else 12 + i
+                    for i in range(n)]
+        return build(d)
+    raise SystemExit('unknown mutation ' + kind)
+
+kind, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(src, 'rb').read()
+d = parse(raw)
+out = build(d) if kind == 'rebuild' else mutate(kind, raw, d)
+open(dst, 'wb').write(out)
+PYIDX
+
+# The pack header's object count and the pack's own trailing checksum, which
+# the index carries a copy of. Both are cross-checks between the two files
+# rather than anything inside either one.
+cat > "$TMP/packmut.py" <<'PYPACK'
+import struct, sys
+kind, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+b = open(src, 'rb').read()
+if kind == 'count':
+    b = b[:8] + struct.pack('>I', struct.unpack('>I', b[8:12])[0] + 1) + b[12:]
+elif kind == 'sum':
+    b = b[:-1] + bytes([b[-1] ^ 0xff])
+else:
+    raise SystemExit('unknown pack mutation ' + kind)
+open(dst, 'wb').write(b)
+PYPACK
+
+# git creates packs and indexes read-only (0444), so copying one over a copy
+# made a moment earlier fails with EACCES and the harness goes on to compare
+# the file it did not write. Every copy below goes through this.
+cpw() { rm -f "$2"; cp "$1" "$2"; chmod u+rw "$2"; }
+
+# A pack of our own, so a clone with no siblings still has one. The self
+# corpus is deliberately unpacked (section 2 compares `ls` over a whole
+# repository, which only works with no pack), so the pack is built beside it
+# rather than in it.
+mkdir -p "$TMP/packs"
+SELFREPO=$TMP/corpus/$(printf '%s\n' $HAVE_SELF | head -1)
+$GIT --git-dir="$SELFREPO" cat-file --batch-all-objects --batch-check |
+	awk '{print $1}' > "$TMP/packs/in"
+NSELF=$(wc -l < "$TMP/packs/in" | tr -d ' ')
+SELFPACK=$($GIT --git-dir="$SELFREPO" pack-objects --non-empty \
+	"$TMP/packs/self" < "$TMP/packs/in")
+SELFIDX="$TMP/packs/self-$SELFPACK.idx"
+assert "a pack was built from the self corpus" test -f "$SELFIDX"
+eq "and it holds every object of the self corpus" \
+	"$($GIT show-index --object-format=sha1 < "$SELFIDX" | wc -l | tr -d ' ')" \
+	"$NSELF"
+
+# Every index in reach: ours first, then whichever siblings were copied.
+IDXES="$SELFIDX"
+for r in $HAVE_SMALL $HAVE_BIG; do
+	for i in "$TMP/corpus/$r/objects/pack/"*.idx; do
+		[ -f "$i" ] && IDXES="$IDXES $i"
+	done
+done
+
+# Per object, not per index. A whole-file diff over a thousand objects says
+# only that something somewhere disagreed; this names the object.
+# via32_total and via64_total are the census: how many objects were read
+# through each of the two offset encodings, summed over every index. A
+# 64-bit offset test over a corpus with no large offsets passes while
+# reading nothing, so these are counted here rather than assumed, and the
+# accumulation lives inside this function so no caller can forget it.
+via32_total=0
+via64_total=0
+idx_vs_showindex() { # <label> <idx>
+	"$GITOBJ" idx "$2" > "$TMP/i.ours" 2> "$TMP/i.census"
+	eq "$1: idx exits 0" "$?" 0
+	$GIT show-index --object-format=sha1 < "$2" > "$TMP/i.theirs"
+	eq "$1: same number of objects as show-index" \
+		"$(wc -l < "$TMP/i.ours" | tr -d ' ')" "$(wc -l < "$TMP/i.theirs" | tr -d ' ')"
+	local a b sha
+	while IFS= read -r a <&3 && IFS= read -r b <&4; do
+		sha=${b#* }; sha=${sha%% *}
+		eq "$1 $sha" "$a" "$b"
+	done 3< "$TMP/i.ours" 4< "$TMP/i.theirs"
+	via32_total=$((via32_total + $(sed -n \
+		's/.*objects, \([0-9]*\) direct.*/\1/p' "$TMP/i.census")))
+	via64_total=$((via64_total + $(sed -n \
+		's/.*, \([0-9]*\) via the 64-bit.*/\1/p' "$TMP/i.census")))
+}
+
+nidx=0
+npackobj=0
+for i in $IDXES; do
+	tag="idx $(basename "$i")"
+	nidx=$((nidx + 1))
+	idx_vs_showindex "$tag" "$i"
+	npackobj=$((npackobj + $(wc -l < "$TMP/i.ours")))
+	# The CRC in the index is over the object's bytes AS PACKED, which means
+	# the extent of each object in the pack: from its own offset to the next
+	# one in PACK order, which the index only yields once its offsets are
+	# sorted. git wrote these CRCs; we recompute them over git's pack bytes.
+	eq "$tag: every CRC matches the packed data" \
+		"$("$GITOBJ" idxcrc "$i" 2>/dev/null | tail -1)" \
+		"$(wc -l < "$TMP/i.ours" | tr -d ' ') objects, 0 bad crcs"
+	# And git agrees the index is good, so accepting it is not acceptance of
+	# something git would reject.
+	assert "$tag: git verify-pack accepts it" \
+		$GIT -C "$SCRATCH" verify-pack "$i"
+	# The index rebuilt from the pack alone, by git, today. This is the one
+	# comparison where both sides are git's own writers, so a disagreement
+	# would be a repacked corpus rather than a bug here.
+	cpw "$i" "$TMP/orig.idx"
+	cpw "${i%.idx}.pack" "$TMP/re.pack"
+	rm -f "$TMP/re.idx"
+	if $GIT -C "$SCRATCH" index-pack -o "$TMP/re.idx" "$TMP/re.pack" > /dev/null 2>&1; then
+		assert "$tag: git index-pack rebuilds it byte for byte" \
+			cmp -s "$TMP/re.idx" "$TMP/orig.idx"
+		"$GITOBJ" idx "$TMP/re.idx" > "$TMP/i.re" 2>/dev/null
+		assert "$tag: and we read the rebuilt index the same way" \
+			cmp -s "$TMP/i.re" "$TMP/i.ours"
+	else
+		no "$tag: git index-pack could not rebuild it"
+	fi
+	# The mutation fixtures below are only about what was changed if the
+	# rebuild is otherwise exact.
+	python3 "$TMP/idxtool.py" rebuild "$i" "$TMP/rb.idx"
+	assert "$tag: the fixture builder round-trips it byte for byte" \
+		cmp -s "$TMP/rb.idx" "$i"
+done
+[ "$nidx" -ge 1 ] && ok || no "no pack index to read"
+printf 'read %d pack indexes, %d objects\n' "$nidx" "$npackobj"
+
+# --- the 64-bit offset table ----------------------------------------
+# An offset at or above 2^31 does not fit the 32-bit entry, so the entry
+# carries the top bit plus an index into a separate table of 64-bit offsets.
+# A pack that needs it is over two gigabytes, so nothing in any corpus here
+# reaches it and no amount of real data ever will. It is built instead.
+#
+# First over a REAL pack, with every offset routed through the table and the
+# values unchanged. git follows the indirection on the top bit alone, so this
+# is a valid index for that pack: `git verify-pack` reads the pack through it,
+# `git cat-file` gets object content out of it, and both must agree with the
+# plain index they came from.
+IND=$TMP/packs/ind
+mkdir -p "$IND"
+python3 "$TMP/idxtool.py" indirect "$SELFIDX" "$IND/pack-$SELFPACK.idx"
+cpw "$TMP/packs/self-$SELFPACK.pack" "$IND/pack-$SELFPACK.pack"
+assert "the indirect index really differs from the plain one" \
+	sh -c "! cmp -s '$IND/pack-$SELFPACK.idx' '$SELFIDX'"
+idx_vs_showindex "indirect" "$IND/pack-$SELFPACK.idx"
+# Every object, through the table, and nothing left on the direct path.
+ind_census=$(cat "$TMP/i.census")
+eq "the indirect index sends all but the first object through the table" \
+	"$ind_census" \
+	"$NSELF objects, 1 direct, $((NSELF - 1)) via the 64-bit table of $((NSELF - 1))"
+# The offsets have to come out as the plain index's, object for object.
+"$GITOBJ" idx "$SELFIDX" > "$TMP/i.plain" 2>/dev/null
+"$GITOBJ" idx "$IND/pack-$SELFPACK.idx" > "$TMP/i.ind" 2>/dev/null
+assert "the table resolves to the same offsets as the 32-bit entries" \
+	cmp -s "$TMP/i.plain" "$TMP/i.ind"
+eq "and the CRCs still check out, with the extents derived through it" \
+	"$("$GITOBJ" idxcrc "$IND/pack-$SELFPACK.idx" 2>/dev/null | tail -1)" \
+	"$NSELF objects, 0 bad crcs"
+assert "git verify-pack reads the pack through the 64-bit table" \
+	$GIT -C "$SCRATCH" verify-pack "$IND/pack-$SELFPACK.idx"
+# git resolving a NAME to an offset through the table, and inflating what it
+# finds there: the whole lookup path, with git on the far side of it.
+IREPO=$TMP/packs/irepo
+$GIT init -q --bare "$IREPO"
+cpw "$IND/pack-$SELFPACK.idx" "$IREPO/objects/pack/pack-$SELFPACK.idx"
+cpw "$IND/pack-$SELFPACK.pack" "$IREPO/objects/pack/pack-$SELFPACK.pack"
+eq "git lists every object in the repository whose only index is that one" \
+	"$($GIT --git-dir="$IREPO" cat-file --batch-all-objects --batch-check | wc -l | tr -d ' ')" \
+	"$NSELF"
+iblob=$($GIT --git-dir="$IREPO" cat-file --batch-all-objects --batch-check |
+	awk '$2=="blob"{print $1; exit}')
+eq "and reads a blob out of it, through the table" \
+	"$($GIT --git-dir="$IREPO" cat-file blob "$iblob" | wc -c)" \
+	"$($GIT --git-dir="$SELFREPO" cat-file blob "$iblob" | wc -c)"
+$GIT --git-dir="$IREPO" fsck > "$TMP/fsck.out" 2>&1
+assert "git fsck is clean over the repository indexed through the table" \
+	sh -c "! grep -Eiv '^(notice|dangling)' '$TMP/fsck.out' | grep -q ."
+
+# Then the offsets a real pack cannot have: both sides of 2^31 and 2^32, the
+# top bit set, and 2^64-1. There is no pack to go with these, which is why
+# show-index is the oracle: it reads the index and nothing else. The first
+# value is BELOW 2^31 and still goes through the table, so the indirection is
+# tested separately from the magnitude.
+python3 "$TMP/idxtool.py" bigoff "$SELFIDX" "$TMP/big.idx"
+idx_vs_showindex "bigoff" "$TMP/big.idx"
+for v in 2147483647 2147483648 4294967296 9223372036854775808 18446744073709551615; do
+	assert "bigoff: offset $v is read back exactly" \
+		grep -qx "$v [0-9a-f]\{40\} ([0-9a-f]\{8\})" "$TMP/i.ours"
+done
+# The guard against the whole of the above passing vacuously.
+[ "$via64_total" -ge 100 ] && ok ||
+	no "only $via64_total objects went through the 64-bit offset table"
+[ "$via32_total" -ge 100 ] && ok ||
+	no "only $via32_total objects went through a 32-bit offset entry"
+printf '%d objects read through a 32-bit offset, %d through the 64-bit table\n' \
+	"$via32_total" "$via64_total"
+
+# --- refusals -------------------------------------------------------
+# Each of these is one lie about the index, and each refusal has to name a
+# position: "corrupt index" sends a reader back to a megabyte of binary.
+# git is the authority for the lie being a lie, and which git command
+# notices differs -- show-index checks the parts it has to walk, verify-pack
+# checks the index against the pack.
+BAD=$TMP/packs/bad
+mkdir -p "$BAD"
+# The message is asserted, not just the exit status. Refusing for the wrong
+# reason is how a check stops being load-bearing without anything noticing:
+# delete the size arithmetic and a truncated index is still refused, by the
+# count of 64-bit offsets that the broken arithmetic then produces, so the
+# exit status is identical and `refute` cannot tell the two apart. Two
+# mutations survived the whole of this section for exactly that reason, and
+# both die on the text.
+idx_refuse() { # <kind> <what it is> <expected message, an extended regex>
+	python3 "$TMP/idxtool.py" "$1" "$SELFIDX" "$BAD/$1.idx"
+	refute "idx refuses $2" "$GITOBJ" idx "$BAD/$1.idx"
+	assert "and names the rule and the place: $2" sh -c \
+		"'$GITOBJ' idx '$BAD/$1.idx' 2>&1 | grep -Eq '$3'"
+}
+# Caught by reading the index alone.
+idx_refuse trunc "a truncated index" \
+	'too small for the object count it declares: [0-9]+'
+idx_refuse ver "an index version it does not know" \
+	'unsupported pack index version: 3'
+idx_refuse partial8 "a trailing partial 64-bit offset" \
+	'ends in a partial 64-bit offset at [0-9]+'
+idx_refuse fanback "a fanout entry that goes backwards" \
+	'fanout entry goes backwards at [0-9]+'
+idx_refuse unsorted "a name list out of order" \
+	'names are not in increasing order at [0-9]+'
+idx_refuse dupname "the same name twice" \
+	'names are not in increasing order at [0-9]+'
+idx_refuse fanbucket "a fanout entry that disagrees with the names" \
+	'fanout bucket disagrees with the name it indexes at [0-9]+'
+idx_refuse bigpast "a 64-bit indirection past the end of the table" \
+	'64-bit offset index past the end of the table at [0-9]+'
+idx_refuse bigtoomany "more 64-bit offsets than objects" \
+	'more 64-bit offsets than objects that could need one: [0-9]+'
+idx_refuse idxsum "an index whose own checksum does not match" \
+	'pack index checksum mismatch at [0-9]+' 
+# No position for this one: the magic is the first four bytes, and a v1
+# index is not corrupt, it is a format with no reader here.
+python3 "$TMP/idxtool.py" magic "$SELFIDX" "$BAD/magic.idx"
+refute "idx refuses an index with no v2 magic" "$GITOBJ" idx "$BAD/magic.idx"
+assert "and names v1 as the reason" sh -c \
+	"'$GITOBJ' idx '$BAD/magic.idx' 2>&1 | grep -q 'v1'"
+
+# git refuses the same files. show-index walks names and the 64-bit table, so
+# it sees five of them; verify-pack also reads the pack, so it sees all.
+for k in trunc ver partial8 fanback unsorted dupname fanbucket bigpast bigtoomany idxsum magic; do
+	cpw "$TMP/packs/self-$SELFPACK.pack" "$BAD/pack-$SELFPACK.pack"
+	cpw "$BAD/$k.idx" "$BAD/pack-$SELFPACK.idx"
+	assert "git verify-pack refuses $k too" sh -c \
+		"! $GIT -C '$SCRATCH' verify-pack '$BAD/pack-$SELFPACK.idx' >/dev/null 2>&1"
+done
+for k in trunc ver fanback magic; do
+	assert "git show-index refuses $k too" sh -c \
+		"! $GIT show-index --object-format=sha1 < '$BAD/$k.idx' >/dev/null 2>&1"
+done
+# The ones show-index reads happily are the ones it never has to resolve: it
+# walks the name list in order without consulting the fanout, it does not
+# check either checksum, and its bounds check on the 64-bit table does not
+# fire for an index into a table that is empty. verify-pack is the authority
+# for all of them.
+for k in unsorted dupname idxsum partial8 bigpast bigtoomany; do
+	assert "git show-index does not notice $k, so verify-pack is the authority" \
+		sh -c "$GIT show-index --object-format=sha1 < '$BAD/$k.idx' >/dev/null 2>&1"
+done
+# A fanout that disagrees with the names is the one corruption with a
+# visible consequence rather than a parse error: git's binary search looks
+# in the wrong range and the object it misplaces becomes unfindable.
+cpw "$TMP/packs/self-$SELFPACK.pack" "$IREPO/objects/pack/pack-bad-$SELFPACK.pack"
+cpw "$BAD/fanbucket.idx" "$IREPO/objects/pack/pack-bad-$SELFPACK.idx"
+rm -f "$IREPO/objects/pack/pack-$SELFPACK.idx" "$IREPO/objects/pack/pack-$SELFPACK.pack"
+# The victim is computed from the GOOD index: it is the first object of the
+# bucket after the boundary the tool moves, which the moved boundary then
+# claims for the bucket below it.
+lost=$(python3 -c '
+import sys, struct
+b = open(sys.argv[1], "rb").read()
+fan = struct.unpack(">256I", b[8:1032])
+k = next(i for i in range(255) if fan[i] < fan[i + 1])
+s = 1032 + 20 * fan[k]
+print(b[s:s + 20].hex())
+' "$SELFIDX")
+refute "git cannot find the object a shifted fanout misplaces" \
+	$GIT --git-dir="$IREPO" cat-file -e "$lost"
+
+# Refusals that need the pack as well: the CRC, the offsets and the two
+# cross-checks between the files.
+crc_refuse() { # <kind> <what it is> <expected message> [pack-mutation]
+	rm -rf "$BAD/c"
+	mkdir -p "$BAD/c"
+	if [ -n "${4:-}" ]; then
+		python3 "$TMP/packmut.py" "$4" "$TMP/packs/self-$SELFPACK.pack" \
+			"$BAD/c/pack-$SELFPACK.pack"
+		cpw "$SELFIDX" "$BAD/c/pack-$SELFPACK.idx"
+	else
+		python3 "$TMP/idxtool.py" "$1" "$SELFIDX" "$BAD/c/pack-$SELFPACK.idx"
+		cpw "$TMP/packs/self-$SELFPACK.pack" "$BAD/c/pack-$SELFPACK.pack"
+	fi
+	refute "idxcrc refuses $2" "$GITOBJ" idxcrc "$BAD/c/pack-$SELFPACK.idx"
+	assert "and names the rule and the place: $2" sh -c \
+		"'$GITOBJ' idxcrc '$BAD/c/pack-$SELFPACK.idx' 2>&1 | grep -Eq '$3'"
+	assert "git verify-pack refuses $2 too" sh -c \
+		"! $GIT -C '$SCRATCH' verify-pack '$BAD/c/pack-$SELFPACK.idx' >/dev/null 2>&1"
+}
+crc_refuse offpast "an offset outside the pack" \
+	'index offset is outside the pack at [0-9]+'
+crc_refuse offdup "two objects at one offset" \
+	'two objects share a pack offset at [0-9]+'
+crc_refuse packcount "a pack whose header counts different objects" \
+	'pack object count disagrees with the index: [0-9]+' count
+crc_refuse packsum "a pack whose checksum is not the one the index carries" \
+	'not the trailer the pack carries at [0-9]+' sum
+# A wrong CRC is not a refusal, it is a finding: the index parses, so the
+# object is named and counted the way `verify` names a loose object whose
+# content was swapped.
+rm -f "$BAD/c/pack-$SELFPACK.idx"
+python3 "$TMP/idxtool.py" crcbit "$SELFIDX" "$BAD/c/pack-$SELFPACK.idx"
+cpw "$TMP/packs/self-$SELFPACK.pack" "$BAD/c/pack-$SELFPACK.pack"
+refute "idxcrc exits 1 on a CRC that does not match the pack" \
+	"$GITOBJ" idxcrc "$BAD/c/pack-$SELFPACK.idx"
+eq "and counts exactly the one bad CRC" \
+	"$("$GITOBJ" idxcrc "$BAD/c/pack-$SELFPACK.idx" 2>/dev/null | tail -1)" \
+	"$NSELF objects, 1 bad crcs"
+# crcbit breaks the CRC of the FIRST object in index order, which is the
+# first line show-index prints.
+crcvictim=$($GIT show-index --object-format=sha1 < "$SELFIDX" | awk 'NR==1{print $2}')
+assert "and names the object whose CRC is wrong" sh -c \
+	"'$GITOBJ' idxcrc '$BAD/c/pack-$SELFPACK.idx' 2>/dev/null |
+		grep -q '^CRC MISMATCH $crcvictim '"
+assert "git verify-pack refuses the broken CRC too" sh -c \
+	"! $GIT -C '$SCRATCH' verify-pack '$BAD/c/pack-$SELFPACK.idx' >/dev/null 2>&1"
+
+refute "idx refuses a file that is not an index at all" \
+	"$GITOBJ" idx "$TMP/fix/rand"
+refute "idx refuses an index that does not exist" \
+	"$GITOBJ" idx "$TMP/no/such/pack.idx"
+refute "idxcrc refuses a path that does not end in .idx" \
+	"$GITOBJ" idxcrc "$TMP/packs/self-$SELFPACK.pack"
+rm -f "$BAD/nopack.pack"
+cpw "$SELFIDX" "$BAD/nopack.idx"
+refute "idxcrc refuses an index with no pack beside it" \
+	"$GITOBJ" idxcrc "$BAD/nopack.idx"
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
