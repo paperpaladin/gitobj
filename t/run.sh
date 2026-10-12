@@ -173,7 +173,10 @@ printf 'verified %d loose objects across %s\n' "$total_verified" \
 
 # `gitobj ls` against `git cat-file --batch-all-objects --batch-check`, which
 # emits exactly the same three fields. Only repositories with no packfile can
-# be compared whole this way; the packed ones come back in section 9.
+# be compared whole this way. There is no section 9 and no packed half:
+# gitobj has no pack reader, 76% of the corpus objects are packed and
+# unread, and this comment pointed at work that was never written. See
+# README.md.
 for r in $HAVE_SMALL $HAVE_BIG; do
 	[ -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ] && continue
 	$GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
