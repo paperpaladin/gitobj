@@ -97,8 +97,82 @@ refute "hash rejects an unknown type" "$GITOBJ" hash frobnicate "$TMP/fix/hello"
 # The corpora are real histories. They are COPIED here rather than read in
 # place: anything in this suite that repacks would otherwise be writing into
 # a sibling repository's .git, and a reader has no business doing that.
+# A corpus this suite builds itself, with git, so that the oracle does not
+# depend on which other repositories happen to be sitting next to this one.
+#
+# That dependency was not a theoretical weakness. Cloned on its own and run,
+# this suite failed five assertions: the two corpus-completeness checks, the
+# 300-object floor, and the corruption test, which hardcoded ../cc and sent
+# its cp errors to /dev/null -- so with no sibling it copied nothing, looked
+# for a victim object in an empty directory, and "tested" that verify rejects
+# a corruption that was never planted. A reader's first `make test` is not the
+# place to discover any of that.
+#
+# These are bare repositories, which makes $G/objects the same shape as a
+# copied .git. Blobs go in through one `hash-object --stdin-paths` rather than
+# one process each; the tree, commit and tag are plumbing, so all four object
+# types are present. Nothing is packed, which also means the whole-repository
+# `ls` comparison below has something to run against -- every sibling in the
+# collection has a packfile, so that oracle was skipping entirely.
+SELF_CORPUS="self_a self_b self_c"
+SELF_BLOBS=120
+
+mk_selfcorpus() {
+	name=$1
+	G="$TMP/corpus/$name"
+	mkdir -p "$G" "$TMP/mk/$name"
+	$GIT init -q --bare "$G" || return 1
+	i=0
+	: > "$TMP/mk/$name/paths"
+	while [ "$i" -lt "$SELF_BLOBS" ]; do
+		printf '%s blob %d\n' "$name" "$i" > "$TMP/mk/$name/b$i"
+		echo "$TMP/mk/$name/b$i" >> "$TMP/mk/$name/paths"
+		i=$((i+1))
+	done
+	$GIT --git-dir="$G" hash-object -w --stdin-paths \
+		< "$TMP/mk/$name/paths" > "$TMP/mk/$name/shas" || return 1
+	b=$(head -1 "$TMP/mk/$name/shas")
+	tree=$(printf '100644 blob %s\tb0\n' "$b" | $GIT --git-dir="$G" mktree) || return 1
+	# Fixed dates: these objects are compared against git by name, and a name
+	# that moves every run is a fixture that cannot be reasoned about.
+	commit=$(GIT_AUTHOR_NAME=corpus GIT_AUTHOR_EMAIL=corpus@invalid \
+		GIT_COMMITTER_NAME=corpus GIT_COMMITTER_EMAIL=corpus@invalid \
+		GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' \
+		GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
+		$GIT --git-dir="$G" commit-tree "$tree" -m "corpus commit in $name") || return 1
+	printf 'object %s\ntype commit\ntag %s\ntagger corpus <corpus@invalid> 978307200 +0000\n\nannotated\n' \
+		"$commit" "$name" | $GIT --git-dir="$G" mktag > /dev/null || return 1
+	echo "$name"
+}
+
+HAVE_SELF=
+for r in $SELF_CORPUS; do
+	HAVE_SELF="$HAVE_SELF $(mk_selfcorpus "$r")"
+done
+# Deterministic, so this is pinned rather than reported: if building a corpus
+# starts failing, every floor below becomes easier to clear by accident.
+eq "the self-built corpus has all its repos" \
+	"$(printf '%s\n' $HAVE_SELF | grep -c .)" \
+	"$(printf '%s\n' $SELF_CORPUS | grep -c .)"
+for r in $HAVE_SELF; do
+	assert "$r has all four object types" \
+		test "$($GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
+			--batch-check | awk '{print $2}' | sort -u | tr '\n' ' ')" \
+		= "blob commit tag tree "
+	# No .idx, rather than no pack/ directory: `git init --bare` creates an
+	# empty objects/pack/, so testing for the directory's absence asserted
+	# something that is never true and said nothing about packing.
+	assert "$r is unpacked, so ls can be compared whole" \
+		test -z "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)"
+done
+
+# The sibling repositories are an ADDITIONAL corpus: real histories, far more
+# varied than anything built here. They are optional, because a clone of this
+# repository alone has none of them -- what is reported is how many were
+# found, not an assertion that all of them were. notally-molly is gone from
+# the list: it is an unrelated fork that happened to be adjacent.
 CORPUS_SMALL="cc tarx inflate"
-CORPUS_BIG="psh unrepro cmark httpd wasmi notally-molly"
+CORPUS_BIG="psh unrepro cmark httpd wasmi"
 # Three things this did not do: report a repo it skipped, check that cp
 # succeeded, or tell the caller how many it got. A sibling that is not a git
 # repo was skipped in silence, and `cp -r ... 2>/dev/null` discarded both the
@@ -124,12 +198,16 @@ copy_corpus() {
 		echo "$r"
 	done
 }
-HAVE_SMALL=$(copy_corpus $CORPUS_SMALL)
-# And the count is pinned, so a repo that silently stopped being copied is a
-# failure rather than a smaller corpus.
-eq "the small corpus has all its repos" \
-	"$(printf '%s\n' $HAVE_SMALL | grep -c .)" \
+FOUND_SMALL=$(copy_corpus $CORPUS_SMALL)
+printf 'sibling corpus (small): %d of %d present\n' \
+	"$(printf '%s\n' $FOUND_SMALL | grep -c .)" \
 	"$(printf '%s\n' $CORPUS_SMALL | grep -c .)"
+# Reported, not asserted. The count used to be pinned so that a repo which
+# silently stopped being copied was a failure -- the right instinct, but
+# applied to the wrong thing: it made "you cloned only this repository" a test
+# failure. What must not shrink silently is the corpus this suite controls,
+# and that is pinned above.
+HAVE_SMALL="$HAVE_SELF $FOUND_SMALL"
 
 # Every loose object in the small corpora, all four fields, against git.
 # `git cat-file <type> <sha>` prints the RAW payload for any type, which is
@@ -192,7 +270,7 @@ refute "a missing object is refused" "$GITOBJ" type "$OD2" \
 # git chose these filenames; we recompute the hash. There is no fixture to
 # maintain and nothing of ours on the other side of the comparison.
 HAVE_BIG=$(copy_corpus $CORPUS_BIG)
-eq "the big corpus has all its repos" \
+printf 'sibling corpus (big): %d of %d present\n' \
 	"$(printf '%s\n' $HAVE_BIG | grep -c .)" \
 	"$(printf '%s\n' $CORPUS_BIG | grep -c .)"
 total_verified=0
@@ -247,9 +325,26 @@ fi
 
 # A deliberately corrupted loose object: same filename, different content.
 # verify must notice, because that is the only thing it is for.
+# Built from a self corpus, not ../cc. The sibling version copied with
+# `2>/dev/null` and no status check, so on a standalone clone it copied
+# nothing, found no victim in an empty directory, and asserted that verify
+# rejects a corruption that had never been planted. A corruption test that
+# passes without a corruption is the one test here that must not be allowed
+# to fail open, so the planting is now checked at every step.
 mkdir -p "$TMP/corrupt/objects"
-cp -r "$TMP/corpus/cc/objects/"[0-9a-f][0-9a-f] "$TMP/corrupt/objects/" 2>/dev/null
+# set -- to split on whitespace: `printf '%s' $HAVE_SELF` repeats the format
+# once per word and so ran the three names together into one nonexistent path.
+set -- $HAVE_SELF
+corpus_src=$1
+assert "the corruption test has a corpus to corrupt" \
+	test -d "$TMP/corpus/$corpus_src/objects"
+cp -r "$TMP/corpus/$corpus_src/objects/"[0-9a-f][0-9a-f] "$TMP/corrupt/objects/"
+# git writes loose objects read-only (0444), so the swap below cannot
+# overwrite one without this. copy_corpus does the same thing for the sibling
+# copies; the self corpus needs it too.
+chmod -R u+rw "$TMP/corrupt"
 victim=$("$GITOBJ" ls "$TMP/corrupt/objects" | awk '$2=="blob"{print $1; exit}')
+assert "and found a blob in it to be the victim" test -n "$victim"
 printf 'tampered\n' > "$TMP/t.in"
 # (A `"$GITOBJ" hash blob` on this file used to sit here with its output sent
 # to /dev/null and its status ignored. git writes the object on the next line
@@ -258,6 +353,11 @@ $SG hash-object -w "$TMP/t.in" >/dev/null
 nb=$($SG hash-object "$TMP/t.in")
 cp "$SCRATCH/.git/objects/${nb:0:2}/${nb:2}" \
 	"$TMP/corrupt/objects/${victim:0:2}/${victim:2}"
+# The swap has to have actually changed the file, or the refutation below is
+# refuting nothing.
+assert "the swap really replaced the victim's bytes" \
+	test "$(cd "$TMP/corrupt/objects" && cat "${victim:0:2}/${victim:2}" | cksum)" \
+	!= "$(cd "$TMP/corpus/$corpus_src/objects" && cat "${victim:0:2}/${victim:2}" | cksum)"
 refute "verify catches a loose object whose content was swapped" \
 	"$GITOBJ" verify "$TMP/corrupt/objects"
 assert "and says which one" sh -c \
