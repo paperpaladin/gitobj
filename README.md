@@ -6,11 +6,13 @@ than rewritten.
 
 ```
 $ gitobj verify ../cc/.git/objects
-163 objects, 0 mismatched
+35 objects, 0 mismatched
 
 $ make test
-verified 651 loose objects across cc tarx inflate psh unrepro cmark httpd wasmi notally-molly
-1219 passed, 0 failed
+sibling corpus (small): 3 of 3 present
+sibling corpus (big): 5 of 5 present
+verified 599 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
+2208 passed, 0 failed
 ```
 
 ## The oracle is the object's own name
