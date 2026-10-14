@@ -45,7 +45,7 @@ Everything else is `git cat-file -p` / `-t` / `-s` and `git log --format=`,
 object by object, over the loose objects of three sibling repositories,
 cc, tarx and inflate, the `CORPUS_SMALL` set. The other six get `gitobj
 verify` over their whole object store, plus a whole-repository `gitobj ls`
-comparison for the two with no packfile. This said "nine", which is the size
+comparison for the two with no packfile. This said "nine", the size
 of the corpus, not the reach of the per-object sweep.
 
 ## What does not work
