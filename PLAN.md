@@ -35,7 +35,7 @@ In scope:
 * tree entry modes: `100644`, `100755`, `120000`, `40000` (stored without
   the leading zero) and `160000` gitlinks.
 In scope and NOT YET WRITTEN. Listed here without that qualification until
-an audit pointed out there is no pack code in `gitobj.c` at all: the only
+an audit pointed out there is no pack code in `gitobj.c` at all. The only
 trace is `T_OFS_DELTA = 6, T_REF_DELTA = 7` in an enum, and neither constant
 is ever read:
 
@@ -69,7 +69,7 @@ file and the one that was not true.
 
 And git accepts what we write, planned, not present. There is no
 `gitobj write` and no `gitobj mktree`, so only one direction is tested at
-all: we read what git wrote, and nothing reads what we write because we
+all. We read what git wrote, and nothing reads what we write because we
 write nothing.
 
 ## Oracle

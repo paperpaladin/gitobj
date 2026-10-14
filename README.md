@@ -54,7 +54,7 @@ There is no pack reader. This is the big one. Seven of the nine corpus
 repositories have a packfile, and **656 of the 2534 objects in the corpus
 are loose: 26%**. The other 74% are never read.
 
-`PLAN.md` claimed otherwise until an audit went looking: its hard invariant
+`PLAN.md` claimed otherwise until an audit went looking. Its hard invariant
 said the suite hashes "every object in every corpus repository, loose and
 packed", its in-scope list described the v2 index, both delta encodings and
 delta chains of any depth, and its oracle list included `git verify-pack -v`
