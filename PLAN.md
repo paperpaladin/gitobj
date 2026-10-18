@@ -16,11 +16,11 @@ gitobj msg    <objdir> <sha>           a commit/tag message, byte-exact
 gitobj ls     <objdir>                 every object: sha, type, size
 gitobj verify <objdir>                 hash every object against its own name
 gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
+gitobj mktree <objdir>                 git-mktree format on stdin, store a tree
 
 Planned and NOT PRESENT. These were listed above as though they existed, and
-`write` was one of them until it was written:
+`write` and `mktree` were two of them until they were written:
 
-gitobj mktree <objdir>                 git-mktree format on stdin
 gitobj packls <idx>                    `git verify-pack -v` layout
 ```
 
@@ -34,7 +34,11 @@ In scope:
   into headers (including multi-line folded ones, such as `gpgsig`) plus a
   byte-exact message.
 * tree construction, with git's sort order: entries compare as if a
-  directory name carried a trailing slash, so `a.c` sorts *after* `a/`.
+  directory name carried a trailing slash, so `a.c` sorts *before* `a`.
+  `mktree` reads `git ls-tree` format on stdin, C-quoted names included,
+  sorts it and stores the tree. It does not look its entries up in the
+  object store, so unlike `git mktree` it will not notice an entry whose
+  object is absent or of another type; `git fsck` is what catches that.
 * tree entry modes: `100644`, `100755`, `120000`, `40000` (stored without
   the leading zero) and `160000` gitlinks.
 In scope and NOT YET WRITTEN. Listed here without that qualification until
@@ -50,9 +54,11 @@ is ever read:
   instruction stream, including the copy instruction's optional-byte bitmap
   where an absent byte means 0 for the offset and 0x10000 for the size.
 * delta chains of any depth, where a base is itself a delta.
-* writing anything but a loose object: no `mktree`, no packfile writing, no
+* writing anything but a loose object: no packfile writing, no
   `unpack-objects`. This said `gitobj` was read-only, which it was until
-  `write` landed.
+  `write` landed, and listed `mktree` among the missing until that landed
+  too. A tree is still the only object `gitobj` constructs: there is no
+  commit or tag builder.
 
 Exit status: 0 success, 1 refused or not found, 2 the command line was wrong.
 
@@ -66,17 +72,20 @@ the delta chain beneath it. If a single byte of any of that is wrong the hash
 does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
-**It currently covers the LOOSE objects only, which is 497 of the 1860 in
-the corpus: 27%.** Seven of the nine corpus repositories have a packfile
-whose contents are never read, because there is no pack reader. This
+**It currently covers the LOOSE objects only, which is 539 of the 1902 in
+the corpus: 28%.** All eight sibling repositories in the corpus have a
+packfile whose contents are never read, because there is no pack reader;
+only the three this suite builds for itself are wholly loose. This
 section said "loose and packed" and that was the strongest claim in the
 file and the one that was not true. The counts move with every commit or
-repack in a sibling; they were 585 of 2468 a few days ago.
+repack in a sibling; they were 497 of 1860 at the last commit and 585 of
+2468 before that.
 
 The other half of the invariant is that git accepts what we write, and that
-half now runs for loose objects: `gitobj write` re-serialises an object and
-`git fsck --strict` and `git cat-file -p` read it back. It does not run for
-anything else, because `mktree` and pack writing are still absent.
+half now runs for loose objects and for trees we construct ourselves:
+`gitobj write` re-serialises an object and `gitobj mktree` builds one out of
+entry lines, and `git fsck --strict` and `git cat-file -p` read both back.
+It does not run for pack writing, which is still absent.
 
 ## Oracle
 
@@ -89,9 +98,15 @@ Ranked, strongest first, by how little of it we control.
    object in every corpus repository. The tree pretty-printer, the mode
    formatting and the raw commit/tag bytes are all pinned here.
 3. `git fsck --strict` and `git cat-file -p` over a bare repository whose
-   every object `gitobj write` put there. git inflates our zlib stream,
-   re-hashes it and parses the trees and commits, so this is the read
-   oracles run backwards, with git on the far side of the serialiser.
+   every object `gitobj write` and `gitobj mktree` put there. git inflates
+   our zlib stream, re-hashes it and parses the trees and commits, so this
+   is the read oracles run backwards, with git on the far side of the
+   serialiser. For a tree it is also the only oracle for the entry ORDER
+   that does not come from comparing names: fsck calls a misordered tree
+   treeNotSorted.
+   `git mktree` itself is the name oracle: it sorts its own input, so it and
+   `gitobj mktree` can be handed the same unsorted lines and must produce
+   the same object name.
 4. `git log --format=` for the parsed commit fields (`%T`, `%P`, `%an`,
    `%ae`, `%ad --date=raw`, `%e`), and `git cat-file -p` for the message
    bytes, so CRLF and trailing whitespace are checked as bytes, not as
@@ -166,10 +181,43 @@ than it is. `grep -n 'mutat\|verify-pack\|mktree\|packls' t/run.sh` returns noth
       git and by us, correctly, because a stored block never references the
       sliding window, so the field is unobservable. The first of those was
       written as a defect and is not one.
-- [ ] tree sorting and `gitobj mktree`
+- [x] tree sorting and `gitobj mktree`
       why: the trailing-slash rule is the single most commonly wrong thing in
       a git reimplementation, and `git mktree` sorts its own input, so the
       two can be fed the same unsorted lines and compared.
+      files: gitobj.c (mentcmp, unquote_name, parse_mkline, tree_build and
+      the `mktree` command), t/run.sh section 7 plus three payload shapes in
+      section 6, README.md
+      proves: every tree in the mode/commit/tag fixture is rebuilt from its
+      own `git ls-tree` listing in three input orders -- as printed,
+      reversed, and sorted by name as plain bytes -- and gitobj, `git
+      mktree` and the name git originally gave the tree all agree on all
+      three. `git cat-file -p`, `-t` and `-s` read the results, and `git
+      fsck --strict` is clean over a bare repository every tree in which we
+      built: the fixture's own trees are deliberately withheld when its
+      objects are copied in, so no tree there can have been found already
+      present. The slash fixture (a-b, a.c, a, a0, aa, with a directory
+      named "a") is also checked against a python SHA-1 of the
+      plain-byte-order tree, which must NOT be what we produced, so the
+      section cannot pass against a sorter that ignores the rule. 2049
+      assertions before, 2303 after; 1751 to 1862 cloned alone.
+      found: eleven planted defects, eleven red, no survivors. Deleting the
+      trailing-slash rule fails 52 assertions and TWO of them are `git fsck
+      --strict`, which calls the result treeNotSorted -- so the entry order
+      has an oracle that is not a name comparison. Reversing the order fails
+      52, sorting nothing 26, plain memcmp with no tie-break 26, printing
+      the mode as %06o 50, dropping the entry NUL 70, ignoring C-quoting 49,
+      reading an octal escape as decimal 47, never storing the object 27,
+      accepting any octal mode 2, dropping the slash check 1.
+      found: UBSan caught `qsort(NULL, 0, ...)` on the empty tree, which the
+      optimised build happened to get right. `bwrite(dst, NULL, 0)` was the
+      same undefined call one layer down and is now guarded once for every
+      caller rather than at the two sites that reach it today.
+      found: in the harness, not the code. The new empty-blob payload is the
+      same object as the existing 0-byte case, so counting it again made the
+      written-object counter disagree with git's object count by one. The
+      count is cross-checked against `cat-file --batch-all-objects`, which
+      is the only reason it showed up.
 - [ ] the pack v2 index: fanout, names, CRCs, 32- and 64-bit offsets
       why: the pack is unreadable without it, and the fanout table is a
       self-checking structure (it must end at the object count).

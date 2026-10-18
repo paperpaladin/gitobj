@@ -720,6 +720,36 @@ for n in 0 1 2 65522 65523 65524 65525 65526 131057 131058 131059 200000; do
 	nwritten=$((nwritten+1))
 done
 
+# Payloads chosen for what they are rather than for their length. A round
+# trip over an empty blob exercises almost nothing and would be a poor
+# single case; a blob that is mostly NUL bytes catches anything in the
+# writer that treats the payload as a C string; and a large repetitive one
+# is the case a real deflate collapses to nothing, which is where our stored
+# blocks differ most from what git would have written. git has to inflate
+# all three and agree on the bytes, the type and the size.
+python3 -c 'open("'"$TMP"'/pay.nul","wb").write(b"\x00"*4096+b"a\x00b\x00"*256)'
+python3 -c 'open("'"$TMP"'/pay.squish","wb").write((b"the same line over and over\n")*12000)'
+# The empty blob by its own name. It is the same object as the 0-byte case
+# in the loop above, so it is NOT counted again below: nwritten is checked
+# against what git finds in the store, and counting one object twice there
+# cost a red run to notice.
+eq "the empty blob is e69de29" "$("$GITOBJ" write "$WOD" blob /dev/null)" \
+	"$($SG hash-object -t blob /dev/null)"
+eq "git reads our empty blob as a blob of size 0" \
+	"$($WG cat-file -s "$($SG hash-object -t blob /dev/null)")" 0
+
+for f in nul squish; do
+	got=$("$GITOBJ" write "$WOD" blob "$TMP/pay.$f")
+	eq "write blob $f names it as git does" "$got" \
+		"$($SG hash-object -t blob "$TMP/pay.$f")"
+	$WG cat-file blob "$got" > "$TMP/ours" 2>/dev/null
+	assert "git inflates our $f blob byte for byte" cmp -s "$TMP/ours" "$TMP/pay.$f"
+	eq "git calls our $f blob a blob" "$($WG cat-file -t "$got")" blob
+	eq "git agrees on the size of our $f blob" "$($WG cat-file -s "$got")" \
+		"$(wc -c < "$TMP/pay.$f")"
+	nwritten=$((nwritten+1))
+done
+
 # stdin, and writing the same content twice.
 printf 'written from stdin\n' > "$TMP/wstdin"
 got=$("$GITOBJ" write "$WOD" blob < "$TMP/wstdin")
@@ -751,6 +781,177 @@ refute "write refuses an object directory that does not exist" \
 	"$GITOBJ" write "$TMP/no/such/objects" blob "$TMP/wstdin"
 refute "write refuses a file it cannot read" \
 	"$GITOBJ" write "$WOD" blob "$TMP/no/such/file"
+
+# =====================================================================
+# 7. mktree: git's sort order, and git reads the tree we built
+# =====================================================================
+# Section 6 proved git can read bytes we re-serialised from an object git
+# had already built, so the entry order came from git. Here it comes from
+# us, and the sort is the one rule in this format an implementation can get
+# wrong while still producing something that parses: entries compare as if
+# a directory name carried a trailing slash, so "a" sorts between "a.c" and
+# "a0" rather than before both. `git fsck --strict` calls the wrong order
+# treeNotSorted, which makes fsck an oracle for the ordering and not only
+# for the framing.
+MREPO=$TMP/mktree
+$GIT init -q --bare "$MREPO"
+MOD=$MREPO/objects
+MG="$GIT --git-dir=$MREPO"
+
+# Everything in the mode/commit/tag fixture EXCEPT its trees. The children
+# have to be present for fsck to have anything to check the links against,
+# and withholding the trees means no tree in this repository can have got
+# there any way but mktree -- a write test that passes by finding the object
+# already stored is the hazard, and for trees it is excluded by
+# construction here.
+for sha in $(loose_shas "$W/.git"); do
+	gt=$($TG cat-file -t "$sha")
+	[ "$gt" = tree ] && continue
+	$TG cat-file "$gt" "$sha" > "$TMP/payload"
+	"$GITOBJ" write "$MOD" "$gt" "$TMP/payload" > /dev/null
+done
+eq "the mktree target starts with no trees in it" \
+	"$($MG cat-file --batch-all-objects --batch-check | awk '$2=="tree"' | wc -l)" 0
+
+# Every tree in the fixture, rebuilt from its own listing in three input
+# orders. `git ls-tree` prints exactly git-mktree's input format, C-quoted
+# names and all, so the listing travels unaltered; reversed and
+# name-sorted are the two orders that a sorter doing nothing would leave
+# wrong. git mktree is fed the same bytes and must name the same object.
+nmk=0
+for t in $($TG cat-file --batch-all-objects --batch-check |
+		awk '$2=="tree"{print $1}'); do
+	$TG ls-tree "$t" > "$TMP/entries"
+	tac "$TMP/entries" > "$TMP/entries.rev"
+	LC_ALL=C sort -t"$(printf '\t')" -k2 "$TMP/entries" > "$TMP/entries.naive"
+	for ord in entries entries.rev entries.naive; do
+		got=$("$GITOBJ" mktree "$MOD" < "$TMP/$ord")
+		eq "mktree $t from $ord names the tree git named" "$got" "$t"
+		eq "git mktree agrees on $t from $ord" "$($TG mktree < "$TMP/$ord")" "$got"
+	done
+	$MG cat-file -p "$t" > "$TMP/ours" 2>/dev/null
+	$TG cat-file -p "$t" > "$TMP/theirs"
+	assert "git cat-file -p reads the $t we built" cmp -s "$TMP/ours" "$TMP/theirs"
+	eq "git calls the $t we built a tree" "$($MG cat-file -t "$t")" tree
+	eq "git agrees on the size of the $t we built" \
+		"$($MG cat-file -s "$t")" "$($TG cat-file -s "$t")"
+	nmk=$((nmk+1))
+done
+[ "$nmk" -ge 3 ] && ok || no "only $nmk trees rebuilt by mktree"
+# Set equality, not a count: a tree we built under the wrong name would
+# leave the right one missing and the wrong one present.
+eq "mktree built every tree the fixture has and no others" \
+	"$($MG cat-file --batch-all-objects --batch-check |
+		awk '$2=="tree"{print $1}' | sort | tr '\n' ' ')" \
+	"$($TG cat-file --batch-all-objects --batch-check |
+		awk '$2=="tree"{print $1}' | sort | tr '\n' ' ')"
+
+# A tree built from scratch whose names straddle the slash. '-' is 0x2d,
+# '.' is 0x2e, '/' is 0x2f and '0' is 0x30, so the directory "a" belongs
+# after "a-b" and "a.c" and before "a0", where plain byte order over the
+# stored names would put it first. The entries are fed in exactly that
+# wrong order. The blobs exist in both repositories because git mktree
+# verifies that an entry's object is present before it will write a tree.
+sb=$($SG hash-object -t blob -w "$TMP/fix/hello")
+"$GITOBJ" write "$MOD" blob "$TMP/fix/hello" > /dev/null
+printf '100644 blob %s\tinner\n' "$sb" > "$TMP/subin"
+sub=$("$GITOBJ" mktree "$MOD" < "$TMP/subin")
+eq "mktree and git mktree agree on the subtree" "$sub" "$($SG mktree < "$TMP/subin")"
+printf '040000 tree %s\ta\n100644 blob %s\ta-b\n100644 blob %s\ta.c\n100644 blob %s\ta0\n100644 blob %s\taa\n' \
+	"$sub" "$sb" "$sb" "$sb" "$sb" > "$TMP/sortin"
+sorted=$("$GITOBJ" mktree "$MOD" < "$TMP/sortin")
+eq "mktree sorts the slash cases as git mktree does" "$sorted" \
+	"$($SG mktree < "$TMP/sortin")"
+eq "the directory lands between a.c and a0" \
+	"$("$GITOBJ" cat "$MOD" "$sorted" | cut -f2 | tr '\n' ' ')" "a-b a.c a a0 aa "
+# And the fixture discriminates: sorting the names as plain bytes is a
+# DIFFERENT object, computed here without git and without gitobj, so the
+# two checks above are not both satisfiable by a sorter that ignores the
+# rule. Without this the whole section could pass against strcmp order.
+naive=$(python3 -c '
+import hashlib, sys
+sub, sb = sys.argv[1], sys.argv[2]
+ents = [(b"40000", b"a", sub), (b"100644", b"a-b", sb), (b"100644", b"a.c", sb),
+        (b"100644", b"a0", sb), (b"100644", b"aa", sb)]
+ents.sort(key=lambda e: e[1])
+body = b"".join(m + b" " + n + b"\x00" + bytes.fromhex(i) for m, n, i in ents)
+print(hashlib.sha1(b"tree %d\x00" % len(body) + body).hexdigest())
+' "$sub" "$sb")
+assert "plain byte order over the names is a different tree" \
+	test "$naive" != "$sorted"
+refute "and git does not have that tree" $SG cat-file -e "$naive"
+
+# The empty tree. git's own 4b825dc is not a special case in the code, it
+# is what hashing zero entries produces, and it is the one tree whose name
+# can be written down.
+EMPTYTREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+eq "mktree of no entries is the empty tree" \
+	"$("$GITOBJ" mktree "$MOD" < /dev/null)" "$EMPTYTREE"
+eq "git mktree says the same" "$($SG mktree < /dev/null)" "$EMPTYTREE"
+assert "the empty tree really was stored" \
+	test -f "$MOD/${EMPTYTREE:0:2}/${EMPTYTREE:2}"
+eq "git reads our empty tree as a tree of size 0" \
+	"$($MG cat-file -s "$EMPTYTREE")" 0
+eq "git calls our empty tree a tree" "$($MG cat-file -t "$EMPTYTREE")" tree
+
+# Our pretty-printer is this parser's inverse: cat a tree and feed it
+# straight back. This one is us against ourselves, which is why it comes
+# after the oracle and not instead of it -- but it is the only check that
+# runs a name with a diaeresis, a bell, a DEL, a tab, a quote and a
+# backslash back through the unquoter.
+eq "cat | mktree round-trips the fixture root tree" \
+	"$("$GITOBJ" cat "$MOD" "$TREE" | "$GITOBJ" mktree "$MOD")" "$TREE"
+
+# fsck over the lot. Everything is unreachable, so dangling is expected;
+# treeNotSorted, badFilemode and a broken link are not.
+$MG fsck --strict > "$TMP/fsck.out" 2>&1
+eq "git fsck --strict exits 0 over the trees we built" "$?" 0
+assert "git fsck --strict reports no error over the trees we built" \
+	sh -c "! grep -Eiv '^(notice|dangling)' '$TMP/fsck.out' | grep -q ."
+assert "fsck had trees to look at" \
+	test "$($MG cat-file --batch-all-objects --batch-check |
+		awk '$2=="tree"' | wc -l)" -ge 4
+
+# Refusals git agrees with: each of these makes git mktree die too, so the
+# refusal is not a rule we invented.
+mk_ref() { # NAME FORMAT [printf args...]
+	local n=$1 f=$2; shift 2
+	printf "$f" "$@" > "$TMP/mkin"
+	refute "mktree refuses $n" sh -c "'$GITOBJ' mktree '$MOD' < '$TMP/mkin'"
+	assert "git mktree refuses $n too" sh -c "! $SG mktree < '$TMP/mkin'"
+}
+mk_ref "an entry with no tab" '100644 blob %s x\n' "$sb"
+mk_ref "a 38-character object name" '100644 blob %.38s\tx\n' "$sb"
+mk_ref "a non-hex object name" '100644 blob %s\tx\n' \
+	zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+mk_ref "a type that disagrees with the mode" '100644 tree %s\tx\n' "$sb"
+mk_ref "a quoted name with no closing quote" '100644 blob %s\t"abc\n' "$sb"
+mk_ref "an invalid escape in a quoted name" '100644 blob %s\t"a\\zc"\n' "$sb"
+mk_ref "a name containing a slash" '100644 blob %s\ta/b\n' "$sb"
+
+# Refusals git mktree does NOT make, where the authority is fsck instead:
+# git writes the object and then `git fsck --strict` complains about it, so
+# accepting these would mean producing a tree git itself calls broken.
+nstrict=0
+mk_strict() { # NAME FORMAT [printf args...]
+	local n=$1 f=$2; shift 2
+	printf "$f" "$@" > "$TMP/mkin"
+	refute "mktree refuses $n" sh -c "'$GITOBJ' mktree '$MOD' < '$TMP/mkin'"
+	nstrict=$((nstrict+1))
+	local R=$TMP/strict$nstrict
+	$GIT init -q --bare "$R"
+	$GIT --git-dir="$R" hash-object -t blob -w "$TMP/fix/hello" > /dev/null
+	$GIT --git-dir="$R" mktree < "$TMP/mkin" > /dev/null 2>&1
+	$GIT --git-dir="$R" fsck --strict > "$TMP/strict.out" 2>&1
+	assert "git fsck --strict complains about $n" \
+		sh -c "grep -Eiv '^(notice|dangling)' '$TMP/strict.out' | grep -q ."
+}
+mk_strict "a file mode git does not use" '100645 blob %s\tx\n' "$sb"
+mk_strict "a zero-padded file mode" '000000 blob %s\tx\n' "$sb"
+mk_strict "an empty entry name" '100644 blob %s\t\n' "$sb"
+
+refute "mktree refuses an object directory that does not exist" \
+	sh -c "'$GITOBJ' mktree '$TMP/no/such/objects' < '$TMP/sortin'"
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
