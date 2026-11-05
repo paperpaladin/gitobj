@@ -1,28 +1,41 @@
 # gitobj
 
-Reads git's object database, writes loose objects into it, builds trees, and
-reads a packfile's v2 index: one C11 file, no libgit2, no shelling out to git.
+Reads git's object database, writes loose objects into it, builds trees, reads
+a packfile's v2 index, and reads the pack entries that index points at as long
+as they are stored whole: one C11 file, no libgit2, no shelling out to git.
 The DEFLATE decoder is vendored from the sibling `../inflate` rather than
 rewritten; the writer emits zlib stored blocks, which git reads and which
 compress nothing.
 
 ```
-$ gitobj verify ../cc/.git/objects
-36 objects, 0 mismatched
+$ gitobj idx ../cc/.git/objects/pack/pack-1b962a98....idx | head -2
+51370 00b08fcfd7569c4407399d58abdb585cb5b0643d (d10ec21f)
+64393 00e813579e96a58252d7324af1f0e21b11249363 (0a14a8ba)
+538 objects, 538 direct, 0 via the 64-bit table of 0
 
-$ gitobj idx ../cc/.git/objects/pack/pack-8befd6b....idx | head -2
-703 0469307bad05f670f586aaff23fe3f12dd2db312 (55c305d9)
-3223900 04da8f63abae00c6df98f1aaa4cc6b3996da7f75 (78a31b4a)
-236 objects, 236 direct, 0 via the 64-bit table of 0
+$ gitobj packls ../cc/.git/objects/pack/pack-1b962a98....idx
+c160c3f543be8fc45799263920baf036f4e4edc7 commit 2227 1138 12
+fb2f17948db733ec0a52bbe6ba0c31663ad2d24a commit 2112 1092 1150
+e350bdae2c1cfe3dda02834985845838eadafed4 commit 2026 1058 2242
+gitobj: pack entry is a delta, which gitobj cannot resolve yet at 50723
 
 $ make test
 sibling corpus (small): 3 of 3 present
 sibling corpus (big): 5 of 5 present
-verified 699 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
-read 9 pack indexes, 1486 objects
-1598 objects read through a 32-bit offset, 134 through the 64-bit table
-4472 passed, 0 failed
+per-object cat-file sweep: 369 loose objects over self_a(123) self_b(123) self_c(123)
+verified 369 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
+read 9 pack indexes, 2938 objects
+3050 objects read through a 32-bit offset, 134 through the 64-bit table
+the delta corpus: 121 objects, 74 delta entries, deepest chain 9
+5358 passed, 0 failed
 ```
+
+`gitobj packls` prints the columns `git verify-pack -v` prints, padding
+included, and stops at the first delta entry. git puts the whole entries
+first, so over the eight sibling packs it gets 24 to 49 objects in before it
+stops, out of 218 to 547. The suite does not compare it against a corpus
+pack for that reason: it builds a 121-object pack with `--window=0` and
+compares all of that, and has git assert that the pack really holds no delta.
 
 `gitobj idx` prints the same three fields as `git show-index`, in the same
 format, so the two can be compared object by object. The
@@ -33,19 +46,24 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **2324 passed**, against three bare
-repositories it builds itself: 120 blobs each through one
+Cloned on its own this suite reports **2471 passed**, against four bare
+repositories it builds itself. Three hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
 those three is then packed with `git pack-objects`, so the index reader has a
 pack of its own and a standalone clone exercises it.
 
-Inside the collection it reports more: 4472 above, because the sibling
+The fourth is for the pack reader and is described under the pack walk below,
+because the first three cannot do that job: their blobs are a few dozen bytes
+each and git does not attempt a delta below 50 bytes, so no window setting
+makes it produce one.
+
+Inside the collection it reports more: 5358 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-2324: the one a reader gets by cloning this repository and running `make
+2471: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -64,11 +82,19 @@ it cannot be satisfied by being self-consistently wrong. It is the reason
 this repo has no expected-output files.
 
 Everything else is `git cat-file -p` / `-t` / `-s` and `git log --format=`,
-object by object, over the loose objects of three sibling repositories,
-cc, tarx and inflate, the `CORPUS_SMALL` set. The other six get `gitobj
-verify` over their whole object store, plus a whole-repository `gitobj ls`
-comparison for the two with no packfile. This said "nine", the size
-of the corpus, not the reach of the per-object sweep.
+object by object, over every loose object of the `CORPUS_SMALL` set: the
+three repositories the suite builds, and cc, tarx and inflate if they are
+there. Those last three contribute NOTHING to it at the moment, and did when
+this was written: all eight siblings have since been repacked and hold no
+loose object at all, so the 369 objects the sweep covers are the self
+corpus's own. The suite prints which repositories it got them from for that
+reason, rather than only how many it found, since the floor of 20 was being
+cleared by a corpus the suite builds itself whatever the neighbours did.
+
+The other five siblings get `gitobj verify` over their whole object store,
+which now finds nothing in them either, plus a whole-repository `gitobj ls`
+comparison for the ones with no packfile. This said "nine", the size of the
+corpus, not the reach of the per-object sweep.
 
 For `gitobj write` the oracle runs the other way: every loose object of the
 tree/commit/tag fixture is re-serialised into a bare repository git created
@@ -124,7 +150,7 @@ mutates one, so a fixture differs from git's only where it was asked to.
 The CRC is the one field with an oracle outside the index entirely. It is a
 CRC-32 over the object's bytes as packed, which means from its own offset to
 the next offset in PACK order, and the index is sorted by name, so the
-extents only exist once the offsets have been sorted. 1486 of them are
+extents only exist once the offsets have been sorted. 2938 of them are
 recomputed from the pack bytes and compared with what git stored.
 
 The 64-bit offset table has no corpus coverage and never will: an offset
@@ -186,20 +212,87 @@ two leave the file refused for a different reason with the same exit status,
 which is why every refusal here asserts its message and not only its status.
 The details are in `PLAN.md`.
 
+## The pack walk, and the corpus that had to be built for it
+
+A pack entry begins with a varint that is split three ways: the top bit
+continues it, the next three bits are the type, and the low four are the
+bottom four bits of the size, with seven bits per byte after that. The type
+and the inflated size are `git verify-pack -v`'s second and third columns and
+nothing in the index holds either of them, so this is the first thing here
+that reads pack content at all.
+
+Deltas are not resolved yet, so the comparison needs a pack with none in it,
+and the corpus the rest of the suite uses cannot provide one. Its blobs are a
+few dozen bytes each and git does not attempt a delta below 50 bytes, so
+`pack-objects` leaves all 123 objects whole whatever window it is given. That
+was found by asserting the opposite: the first version of this section built
+a `--window=0` pack and checked that the ordinary pack had deltas to refuse,
+and the ordinary pack had none either.
+
+So there is a fourth repository now, 40 revisions of a 400-line file with one
+line rewritten each time, plus a tree per revision that grows by one entry
+and a commit per revision. git packs that into 121 objects of which 74 are
+deltas, the deepest chain 9, and those numbers are printed by the suite
+rather than assumed, because a delta test over a pack with no deltas in it
+passes while reading nothing. The trees matter on their own: a delta entry
+carries no type, it inherits the type of whatever is at the end of its chain,
+so a corpus whose deltas are all blobs cannot tell a type read from the base
+apart from one read anywhere else.
+
+The same objects are packed twice, once with `--window=0` and once the way
+git chooses. `git verify-pack -v` prints five fields for an entry stored
+whole and seven for a delta, so which pack is which is asserted from git's
+own output rather than from the flag that was meant to produce it. All 121
+objects of the delta-free pack are compared against `verify-pack -v` line by
+line, per object rather than as a file diff, and all 121 hash back to their
+own names. The delta pack is refused, with git reading the very same pack
+perfectly, which is the pair a missing feature needs: its failure mode is not
+an absent error message, it is a confident wrong answer about something that
+looked close enough.
+
+Seven mutations of the pack walk, six red. Reading the type from the low
+three bits instead of bits 4 to 6 fails 9 assertions, taking the size nibble
+from three bits rather than four fails 5, and resuming the varint at bit 7
+instead of bit 4 fails 6. Deriving an entry's extent from the next INDEX
+entry rather than the next offset in pack order fails 8, every one of them a
+CRC comparison in section 8, which is the same defect that section already
+exists to catch. Accepting type 5, which git has never assigned, and
+dropping the check that an entry inflated to the size it declares each fail
+2: both needed a pack edited by hand, since nothing git writes is wrong in
+either way.
+
+Those two fixtures are each a single lie. Editing one byte of a pack
+invalidates four things that have nothing to do with the defect under test
+(the pack's trailing checksum, the copy of it the index carries, that
+object's CRC, and the index's own checksum) and all four are re-stamped, with
+`gitobj idxcrc` accepting the edited pair as the guard that they were.
+
+The survivor is treating the 20-byte pack trailer as entry data. Nothing
+points an entry at it: every offset is checked against the start of the
+trailer when the index is opened, so the bound only matters to a varint or a
+zlib stream that runs off the end of the last entry, and no fixture here does
+that. It is the truncation work of `PLAN.md`'s refusals item, and until that
+exists this is a bound with no test behind it, which is said here rather than
+counted as covered.
+
 ## What does not work
 
-There is no pack READER, only an index reader. The index gives a name, an
-offset and a CRC for all 1363 packed objects in the eight sibling
-repositories, and that is where it stops: no type, no size, no content. The
-pack entry's type and size varint, both delta encodings and delta chains are
-all still absent, which is the next four items of `PLAN.md`.
+There is no delta support, so most of a pack is still unreadable. A pack
+entry's type and inflated size are read now, for entries stored whole;
+`OFS_DELTA`, `REF_DELTA`, the copy/insert instruction stream and chains whose
+base is itself a delta are all still absent, which is the next four items of
+`PLAN.md`. `packls` stops at the first delta entry, and git puts the whole
+entries first, so it gets 24 to 49 objects into each of the eight sibling
+packs and no further.
 
 So the hard invariant, that every object read hashes back to its own name,
-still covers the loose objects only: **699 of the 2062 objects in the
-corpus, 34%**. Those counts move whenever a sibling is committed to or
-repacked; they were 539 of 1902 one commit ago. The three repositories the
-suite builds for itself are wholly loose and are the only reason the share is
-not far smaller.
+covers **490 of the 3184 objects the suite reads, 15%**: the 369 loose ones
+and the 121 in the delta-free pack. Not one of the 2815 objects in the eight
+sibling packs is covered, because every one of those packs has a delta in it
+and `packverify` stops there. The share was 699 of 2062 two commits ago and
+the denominator has grown rather than the numerator shrinking: the siblings
+have all been repacked since, so what were loose objects there are now packed
+ones, and 8 of the 11 corpus repositories hold no loose object whatsoever.
 
 The CRC is the strongest thing available to an index reader, and it is not
 the same claim. It says the packed bytes between two offsets are the bytes
@@ -210,9 +303,9 @@ says nothing about whether those bytes inflate to anything.
 Its hard invariant said the suite hashes "every object in every corpus
 repository, loose and packed", its in-scope list described the v2 index, both
 delta encodings and delta chains of any depth, and its oracle list included
-`git verify-pack -v` diffed against a `gitobj packls`. The index is the first
-of those to exist. `packls` still does not: its columns are the pack entry's
-type and size, which nothing here can compute yet.
+`git verify-pack -v` diffed against a `gitobj packls`. The index was the
+first of those to exist and `packls` is the second; the diff against it is
+real but partial, since it can only be run over a pack that holds no delta.
 
 A pack over two gigabytes is the one thing in the index the suite cannot
 obtain, so no index git itself wrote with a 64-bit offset in it has ever been
@@ -269,9 +362,10 @@ Not fast. Every object is inflated from scratch.
 The house convention here is that every repo has a `README.md` stating what
 does *not* work, and this repo did not have one. `gitobj.c`'s header comment
 pointed at it (`See README.md`), and so did a comment in `t/run.sh` pointing
-at a "section 9" that does not exist either: the file stopped at section 5,
-and stops at 8 now that there is a writer, a tree builder and a pack index
-reader to test. Those two pointers and the `PLAN.md` prose were the only
+at a "section 9" that did not exist either: the file stopped at section 5,
+and stops at 9 now that there is a writer, a tree builder, a pack index
+reader and a pack walk to test. Section 9 is the one that comment pointed
+at, three commits before it was written. Those two pointers and the `PLAN.md` prose were the only
 places the pack gap was acknowledged, and all three described it as
 finished.
 

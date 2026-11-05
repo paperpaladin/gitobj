@@ -1,10 +1,11 @@
 /* gitobj. git's object database: reads loose objects and pack indexes,
  * writes loose objects, in one C11 file.
  *
- * The four object types, and a packfile's v2 index. NOT the pack itself: the
- * entry type and size varint, both delta encodings and delta chains are
- * planned and absent, so a packed object has a name, an offset and a CRC here
- * and no content. See README.md, which says so first. The writer compresses
+ * The four object types, a packfile's v2 index, and the pack entries that
+ * index points at as long as they are stored whole. NOT the deltas: both
+ * encodings and the instruction stream are planned and absent, so a packed
+ * object that git chose to delta has a name, an offset and a CRC here and no
+ * content. See README.md, which says so first. The writer compresses
  * nothing (zlib stored blocks), which git reads and no one should use for a
  * real repository; that is in README.md too. No libgit2, no zlib, no shelling
  * out to git. git is the authority this is measured against, never a
@@ -13,8 +14,9 @@
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
  * read is self-checking: if the bytes we reconstructed hash back to the name
  * we looked them up by, the whole decode path was right. That covers the
- * loose objects; an index entry has no payload to hash, so its checks are the
- * fanout against the name list and the CRC against the pack. See README.md.
+ * loose objects and the pack entries stored whole; an index entry has no
+ * payload to hash, so its checks are the fanout against the name list and the
+ * CRC against the pack. See README.md.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
@@ -1123,6 +1125,159 @@ static int pofscmp(const void *a, const void *b) {
 	return x < y ? -1 : x > y ? 1 : 0;
 }
 
+/* ------------------------------------------------------------ the packfile
+ *
+ * "PACK", a version, an object count, then one entry per object, then a
+ * SHA-1 over everything before it. An entry is a type/size varint followed
+ * by a zlib stream, and for the two delta types the varint is followed by
+ * the base's identity.
+ *
+ * Nothing in the pack records where an entry ENDS. The index's offsets,
+ * sorted, are the only record of the extents, which is why this reader
+ * wants both files even though inflating any one entry needs only the pack.
+ */
+
+#define PACK_HDR 12
+
+typedef struct {
+	Idx x;
+	Buf pk;
+	Pofs *ord;          /* every offset, in pack order, with its index entry */
+	size_t nbase;       /* the census: how many entries took each path */
+} Pack;
+
+/* Open an index and the pack beside it, and check the two against each
+ * other: the object count in the pack header, the pack's own trailing
+ * checksum (of which the index carries a copy), and that every offset the
+ * index gives lands inside the pack and is claimed by only one object.
+ *
+ * Every offset is validated before any extent is derived from one. Checking
+ * them as each is used is not the same thing: an object's length comes from
+ * the NEXT offset, so one bogus entry makes its predecessor's extent run off
+ * the end of the pack while the predecessor's own offset is perfectly valid.
+ * That version segfaulted on the first fixture that pointed an offset past
+ * the pack. */
+static void pack_open(const char *idxpath, Pack *p) {
+	memset(p, 0, sizeof *p);
+	size_t pl = strlen(idxpath);
+	if (pl < 4 || strcmp(idxpath + pl - 4, ".idx"))
+		die2("not a .idx path", idxpath);
+	idx_open(idxpath, &p->x);
+	char pp[4096];
+	if ((size_t)snprintf(pp, sizeof pp, "%.*s.pack", (int)(pl - 4), idxpath)
+	    >= sizeof pp)
+		die("pack path too long");
+	readall(pp, &p->pk);
+	bexact(&p->pk);
+	/* 12 bytes of header, 20 of trailing checksum, and at least one byte
+	 * between them for the smallest possible object. */
+	if (p->pk.n < PACK_HDR + 21)
+		dieval("pack shorter than a header and a trailer", p->pk.n);
+	if (memcmp(p->pk.p, "PACK", 4)) die2("not a packfile", pp);
+	if (be32(p->pk.p + 4) != 2)
+		dieval("unsupported pack version", be32(p->pk.p + 4));
+	if (be32(p->pk.p + 8) != p->x.n)
+		dieval("pack object count disagrees with the index", be32(p->pk.p + 8));
+	if (memcmp(p->x.raw.p + p->x.raw.n - 40, p->pk.p + p->pk.n - 20, 20))
+		dieat("the pack checksum in the index is not the trailer the pack carries",
+		      p->x.raw.n - 40);
+
+	p->ord = malloc(p->x.n ? p->x.n * sizeof *p->ord : 1);
+	if (!p->ord) die("out of memory");
+	for (size_t i = 0; i < p->x.n; i++) {
+		p->ord[i].off = idx_offset(&p->x, i);
+		p->ord[i].i = (uint32_t)i;
+	}
+	if (p->x.n) qsort(p->ord, p->x.n, sizeof *p->ord, pofscmp);
+	for (size_t k = 0; k < p->x.n; k++) {
+		if (p->ord[k].off < PACK_HDR || p->ord[k].off >= p->pk.n - 20)
+			dieat("index offset is outside the pack", p->ord[k].i);
+		if (k && p->ord[k].off == p->ord[k - 1].off)
+			dieat("two objects share a pack offset", p->ord[k].i);
+	}
+}
+
+static void pack_close(Pack *p) {
+	free(p->ord);
+	bfree(&p->pk);
+	bfree(&p->x.raw);
+}
+
+/* The bytes an entry occupies: from its own offset to the next offset in
+ * pack order, or to the start of the trailer for the last one. This is
+ * `verify-pack -v`'s size-in-pack column. */
+static uint64_t pack_extent(const Pack *p, size_t k) {
+	uint64_t beg = p->ord[k].off;
+	uint64_t end = k + 1 < p->x.n ? p->ord[k + 1].off : p->pk.n - 20;
+	return end - beg;
+}
+
+/* An entry's header is a varint whose FIRST byte is split three ways: the
+ * top bit continues, the next three are the type, and the low four are the
+ * bottom four bits of the size. Later bytes carry seven bits each, low
+ * group first. It is not the encoding any other length in the format uses,
+ * which is the reason it gets its own function.
+ *
+ * For a delta entry the size is the length of the DELTA data, not of the
+ * object the delta produces. */
+static const char *pack_entry_hdr(const uint8_t *p, size_t n, size_t *at,
+                                  int *type, size_t *size) {
+	size_t i = *at;
+	if (i >= n) return "pack entry begins past the end of the pack";
+	uint8_t c = p[i++];
+	int t = (c >> 4) & 7;
+	size_t v = c & 15;
+	int sh = 4;
+	while (c & 0x80) {
+		if (i >= n) return "pack entry size varint runs past the end of the pack";
+		if (sh > 56) return "pack entry size varint is too long";
+		c = p[i++];
+		v |= (size_t)(c & 0x7f) << sh;
+		sh += 7;
+		/* Inside the loop, because bits only ever accumulate upward: a
+		 * varint asking for 2^60 is refused on the byte that says so
+		 * rather than after sixty bits of it have been shifted in. */
+		if (v > OBJ_MAX) return "pack entry declares a size above OBJ_MAX";
+	}
+	*at = i;
+	*type = t;
+	*size = v;
+	return NULL;
+}
+
+/* Read the object at a pack offset. */
+static const char *pack_at(Pack *p, uint64_t off, Obj *out) {
+	const uint8_t *q = p->pk.p;
+	/* The trailer is not entry data, so it is not part of what a varint or
+	 * a zlib stream is allowed to read into. */
+	size_t n = p->pk.n - 20;
+	if (off < PACK_HDR || off >= n) return "pack offset is outside the pack";
+	size_t at = (size_t)off;
+	int t;
+	size_t sz;
+	const char *e = pack_entry_hdr(q, n, &at, &t, &sz);
+	if (e) return e;
+	if (t == T_OFS_DELTA || t == T_REF_DELTA)
+		return "pack entry is a delta, which gitobj cannot resolve yet";
+	if (t < T_COMMIT || t > T_TAG)
+		return "pack entry has a type number git does not use";
+
+	Buf z = {0};
+	size_t used = 0;
+	if ((e = zinflate(q + at, n - at, &z, &used))) { bfree(&z); return e; }
+	/* The declared size is checked against what inflated. git stores both,
+	 * and a reader that trusts the varint reports a length the data does
+	 * not have. */
+	if (z.n != sz) {
+		bfree(&z);
+		return "pack entry inflated to a size other than the one it declares";
+	}
+	p->nbase++;
+	out->type = t;
+	out->data = z;
+	return NULL;
+}
+
 /* ------------------------------------------------- enumerating the store */
 
 typedef struct { char (*v)[41]; size_t n, cap; } Names;
@@ -1182,6 +1337,8 @@ static int usage(void) {
 	      "       gitobj ls|verify <objdir>\n"
 	      "       gitobj idx <pack.idx>\n"
 	      "       gitobj idxcrc <pack.idx>\n"
+	      "       gitobj packls <pack.idx>\n"
+	      "       gitobj packverify <pack.idx>\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
 	      "       gitobj msg <objdir> <sha>\n", stderr);
 	return 2;
@@ -1317,70 +1474,82 @@ int main(int argc, char **argv) {
 	}
 
 	if (!strcmp(cmd, "idxcrc") && argc == 3) {
-		Idx x;
-		idx_open(argv[2], &x);
-		size_t pl = strlen(argv[2]);
-		if (pl < 4 || strcmp(argv[2] + pl - 4, ".idx"))
-			die2("not a .idx path", argv[2]);
-		char pp[4096];
-		if ((size_t)snprintf(pp, sizeof pp, "%.*s.pack", (int)(pl - 4), argv[2])
-		    >= sizeof pp)
-			die("pack path too long");
-		Buf pk = {0};
-		readall(pp, &pk);
-		bexact(&pk);
-		/* 12 bytes of header, 20 of trailing checksum, and at least one
-		 * byte between them for the smallest possible object. */
-		if (pk.n < 33) dieval("pack shorter than a header and a trailer", pk.n);
-		if (memcmp(pk.p, "PACK", 4)) die2("not a packfile", pp);
-		if (be32(pk.p + 4) != 2) dieval("unsupported pack version", be32(pk.p + 4));
-		if (be32(pk.p + 8) != x.n)
-			dieval("pack object count disagrees with the index", be32(pk.p + 8));
-		if (memcmp(x.raw.p + x.raw.n - 40, pk.p + pk.n - 20, 20))
-			dieat("the pack checksum in the index is not the trailer the pack carries",
-			      x.raw.n - 40);
-
-		Pofs *v = malloc(x.n ? x.n * sizeof *v : 1);
-		if (!v) die("out of memory");
-		for (size_t i = 0; i < x.n; i++) {
-			v[i].off = idx_offset(&x, i);
-			v[i].i = (uint32_t)i;
-		}
-		if (x.n) qsort(v, x.n, sizeof *v, pofscmp);
-		/* Every offset is checked before any extent is derived from one.
-		 * Checking them inside the loop below is not the same thing: an
-		 * object's length comes from the NEXT offset, so one bogus entry
-		 * makes its predecessor's extent run off the end of the pack, and
-		 * the predecessor's own offset is perfectly valid. That version
-		 * segfaulted on the first fixture that pointed an offset past the
-		 * pack, which is what the fixture was for. */
-		for (size_t k = 0; k < x.n; k++) {
-			if (v[k].off < 12 || v[k].off >= pk.n - 20)
-				dieat("index offset is outside the pack", v[k].i);
-			if (k && v[k].off == v[k - 1].off)
-				dieat("two objects share a pack offset", v[k].i);
-		}
+		Pack p;
+		pack_open(argv[2], &p);
 		size_t bad = 0;
 		char hex[41];
-		for (size_t k = 0; k < x.n; k++) {
-			uint64_t beg = v[k].off;
-			uint64_t end = k + 1 < x.n ? v[k + 1].off : pk.n - 20;
-			uint32_t got = crc32z(pk.p + beg, (size_t)(end - beg));
-			uint32_t want = be32(x.crcs + 4 * v[k].i);
+		for (size_t k = 0; k < p.x.n; k++) {
+			uint64_t beg = p.ord[k].off;
+			uint32_t got = crc32z(p.pk.p + beg, (size_t)pack_extent(&p, k));
+			uint32_t want = be32(p.x.crcs + 4 * p.ord[k].i);
 			if (got != want) {
-				hexify(x.names + 20 * v[k].i, hex);
+				hexify(p.x.names + 20 * p.ord[k].i, hex);
 				printf("CRC MISMATCH %s at %llu: %08x, index says %08x\n",
 				       hex, (unsigned long long)beg, (unsigned)got,
 				       (unsigned)want);
 				bad++;
 			}
 		}
-		printf("%zu objects, %zu bad crcs\n", x.n, bad);
+		printf("%zu objects, %zu bad crcs\n", p.x.n, bad);
 		fprintf(stderr, "%zu objects, %zu direct, %zu via the 64-bit table of %zu\n",
-		        x.n, x.via32, x.via64, x.nbig);
-		free(v);
-		bfree(&pk);
-		bfree(&x.raw);
+		        p.x.n, p.x.via32, p.x.via64, p.x.nbig);
+		pack_close(&p);
+		return bad ? 1 : 0;
+	}
+
+	/* `git verify-pack -v` prints exactly these columns in exactly this
+	 * format, padding the type to six characters, so stdout here is
+	 * comparable with it line for line. Pack order, which is what git
+	 * walks: it sorts the index's offsets for the same reason this does.
+	 *
+	 * The census on stderr is the vacuity guard. A delta test over a pack
+	 * with no deltas in it passes while reading nothing, and which entries
+	 * are deltas is decided by whoever wrote the pack, so the count of
+	 * each kind is output rather than an assumption. */
+	if (!strcmp(cmd, "packls") && argc == 3) {
+		Pack p;
+		pack_open(argv[2], &p);
+		char hex[41];
+		for (size_t k = 0; k < p.x.n; k++) {
+			Obj o = {0, {0}};
+			const char *e = pack_at(&p, p.ord[k].off, &o);
+			if (e) dieat(e, (size_t)p.ord[k].off);
+			hexify(p.x.names + 20 * p.ord[k].i, hex);
+			printf("%s %-6s %zu %llu %llu\n", hex, tname(o.type), o.data.n,
+			       (unsigned long long)pack_extent(&p, k),
+			       (unsigned long long)p.ord[k].off);
+			bfree(&o.data);
+		}
+		fprintf(stderr, "%zu objects, %zu read whole\n", p.x.n, p.nbase);
+		pack_close(&p);
+		return 0;
+	}
+
+	/* The hard invariant, over packed objects: the name git filed an object
+	 * under has to be the SHA-1 of what came out of the pack. Nothing of
+	 * ours is on the other side of that comparison. */
+	if (!strcmp(cmd, "packverify") && argc == 3) {
+		Pack p;
+		pack_open(argv[2], &p);
+		size_t bad = 0;
+		char hex[41], want[41];
+		for (size_t k = 0; k < p.x.n; k++) {
+			Obj o = {0, {0}};
+			const char *e = pack_at(&p, p.ord[k].off, &o);
+			if (e) dieat(e, (size_t)p.ord[k].off);
+			uint8_t id[20];
+			objid(o.type, o.data.p, o.data.n, id);
+			hexify(id, hex);
+			hexify(p.x.names + 20 * p.ord[k].i, want);
+			if (strcmp(hex, want)) {
+				printf("MISMATCH %s hashes to %s\n", want, hex);
+				bad++;
+			}
+			bfree(&o.data);
+		}
+		printf("%zu objects, %zu mismatched\n", p.x.n, bad);
+		fprintf(stderr, "%zu objects, %zu read whole\n", p.x.n, p.nbase);
+		pack_close(&p);
 		return bad ? 1 : 0;
 	}
 

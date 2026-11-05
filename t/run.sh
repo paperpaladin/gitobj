@@ -224,11 +224,14 @@ loose_shas() {
 }
 
 nloose=0
+loose_from=
 for r in $HAVE_SMALL; do
 	G="$TMP/corpus/$r"
 	OD="$G/objects"
+	n=0
 	for sha in $(loose_shas "$G"); do
 		nloose=$((nloose+1))
+		n=$((n+1))
 		t=$("$GITOBJ" type "$OD" "$sha")
 		gt=$($GIT --git-dir="$G" cat-file -t "$sha")
 		eq "type $r/$sha" "$t" "$gt"
@@ -241,8 +244,15 @@ for r in $HAVE_SMALL; do
 		$GIT --git-dir="$G" cat-file -p "$sha" > "$TMP/theirs"
 		assert "cat -p $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
 	done
+	[ "$n" -gt 0 ] && loose_from="$loose_from $r($n)"
 done
 [ "$nloose" -ge 20 ] && ok || no "only $nloose loose objects in the small corpora"
+# Which repositories this ran over, and not only how many objects. Every
+# sibling in the collection is fully packed today, so cc, tarx and inflate
+# contribute nothing to it and the sweep is over the self corpus alone,
+# which the floor above cannot show and the README used to get wrong.
+printf 'per-object cat-file sweep: %d loose objects over%s\n' "$nloose" \
+	"${loose_from:- nothing}"
 
 # Refusals. A loose object file is one zlib stream and nothing else, so each
 # of these is a distinct lie about the bytes.
@@ -294,10 +304,10 @@ printf 'verified %d loose objects across %s\n' "$total_verified" \
 
 # `gitobj ls` against `git cat-file --batch-all-objects --batch-check`, which
 # emits exactly the same three fields. Only repositories with no packfile can
-# be compared whole this way. `ls` reads loose objects only: section 8 reads
-# the pack INDEX, which has no type or size in it, so a packed object still
-# cannot be listed. This comment used to point at a section 9 that was never
-# written. See README.md.
+# be compared whole this way. `ls` reads loose objects only: section 9 reads
+# pack entries and `packls` prints the same three fields for them, but
+# nothing joins the two listings yet, so a repository with a packfile still
+# cannot be compared whole. See README.md.
 # This is the ONLY place `gitobj ls` is compared against git over a whole
 # repository, and the skip below is silent -- so when every corpus repo has a
 # packfile (7 of the 9 do today) the loop body never runs and the oracle
@@ -1445,6 +1455,189 @@ rm -f "$BAD/nopack.pack"
 cpw "$SELFIDX" "$BAD/nopack.idx"
 refute "idxcrc refuses an index with no pack beside it" \
 	"$GITOBJ" idxcrc "$BAD/nopack.idx"
+
+# =====================================================================
+# 9. the pack walk: the type/size varint, and objects stored whole
+# =====================================================================
+# `git verify-pack -v` is the oracle here and it prints more than an index
+# can answer: an object's TYPE and its inflated SIZE come out of the entry
+# header in the pack, which section 8 never opened. The fourth column, the
+# bytes the entry occupies, is the extent the index's sorted offsets give.
+#
+# A corpus of its own, because the self corpus cannot do this job. Its blobs
+# are a few dozen bytes each and git does not attempt a delta below 50
+# bytes, so `pack-objects` leaves every one of them whole whatever window it
+# is given, and a standalone clone would have no delta to read anywhere. 400
+# lines with one rewritten per revision is a shape git deltas readily.
+#
+# The tree grows by one entry per revision and the entry added names that
+# revision's blob, so consecutive trees are append-only edits of each other.
+# That matters because a delta entry carries no type of its own: it inherits
+# the type of the object at the end of its chain, so a corpus whose deltas
+# are all blobs cannot tell a type read from the base apart from one read
+# anywhere else.
+DREPO=$TMP/dcorpus
+DW=$TMP/mk/dcorpus
+mkdir -p "$DW"
+$GIT init -q --bare "$DREPO"
+seq 1 400 | sed 's/^/line /' > "$DW/f"
+: > "$DW/tree"
+dparent=
+i=0
+while [ "$i" -lt 40 ]; do
+	i=$((i+1))
+	sed -i "${i}s/.*/line $i rewritten in revision $i/" "$DW/f"
+	db=$($GIT --git-dir="$DREPO" hash-object -w "$DW/f")
+	printf '100644 blob %s\tf%03d\n' "$db" "$i" >> "$DW/tree"
+	dt=$($GIT --git-dir="$DREPO" mktree < "$DW/tree")
+	# Fixed dates, so every name in this corpus is the same on every run.
+	dparent=$(GIT_AUTHOR_NAME=deltas GIT_AUTHOR_EMAIL=deltas@invalid \
+		GIT_COMMITTER_NAME=deltas GIT_COMMITTER_EMAIL=deltas@invalid \
+		GIT_AUTHOR_DATE='2002-02-02T00:00:00Z' \
+		GIT_COMMITTER_DATE='2002-02-02T00:00:00Z' \
+		$GIT --git-dir="$DREPO" commit-tree \
+			${dparent:+-p $dparent} "$dt" -m "revision $i of the delta corpus")
+done
+printf 'object %s\ntype commit\ntag deltas\ntagger deltas <deltas@invalid> 1012608000 +0000\n\nannotated\n' \
+	"$dparent" | $GIT --git-dir="$DREPO" mktag > /dev/null
+$GIT --git-dir="$DREPO" cat-file --batch-all-objects --batch-check |
+	awk '{print $1}' > "$TMP/packs/din"
+NDOBJ=$(wc -l < "$TMP/packs/din" | tr -d ' ')
+[ "$NDOBJ" -ge 100 ] && ok || no "the delta corpus has only $NDOBJ objects"
+
+# Two packs of the same objects. The delta-free one is what this section can
+# read; the other is the layout git chooses for itself, and the next item of
+# PLAN.md is reading it.
+mkdir -p "$TMP/packs/d"
+DPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty "$TMP/packs/d/dd" \
+	< "$TMP/packs/din")
+NDPACK=$($GIT --git-dir="$DREPO" pack-objects --window=0 --non-empty \
+	"$TMP/packs/d/nd" < "$TMP/packs/din")
+DIDX="$TMP/packs/d/dd-$DPACK.idx"
+NDIDX="$TMP/packs/d/nd-$NDPACK.idx"
+assert "both packs were built from the delta corpus" test -f "$DIDX" -a -f "$NDIDX"
+# verify-pack -v prints five fields for an entry stored whole and seven for
+# a delta, which is how the two packs are told apart without trusting the
+# flag that was meant to produce them.
+vpv() { $GIT -C "$SCRATCH" verify-pack -v "$1" | awk '$1 ~ /^[0-9a-f]{40}$/'; }
+eq "git says the window=0 pack has no delta in it at all" \
+	"$(vpv "$NDIDX" | awk 'NF>=7' | grep -c .)" 0
+eq "and that it holds every object of the delta corpus" \
+	"$(vpv "$NDIDX" | grep -c .)" "$NDOBJ"
+# The other half: the pack git chose the layout for is mostly deltas, and
+# their chains are deep. Without this the refusal below could be measured
+# against a pack that happened to have none either.
+ndelta=$(vpv "$DIDX" | awk 'NF>=7' | grep -c .)
+ddepth=$(vpv "$DIDX" | awk 'NF>=7{if($6>m)m=$6}END{print m+0}')
+[ "$ndelta" -ge 50 ] && ok ||
+	no "the delta corpus packs to only $ndelta delta entries"
+[ "$ddepth" -ge 5 ] && ok ||
+	no "the deepest delta chain in the delta corpus is only $ddepth"
+printf 'the delta corpus: %d objects, %d delta entries, deepest chain %d\n' \
+	"$NDOBJ" "$ndelta" "$ddepth"
+
+# Per object, not per file: a diff over a hundred objects says only that
+# something somewhere disagreed.
+"$GITOBJ" packls "$NDIDX" > "$TMP/p.ours" 2> "$TMP/p.census"
+eq "packls exits 0 on a delta-free pack" "$?" 0
+vpv "$NDIDX" > "$TMP/p.theirs"
+eq "packls prints a line per object, as verify-pack -v does" \
+	"$(wc -l < "$TMP/p.ours" | tr -d ' ')" "$(wc -l < "$TMP/p.theirs" | tr -d ' ')"
+nd_cmp=0
+while IFS= read -r a <&3 && IFS= read -r b <&4; do
+	nd_cmp=$((nd_cmp + 1))
+	eq "packls ${b%% *}" "$a" "$b"
+done 3< "$TMP/p.ours" 4< "$TMP/p.theirs"
+[ "$nd_cmp" -ge 100 ] && ok ||
+	no "only $nd_cmp objects compared against verify-pack -v"
+# The census, so none of the above can pass having read nothing: every entry
+# in this pack has to have been read out of the pack.
+eq "and every entry was read whole out of the pack" "$(cat "$TMP/p.census")" \
+	"$NDOBJ objects, $NDOBJ read whole"
+
+# The hard invariant, on the far side of the pack: the name git filed each
+# object under has to be the SHA-1 of what came out of the entry.
+eq "every object in the pack hashes back to its own name" \
+	"$("$GITOBJ" packverify "$NDIDX" 2>/dev/null)" "$NDOBJ objects, 0 mismatched"
+
+# A delta is refused cleanly rather than half-read, and git reads the very
+# same pack perfectly. That pair is what a missing feature needs: its
+# failure mode is not an absent error message, it is a confident wrong
+# answer about something that looked close enough.
+refute "packls refuses a pack with deltas in it" "$GITOBJ" packls "$DIDX"
+assert "and names the entry it stopped at" sh -c \
+	"'$GITOBJ' packls '$DIDX' 2>&1 >/dev/null | grep -Eq 'is a delta.* at [0-9]+'"
+assert "while git verify-pack reads that same pack" \
+	$GIT -C "$SCRATCH" verify-pack "$DIDX"
+refute "packverify refuses it too" "$GITOBJ" packverify "$DIDX"
+refute "packls refuses a path that does not end in .idx" \
+	"$GITOBJ" packls "$TMP/packs/self-$SELFPACK.pack"
+refute "packls refuses an index with no pack beside it" \
+	"$GITOBJ" packls "$BAD/nopack.idx"
+refute "packls refuses an index it cannot parse" "$GITOBJ" packls "$BAD/trunc.idx"
+
+# Two lies about an entry header, which is the only way to reach the checks
+# that the header is not self-consistent. Both need the pack edited, and an
+# edit invalidates four things that have nothing to do with the defect: the
+# pack's trailing checksum, the copy of it the index carries, the object's
+# CRC, and the index's own checksum. All four are re-stamped, so each
+# fixture is a single lie and cannot be refused for the wrong reason. The
+# guard on that is that `gitobj idxcrc` still accepts the edited pair.
+cat > "$TMP/packedit.py" <<'PYEDIT'
+import hashlib, struct, sys, zlib
+kind, pk, ix, opk, oix = sys.argv[1:6]
+p = bytearray(open(pk, 'rb').read())
+b = open(ix, 'rb').read()
+HDR = 1032
+fan = struct.unpack('>256I', b[8:HDR])
+n = fan[255]
+o = HDR
+names = [b[o + 20 * i:o + 20 * i + 20] for i in range(n)]; o += 20 * n
+crcs = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+off = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+rest = len(b) - 40 - o
+big = list(struct.unpack('>%dQ' % (rest // 8), b[o:o + rest]))
+assert not any(v & 0x80000000 for v in off), 'this edits 32-bit offsets only'
+order = sorted(range(n), key=lambda i: off[i])
+i0 = order[0]
+at = off[i0]
+if kind == 'type5':      # 5 is the one type number git has never assigned
+    p[at] = (p[at] & 0x8f) | (5 << 4)
+elif kind == 'badsize':   # the declared size, one away from the real one
+    p[at] ^= 1
+else:
+    raise SystemExit('unknown pack edit ' + kind)
+p[-20:] = hashlib.sha1(bytes(p[:-20])).digest()
+end = off[order[1]] if n > 1 else len(p) - 20
+crcs[i0] = zlib.crc32(bytes(p[at:end])) & 0xffffffff
+out = b'\377tOc' + struct.pack('>I', 2) + struct.pack('>256I', *fan)
+out += b''.join(names)
+out += struct.pack('>%dI' % n, *crcs)
+out += struct.pack('>%dI' % n, *off)
+out += struct.pack('>%dQ' % len(big), *big)
+out += bytes(p[-20:])
+out += hashlib.sha1(out).digest()
+open(opk, 'wb').write(bytes(p))
+open(oix, 'wb').write(out)
+PYEDIT
+PE=$TMP/packs/pe
+pack_refuse() { # <kind> <what it is> <expected message, an extended regex>
+	rm -rf "$PE"
+	mkdir -p "$PE"
+	python3 "$TMP/packedit.py" "$1" "$TMP/packs/d/nd-$NDPACK.pack" "$NDIDX" \
+		"$PE/pack-e.pack" "$PE/pack-e.idx"
+	assert "the index and the CRCs of the edited pack are still good: $2" \
+		"$GITOBJ" idxcrc "$PE/pack-e.idx"
+	refute "packls refuses $2" "$GITOBJ" packls "$PE/pack-e.idx"
+	assert "and names the rule and the place: $2" sh -c \
+		"'$GITOBJ' packls '$PE/pack-e.idx' 2>&1 >/dev/null | grep -Eq '$3'"
+	assert "git verify-pack refuses $2 too" sh -c \
+		"! $GIT -C '$SCRATCH' verify-pack '$PE/pack-e.idx' >/dev/null 2>&1"
+}
+pack_refuse type5 "an entry whose type number git does not use" \
+	'type number git does not use at [0-9]+'
+pack_refuse badsize "an entry that inflated to a size other than its own" \
+	'inflated to a size other than the one it declares at [0-9]+'
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
