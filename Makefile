@@ -33,8 +33,15 @@ test-asan: gitobj.c
 		-o gitobj-asan gitobj.c
 	@$(SANOPT) t/run.sh ./gitobj-asan
 
+# A pack over two gigabytes, which is the only way git itself writes a
+# 64-bit offset into an index. Out of `make test` because it writes about
+# 5GB and takes minutes, which also means nobody runs it: re-run it rather
+# than quoting what the README says it said.
+bigpack: gitobj
+	@t/bigpack.sh ./gitobj
+
 clean:
 	rm -f gitobj gitobj-asan
-	rm -rf t/tmp*
+	rm -rf t/tmp* t/bigpack.??????
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan bigpack clean

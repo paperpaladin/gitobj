@@ -4,9 +4,8 @@ Reads git's object database, writes loose objects into it, builds trees, reads
 a packfile's v2 index, and reads the objects out of the pack through delta
 chains of either encoding and any depth: one C11 file, no libgit2, no
 shelling out to git.
-The DEFLATE decoder is vendored from the sibling `../inflate` rather than
-rewritten; the writer emits zlib stored blocks, which git reads and which
-compress nothing.
+Both DEFLATE halves are vendored from the sibling `../inflate` rather than
+rewritten, which is where their oracle lives.
 
 ```
 $ gitobj idx ../cc/.git/objects/pack/pack-1b962a98....idx | head -2
@@ -31,6 +30,8 @@ per-object cat-file sweep: self_a(123, 123 loose) self_b(123, 123 loose) self_c(
 sibling corpus (big): 5 of 5 present
 verified 3307 objects across self_a self_b self_c self_p cc tarx inflate psh unrepro cmark httpd wasmi
 ls against git batch-check: 3307 objects over 12 repositories, 369 loose and 2938 packed
+loose object sizes: 100000 zero bytes to 133, 336000 of repeated text to 1059, 100000 random to 100028
+the same repeated text: 1059 bytes here, 2041 from git at its own default
 read 10 pack indexes, 3061 objects
 3173 objects read through a 32-bit offset, 134 through the 64-bit table
 the delta corpus: 124 objects, 79 delta entries, deepest chain 15
@@ -39,7 +40,7 @@ packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 
 base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
 abbreviated names: 1498 of 7 characters resolved, 0 refused
 four-character prefixes: 32 resolved, 4 ambiguous
-19535 passed, 0 failed
+19545 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
@@ -60,7 +61,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **5874 passed**, against five bare
+Cloned on its own this suite reports **5884 passed**, against six bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -75,14 +76,16 @@ beside it, which is what the index reader reads.
 The fifth is for the deltas and is described under the pack walk below,
 because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
-makes it produce one.
+makes it produce one. The sixth is 600 blobs whose only purpose is to hold
+two objects whose names share their first four characters, which is what the
+abbreviated-name lookup needs and what 123 objects do not provide.
 
-Inside the collection it reports more: 19535 above, because the sibling
+Inside the collection it reports more: 19545 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-5874: the one a reader gets by cloning this repository and running `make
+5884: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -103,7 +106,7 @@ this repo has no expected-output files.
 Everything else is `git cat-file -p` / `-t` / `-s` and `git log --format=`,
 object by object, over every object of the `CORPUS_SMALL` set, loose and
 packed: the four repositories the suite builds, and cc, tarx and inflate if
-they are there. 1375 objects, 1006 of them out of a pack.
+they are there. 1498 objects, 1129 of them out of a pack.
 
 git chooses the set. `cat-file --batch-all-objects` lists what is in the
 store, so the sweep covers whatever is there rather than whatever it went
@@ -113,7 +116,7 @@ been repacked since those were added, so the sweep the previous version of
 this paragraph described as running over three real histories was running
 over the suite's own corpus and clearing its floor of 20 objects with that.
 Hence the per-repository line in the output, and an assertion that both
-halves of the store were read: 8 of the 12 corpus repositories hold nothing
+halves of the store were read: 9 of the 12 corpus repositories hold nothing
 but packed objects and 3 nothing but loose ones.
 
 The other five siblings get `gitobj verify` over their whole object store,
@@ -178,7 +181,7 @@ mutates one, so a fixture differs from git's only where it was asked to.
 The CRC is the one field with an oracle outside the index entirely. It is a
 CRC-32 over the object's bytes as packed, which means from its own offset to
 the next offset in PACK order, and the index is sorted by name, so the
-extents only exist once the offsets have been sorted. 2938 of them are
+extents only exist once the offsets have been sorted. 3061 of them are
 recomputed from the pack bytes and compared with what git stored.
 
 The 64-bit offset table has no corpus coverage and never will: an offset
@@ -266,7 +269,7 @@ was found by asserting the opposite: the first version of this section built
 a `--window=0` pack and checked that the ordinary pack had deltas in it, and
 the ordinary pack had none either.
 
-So there is a fourth repository now: 40 revisions of a 400-line file with one
+So there is a fifth repository now: 40 revisions of a 400-line file with one
 line rewritten each time, a tree per revision that grows by one entry, and a
 commit per revision, plus three revisions of a 20000-line file. git packs
 that into 124 objects of which 79 are deltas, the deepest chain 15, and those
@@ -311,13 +314,13 @@ index naming one object and tells the pack header it holds one fewer, leaving
 the base's bytes where they were: what goes is the entry that would have
 found them.
 
-The comparison runs over every pack in reach: the three fixture packs and
-the nine indexes the corpus has, 3310 objects, 2016 of them deltas, chains up
-to 29 deep. Per object rather than as a file diff, since a diff over three
+The comparison runs over every pack in reach: the fixture packs and the ten
+indexes the corpus has, 3438 objects, 2019 of them deltas, chains up to 29
+deep. Per object rather than as a file diff, since a diff over three
 thousand objects says only that something somewhere disagreed. The census is
 checked against git's own count of delta entries and git's own deepest chain,
 read out of `verify-pack -v`'s field count and sixth column, so a run where
-the delta code never fired could not report agreement. And all 3310 hash back
+the delta code never fired could not report agreement. And all 3438 hash back
 to their own names.
 
 Eighteen mutations, fourteen red. Reading the type from the low three bits
@@ -621,6 +624,79 @@ Filing the object under the name the INDEX gave rather than the one we
 computed was written as a defect and is not one: the two are equal wherever
 anything is written at all, since the mismatch branch writes nothing.
 
+## Writing, after the encoder arrived
+
+`gitobj write` emitted zlib stored blocks until now: legal DEFLATE, read
+perfectly by git, and about 1.0003x the payload where git's own loose object
+is nearer a third of it. Nobody would have written a real repository with
+one.
+
+The encoder is vendored from `../inflate`, the same way its decoder was and
+for the same reason: that project measures this encoder against `gzip -6`
+over seven corpora and owns the oracle for it. What travels is the
+tokeniser, the Huffman tree builder and the cost-chosen block boundaries;
+what does not is gzip framing, which two header bytes and a big-endian
+Adler-32 replace.
+
+What is checked here is the vendoring, and that the choice between the three
+block types is being made at all, since a cost model that always picked one
+of them would pass every other assertion in the write section. Three
+payloads, one per answer:
+
+```
+100000 zero bytes              ->    133      a coded block, or nothing could
+336000 of one repeated line    ->   1059      0.3% of the payload
+100000 from /dev/urandom       -> 100028      stored, and it has to be
+```
+
+The last of those is the sharpest. urandom cannot be compressed, so the cost
+model has to fall back to stored blocks, which are five bytes of header per
+65535 of payload plus six of framing. Anything much over 100028 is a coded
+block being chosen when it should not have been, and anything under it is
+impossible.
+
+git's own loose object for that repeated line is 2041 bytes against our
+1059, which is not a comparison either of us is trying to win: git's default
+for a LOOSE object is compression level 1, where this encoder does the work
+`gzip -6` does. Reported rather than asserted, for that reason.
+
+Four mutations of the framing and the bit writer, four red, each of them
+caught by git refusing to inflate what we wrote and by our own `verify`
+refusing it too. Not reversing a Huffman code into the stream fails 822
+assertions, a zlib header whose check bits do not divide by 31 fails 832,
+the Adler-32 written little-endian fails 558, and never setting BFINAL fails
+548.
+
+## An index git itself wrote with a 64-bit offset
+
+Everything else about the 64-bit offset table is tested against indexes this
+suite rewrites or builds by hand. What no fixture can be is an index git
+PRODUCED with a large offset in it, because that needs a pack git had a
+reason to put one in, which means a pack over two gigabytes.
+
+`make bigpack` builds one: eleven blobs of 230MB of urandom, under gitobj's
+own OBJ_MAX of 256MB so each is an object it would agree to read, packed
+with `--window=0`. Run on 5 November 2026 it produced a pack of
+2,653,704,008 bytes in which git wrote 2 offsets at or above 2^31, and
+`gitobj idx` agreed with `git show-index` line for line, with the census
+confirming that 2 of the 11 objects came through the table. 18 assertions,
+all passing.
+
+It is not in `make test`: it writes about 5GB and takes minutes. That makes
+it a target nobody runs, so re-run it rather than quoting the paragraph
+above; the figures here are one run, not a standing claim.
+
+`--window=0` is not a detail either. With a delta window those eleven 230MB
+blobs are read into memory together to be compared, which on this machine is
+an out-of-memory kill, and the first run reported an empty pack name and
+seven confusing failures because the status of a command substitution was
+never looked at. They are urandom and would not delta anyway.
+
+What that run cannot do, and did not pretend to: read the OBJECTS of a 2.5GB
+pack. `readall()` loads a whole file, so `idxcrc` and `packls` over that pack
+would want 2.5GB of address space and a copy on top of it. The index is what
+the target is for.
+
 ## What does not work
 
 The hard invariant, that every object read hashes back to its own name,
@@ -649,22 +725,15 @@ delta encodings and delta chains of any depth, and its oracle list included
 exists now, four commits after the audit, and the hard invariant is finally
 the claim it had been making all along.
 
-A pack over two gigabytes is the one thing in the index the suite cannot
-obtain, so no index git itself wrote with a 64-bit offset in it has ever been
-read here. What runs instead is described above: an index the suite rewrites
-so that git resolves a real pack through the table, and an index carrying
-offsets by hand. Both have git on the other side of the comparison; neither
-is a 2GB pack.
+A pack over two gigabytes is out of `make test`'s reach, so what the suite
+itself runs is an index it rewrites so that git resolves a real pack through
+the table, and an index carrying offsets by hand. `make bigpack` is the one
+that builds a real one, and it is a separate target because it writes 5GB;
+its section above says what it produced and when.
 
 `.rev` files are ignored. `git pack-objects` writes one beside every pack it
 makes and nothing here looks at it, so the reverse mapping from offset to
 object is recomputed by sorting instead of read.
-
-Writing compresses nothing. `gitobj write` emits a zlib stream of stored
-blocks, so a loose object it writes is about 1.0003x its payload where git's
-is nearer 0.3x. git reads it perfectly and `fsck --strict` is happy, but no
-one should write a real repository with this. A real encoder is the first
-item of `PLAN.md`'s Milestone 1.
 
 `gitobj mktree` is narrower than `git mktree` in three ways, all of them
 things git does by looking in the object store, which it does not do. It
@@ -713,12 +782,11 @@ takes 33 seconds, where it took 10 before it read any packs.
 The house convention here is that every repo has a `README.md` stating what
 does *not* work, and this repo did not have one. `gitobj.c`'s header comment
 pointed at it (`See README.md`), and so did a comment in `t/run.sh` pointing
-at a "section 9" that did not exist either: the file stopped at section 5,
-and stops at 9 now that there is a writer, a tree builder, a pack index
-reader and a pack walk to test. Section 9 is the one that comment pointed
-at, three commits before it was written. Those two pointers and the `PLAN.md` prose were the only
-places the pack gap was acknowledged, and all three described it as
-finished.
+at a "section 9" that did not exist either: the file stopped at section 5.
+It stops at 13 now, and section 9 is the pack walk that comment was pointing
+at, written eight commits after the pointer to it. Those two pointers and
+the `PLAN.md` prose were the only places the pack gap was acknowledged, and
+all three described it as finished.
 
 ## License
 

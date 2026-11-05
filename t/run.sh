@@ -820,6 +820,54 @@ for f in nul squish; do
 	nwritten=$((nwritten+1))
 done
 
+# What the compression comes to. The encoder is vendored from ../inflate,
+# which measures it against `gzip -6` over seven corpora; what is checked
+# here is that the choice between the three block types is being made, since
+# a cost model that always picked one of them would pass every assertion
+# above. Three payloads, one for each answer.
+python3 -c 'open("'"$TMP"'/pay.zero","wb").write(b"\x00"*100000)'
+cp "$TMP/fix/rand" "$TMP/pay.rand"
+# Not a copy of pay.squish: that object is already in the store, and
+# counting one object twice against what git finds there is the mistake the
+# comment above records. A different line, so it is a different blob.
+python3 -c 'open("'"$TMP"'/pay.text","wb").write((b"a line that repeats, and compresses accordingly\n")*7000)'
+csize() { wc -c < "$WOD/${1:0:2}/${1:2}" | tr -d ' '; }
+for f in zero text rand; do
+	got=$("$GITOBJ" write "$WOD" blob "$TMP/pay.$f")
+	eq "write blob $f names it as git does" "$got" \
+		"$($SG hash-object -t blob "$TMP/pay.$f")"
+	$WG cat-file blob "$got" > "$TMP/ours" 2>/dev/null
+	assert "git inflates our $f blob byte for byte" cmp -s "$TMP/ours" "$TMP/pay.$f"
+	eval "sz_$f=\$(csize $got)"
+	eval "in_$f=\$(wc -c < \"\$TMP/pay.\$f\")"
+	nwritten=$((nwritten+1))
+done
+# 100KB of zeros collapses to almost nothing, which only a coded block can
+# do: a stored block of it is 100KB plus framing.
+[ "$sz_zero" -lt 2000 ] && ok ||
+	no "100000 zero bytes came to $sz_zero, so no coded block was chosen"
+# Repetitive text, where git's own loose objects sit around a third.
+[ "$((sz_text * 100 / in_text))" -lt 50 ] && ok ||
+	no "the repetitive payload came to $sz_text of $in_text, over half"
+# urandom cannot be compressed, so the cost model has to fall back to stored
+# blocks: five bytes of block header per 65535 of payload, plus six of
+# framing. Anything much over that is a coded block being chosen when it
+# should not have been, and anything under it is impossible.
+[ "$sz_rand" -ge "$in_rand" ] && ok ||
+	no "100000 random bytes came to $sz_rand, under the $in_rand that went in"
+[ "$sz_rand" -le "$((in_rand + 100))" ] && ok ||
+	no "100000 random bytes came to $sz_rand, so stored blocks were not chosen"
+printf 'loose object sizes: %d zero bytes to %d, %d of repeated text to %d, %d random to %d\n' \
+	"$in_zero" "$sz_zero" "$in_text" "$sz_text" "$in_rand" "$sz_rand"
+# git's own, for the same content, reported rather than asserted: git's
+# default for a loose object is compression level 1, so it is not a
+# comparison either of us is trying to win.
+gsz=$($SG hash-object -t blob -w "$TMP/pay.text" > /dev/null &&
+	wc -c < "$OD2/$(
+		g=$($SG hash-object -t blob "$TMP/pay.text"); echo "${g:0:2}/${g:2}")" | tr -d ' ')
+printf 'the same repeated text: %d bytes here, %d from git at its own default\n' \
+	"$sz_text" "$gsz"
+
 # stdin, and writing the same content twice.
 printf 'written from stdin\n' > "$TMP/wstdin"
 got=$("$GITOBJ" write "$WOD" blob < "$TMP/wstdin")
