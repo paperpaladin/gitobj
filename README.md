@@ -423,8 +423,9 @@ gives "distance reaches before output start at 658". Both refuse, at the same
 offset. Pinning the suite to that text would be pinning it to where a cut
 happened to land, so the measurement is here instead.
 
-`make test-asan` runs all 17099 assertions under ASan and UBSan, this
-section's hand-built and fuzzed packs included, and is clean. That is worth
+`make test-asan` runs all 19545 assertions under ASan and UBSan, this
+section's hand-built and fuzzed packs included, and is clean. The encoder
+vendored later went through it too. That is worth
 no more than the trimming described two sections up makes it worth: the
 index and the pack are both shrunk to exactly the bytes read, and without
 that a read past the end of either lands inside a rounded-up allocation and
@@ -701,9 +702,10 @@ the target is for.
 
 The hard invariant, that every object read hashes back to its own name,
 covers every object in every corpus: 369 loose, and 3438 read out of fifteen
-packs, 2019 of those through a delta chain. It said 490 of 3184 four commits
-ago. The one thing it does not cover is a pack over two gigabytes, which this
-suite cannot build.
+packs, 2019 of those through a delta chain. It said 490 of 3184 seven commits
+ago. The one thing `make test` does not cover is a pack over two gigabytes,
+and `make bigpack` reads the INDEX of one; the objects of a pack that size
+are out of reach of a reader that loads whole files.
 
 `gitobj ls` and `gitobj verify` read a whole object store now, loose files
 and packs together, and an object that is in both is listed once. `gitobj
@@ -722,7 +724,7 @@ Its hard invariant said the suite hashes "every object in every corpus
 repository, loose and packed", its in-scope list described the v2 index, both
 delta encodings and delta chains of any depth, and its oracle list included
 `git verify-pack -v` diffed against a `gitobj packls`. Every one of those
-exists now, four commits after the audit, and the hard invariant is finally
+exists now, seven commits after the audit, and the hard invariant is finally
 the claim it had been making all along.
 
 A pack over two gigabytes is out of `make test`'s reach, so what the suite
@@ -751,15 +753,20 @@ git's own fsck objects to what git produced -- because a refusal with no
 outside authority behind it is just an opinion.
 
 A tree is the only object gitobj constructs. There is no commit or tag
-builder and no packfile writing. Unpacking a pack into loose objects does
-work, and has its own section above.
+builder and no packfile writing: no delta search, no `.idx` generation, and
+so no `git verify-pack` over output of our own, which is the one item of
+`PLAN.md`'s Milestone 1 that would close the loop on the delta encoders.
+Unpacking a pack into loose objects does work, and has its own section
+above.
 
 Those paragraphs used to be one line saying the whole thing was read-only,
 which it was until the writer landed. `PLAN.md` had listed `write` and
 `mktree` as though both existed for a good while before either did.
 
-No SHA-256 repositories, no ref parsing, no `--batch` protocol, no index or
-worktree. An object is addressed by its name or by four or more hex
+No SHA-256 repositories: 20 bytes of hash is on 29 lines of `gitobj.c`,
+SHA-256 itself is not here, and a corpus built with
+`--object-format=sha256` would be needed for any of it to mean anything. No
+ref parsing, no `--batch` protocol, no index or worktree. An object is addressed by its name or by four or more hex
 characters of it, and nothing else: no `HEAD`, no `main~3`, no `:path`, none
 of the rest of git's revision syntax.
 
@@ -768,14 +775,15 @@ or partial clones. Alternates are read, including nested and relative ones,
 but a C-quoted path in the file is not: git accepts a line beginning with a
 double quote as a quoted path, nothing writes one in practice, and such a
 line is taken literally here and the directory is then simply not found. No
-v1 pack index: it is refused by name
-rather than read, since it has no CRCs and git has not written one since
-2007.
+v1 pack index: it is refused by name rather than read, since it has no CRCs
+and git has not written one since 2007.
 
 Not fast. Every object is inflated from scratch, a delta is re-applied for
 every object on its chain whose base has fallen out of the cache, and a
 command that wants one object opens every pack in the store. `make test`
-takes 33 seconds, where it took 10 before it read any packs.
+takes 43 seconds, where it took 10 before it read any packs; most of that is
+processes rather than work, at six of them per object over the 1498 the
+per-object sweep covers.
 
 ## Why this file exists
 

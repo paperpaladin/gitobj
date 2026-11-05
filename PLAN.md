@@ -620,8 +620,35 @@ by hand.
       went from 43 against a suite of 2303 to 291 against one of 17099.
       That is the argument for re-measuring rather than quoting: two of the
       three numbers already in this file were stale.
-- [ ] README and PLAN
+- [x] README and PLAN
       why: a README that lists only successes is not finished.
+      files: README.md and PLAN.md, and nothing else.
+      proves: nothing, which is the point of doing it last. What it does is
+      make both documents agree with a run of the suite. Every figure in
+      the README was re-derived from one: the test counts both ways, the
+      3061 CRCs, the 1498 objects of the per-object sweep, the fifteen
+      packs, the six self-built corpora, and the 43 seconds `make test`
+      now takes.
+      found: five figures had drifted as the suite grew, every one of them
+      in a direction that made the project look like it covered less than
+      it did, which is the harmless direction and still wrong. The
+      per-object sweep was quoted at 1375 objects when it covered 1498, the
+      CRC count at 2938 when it was 3061, the corpus count at five when it
+      was six, and two figures in the delta sections were a commit behind.
+      found: the house rule about a README listing only successes is the
+      easy half. The hard half is a README whose failures are stale. Five
+      surviving mutants are recorded there with the reason each one is
+      unobservable (the buffer trim, the pack trailer bound, both halves of
+      the base cache's byte budget, and the alternates walk's early return
+      on a directory it has already searched) and three more that were
+      written as defects and are not (the zlib window field, searching the
+      whole name list rather than one fanout bucket, and filing an unpacked
+      object under the name the index gave). Two stopped being survivors
+      during this stretch of work and had to be moved rather than left
+      reading as current.
+      Three sections of the README now describe things that work and did
+      not when this item was written: the base cache, alternates and
+      abbreviated names. Each of them says what it still cannot do.
 
 ### Milestone 1: the gaps that bite real users
 
@@ -663,8 +690,9 @@ by hand.
 - [x] a delta base cache, so a chain of depth N costs N inflations once,
   not N inflations per object in it
       why: `packls` over a whole pack would be the slowest thing in the
-      suite, and the fix is a four-entry LRU keyed on pack offset. (`packls`
-      does not exist; see the note at the head of this file.)
+      suite, and the fix is a four-entry LRU keyed on pack offset. (This
+      said `packls` did not exist. It does now, which is what made the
+      slowness measurable rather than predicted.)
       files: gitobj.c (DBASE_N, DBASE_MAX, Dbase, dbase_get, dbase_evict,
       dbase_put, and pack_at split into a census wrapper around
       pack_resolve), t/run.sh sections 9 and 10, README.md
@@ -841,6 +869,13 @@ by hand.
       why: the one direction of the format that is entirely unimplemented,
       and the only way to close the loop on the delta encoders.
 - [ ] SHA-256 repositories
-      why: 20 is hard-coded in nine places. The format is otherwise
-      identical and the work is mostly mechanical, but it needs a corpus
-      built with `--object-format=sha256` to be worth anything.
+      why: the format is otherwise identical and the work is mostly
+      mechanical, but it needs a corpus built with
+      `--object-format=sha256` to be worth anything, and it needs SHA-256
+      itself, which is not here.
+      This said 20 was hard-coded in nine places. It is on 29 lines now
+      counting only the unambiguous forms (`[20]`, `20 *`, `* 20`), since
+      everything the pack reader added names a hash length too, and the
+      index's two 20-byte checksums and the pack's trailer are the same
+      constant wearing a different hat. A count in a `why:` goes stale like
+      any other; re-grep it rather than quoting this.
