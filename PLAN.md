@@ -574,10 +574,25 @@ by hand.
       658". Both refuse at the same offset. Pinning the suite to that text
       would pin it to where a cut happened to land, so the measurement is
       in the README instead.
-- [ ] the three sabotages, recorded in the README
+- [x] the three sabotages, recorded in the README
       why: a suite whose failure has never been observed is not evidence.
       The delta copy instruction, the tree sort and the object header each
       get broken on purpose and the damage written down.
+      files: README.md only. The three defects were planted, measured and
+      reverted; nothing in the repository carries one.
+      proves: the object header returning its length without the NUL fails
+      291 assertions, all of them the write oracle, where git reads back an
+      object under a name it does not agree with. Deleting the tree sort's
+      trailing-slash rule fails 52, two of them `git fsck --strict` calling
+      the result treeNotSorted. Reading the delta copy bitmap as three
+      offset bytes and four length bytes fails 3155, beginning with `gitobj
+      verify` over the siblings, which is the hard invariant itself.
+      found: the same sabotage measures the suite and not the defect. The
+      copy-bitmap one failed 45 assertions three commits ago and fails 3155
+      now, because `ls` and `verify` read packs in between. The header one
+      went from 43 against a suite of 2303 to 291 against one of 17099.
+      That is the argument for re-measuring rather than quoting: two of the
+      three numbers already in this file were stale.
 - [ ] README and PLAN
       why: a README that lists only successes is not finished.
 

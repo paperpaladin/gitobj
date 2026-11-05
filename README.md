@@ -424,6 +424,37 @@ index and the pack are both shrunk to exactly the bytes read, and without
 that a read past the end of either lands inside a rounded-up allocation and
 the sanitizer says nothing.
 
+## The three sabotages
+
+A suite whose failure has never been observed is not evidence, so three rules
+that the whole project rests on get broken on purpose and the damage written
+down. All three numbers are against the suite as it stands, 17099
+assertions, and all three were re-measured for this section rather than
+copied from when each was first planted.
+
+The object header. `objhdr` returns the length of `"<type> <len>"` plus one
+for the NUL that follows it; returning the length without the NUL takes one
+byte off everything that is hashed. 291 assertions fail, and they are the
+write oracle: every object `gitobj write` and `gitobj mktree` put in a bare
+repository comes out under a name git does not agree with. It failed 43 when
+it was first planted, against a suite of 2303.
+
+The tree sort. Entries compare as though a directory's name ended in a
+slash, so `a.c` sorts before `a` when `a` is a directory. Deleting that rule
+fails 52, and two of those are `git fsck --strict` calling the result
+treeNotSorted, which is what makes the ORDER checked by something other than
+a name comparison. The number has not moved since it was planted, because
+nothing added since reads a tree we built.
+
+The delta copy instruction. A copy's operand bytes are selected by a bitmap
+in the instruction byte, four bits for the offset and three for the length;
+reading it as three and four fails 3155. The first failures are `gitobj
+verify` over the sibling repositories, which is the hard invariant itself:
+objects come out of the pack and do not hash back to the names git filed
+them under. This one is also the clearest measure of what the suite has
+grown into rather than of the defect, because the same sabotage failed 45
+assertions three commits ago, before `ls` and `verify` read packs at all.
+
 ## What does not work
 
 There is no delta base cache, so a chain of depth N costs N inflations for
