@@ -1818,17 +1818,6 @@ assert "and says so rather than reading some other object" sh -c \
 assert "git verify-pack refuses it too" sh -c \
 	"! $GIT -C '$SCRATCH' verify-pack '$TH/pack-t.idx' >/dev/null 2>&1"
 
-# The guard against all of the above passing vacuously, counted over every
-# pack this section read. A standalone clone gets its deltas and its chain
-# depth from the corpus built above; in the collection the siblings add a
-# few thousand more.
-[ "$pls_delta" -ge 150 ] && ok ||
-	no "only $pls_delta delta entries were read through verify-pack -v"
-[ "$pls_depth" -ge 5 ] && ok ||
-	no "the deepest chain read was only $pls_depth"
-printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
-	"$pls_objs" "$pls_delta" "$pls_depth"
-
 refute "packls refuses a path that does not end in .idx" \
 	"$GITOBJ" packls "$TMP/packs/self-$SELFPACK.pack"
 refute "packls refuses an index with no pack beside it" \
@@ -1853,6 +1842,400 @@ pack_refuse type5 "an entry whose type number git does not use" \
 	'type number git does not use at [0-9]+'
 pack_refuse badsize "an entry that inflated to a size other than its own" \
 	'inflated to a size other than the one it declares at [0-9]+'
+# =====================================================================
+# 10. a pack built by hand: the lengths git never gets wrong
+# =====================================================================
+# Every length in a pack is a number chosen by whoever wrote the file, and
+# git writes them all correctly, so the checks on them cannot be reached by
+# any fixture git produces. Three mutations of the delta code survived the
+# whole of section 9 for exactly that reason: the declared base size, the
+# declared result size, and the bound that keeps a varint or a zlib stream
+# off the pack trailer.
+#
+# So this builds packs itself, which puts the fixture builder in the
+# position of being the thing that has to be trusted. git settles that: it
+# must accept the well-formed one, resolve its chain, and rebuild its index
+# from the pack alone byte for byte. Only then is a mutation of it one lie.
+cat > "$TMP/packgen.py" <<'PYGEN'
+import hashlib, struct, sys, zlib
+
+HDR = 1032
+
+
+def ent_hdr(t, n):
+    """A pack entry header: continuation bit, three bits of type, four of
+    size, then seven bits per byte."""
+    out = bytearray()
+    c = (t << 4) | (n & 15)
+    n >>= 4
+    while n:
+        out.append(c | 0x80)
+        c = n & 0x7f
+        n >>= 7
+    out.append(c)
+    return bytes(out)
+
+
+def ofs_varint(ofs):
+    """git's own encoder for the OFS_DELTA distance, where every
+    continuation byte takes one off before shifting."""
+    out = [ofs & 127]
+    ofs >>= 7
+    while ofs:
+        ofs -= 1
+        out.append(128 | (ofs & 127))
+        ofs >>= 7
+    return bytes(reversed(out))
+
+
+def dvarint(n):
+    out = bytearray()
+    while True:
+        c = n & 0x7f
+        n >>= 7
+        out.append(c | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def copy(off, size):
+    c = 0x80
+    b = bytearray()
+    for k in range(4):
+        byte = (off >> (8 * k)) & 0xff
+        if byte:
+            c |= 1 << k
+            b.append(byte)
+    if size != 0x10000:       # absent length bytes mean 0x10000
+        for k in range(3):
+            byte = (size >> (8 * k)) & 0xff
+            if byte:
+                c |= 0x10 << k
+                b.append(byte)
+    return bytes([c]) + bytes(b)
+
+
+def insert(data):
+    assert 0 < len(data) < 128
+    return bytes([len(data)]) + data
+
+
+TYPES = {1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag'}
+
+
+def oid(t, data):
+    return hashlib.sha1(('%s %d' % (TYPES[t], len(data))).encode() + b'\0' + data).digest()
+
+
+def apply_instr(base, instr):
+    out = bytearray()
+    for op in instr:
+        if op[0] == 'copy':
+            out += base[op[1]:op[1] + op[2]]
+        elif op[0] == 'insert':
+            out += op[1]
+    return bytes(out)
+
+
+def build(spec, kind, flip=None):
+    """spec is a list of entries in pack order. Returns (pack, idx).
+
+    flip is (offset, mask), applied to the pack body before either checksum
+    or any CRC is computed, so a flipped byte is the fixture's only lie."""
+    content = []
+    types = []
+    payload = []
+    etype = []
+    for i, e in enumerate(spec):
+        if 'data' in e:
+            content.append(e['data'])
+            types.append(e['type'])
+            payload.append(e['data'])
+            etype.append(e['type'])
+        else:
+            b = e['base']
+            res = apply_instr(content[b], e['instr'])
+            content.append(res)
+            types.append(types[b])
+            bs = e.get('base_size', len(content[b]))
+            rs = e.get('res_size', len(res))
+            d = dvarint(bs) + dvarint(rs) + b''.join(
+                op[1] if op[0] == 'raw' else
+                copy(op[1], op[2]) if op[0] == 'copy' else insert(op[1])
+                for op in e['instr'])
+            payload.append(d)
+            etype.append(6 if e['how'] == 'ofs' else 7)
+
+    names = [oid(types[i], content[i]) for i in range(len(spec))]
+
+    # Lay the entries out, which is what fixes the offsets the deltas need.
+    body = bytearray()
+    offs = []
+    for i, e in enumerate(spec):
+        offs.append(12 + len(body))
+        n = len(payload[i])
+        if kind == 'bigsize' and i == len(spec) - 1:
+            n = (256 << 20) + 1      # a size no allocation should be made for
+        body += ent_hdr(etype[i], n)
+        if etype[i] == 6:
+            d = offs[i] - offs[e['base']]
+            if kind == 'ofszero':
+                d = 0                # names the delta entry itself
+            elif kind == 'ofspast':
+                d = offs[i]          # one byte before the pack header
+            body += ofs_varint(d)
+        elif etype[i] == 7:
+            nm = names[e['base']]
+            if kind == 'refself' and i == len(spec) - 1:
+                nm = names[i]        # a delta whose base is itself
+            body += nm
+        body += zlib.compress(payload[i], 6)
+
+    pack = bytearray(b'PACK' + struct.pack('>II', 2, len(spec)) + bytes(body))
+    if flip:
+        pack[flip[0]] ^= flip[1]
+    if kind == 'trunc':
+        # Cut the last entry's zlib stream in half. Everything else stays
+        # true, including both checksums and the CRCs, so the only lie is
+        # that the pack ends early.
+        cut = (len(pack) + offs[-1]) // 2
+        pack = pack[:cut]
+    pack += hashlib.sha1(bytes(pack)).digest()
+
+    order = sorted(range(len(spec)), key=lambda i: names[i])
+    crcs = []
+    for i in order:
+        end = offs[order_next(offs, i)] if order_next(offs, i) is not None \
+            else len(pack) - 20
+        crcs.append(zlib.crc32(bytes(pack[offs[i]:max(offs[i], end)])) & 0xffffffff)
+    fan, t = [], 0
+    c = [0] * 256
+    for i in order:
+        c[names[i][0]] += 1
+    for k in range(256):
+        t += c[k]
+        fan.append(t)
+    idx = b'\377tOc' + struct.pack('>I', 2) + struct.pack('>256I', *fan)
+    idx += b''.join(names[i] for i in order)
+    idx += struct.pack('>%dI' % len(order), *crcs)
+    idx += struct.pack('>%dI' % len(order), *[offs[i] for i in order])
+    idx += bytes(pack[-20:])
+    idx += hashlib.sha1(idx).digest()
+    return bytes(pack), idx
+
+
+def order_next(offs, i):
+    """The entry that follows entry i in PACK order, or None for the last."""
+    later = [o for o in offs if o > offs[i]]
+    if not later:
+        return None
+    return offs.index(min(later))
+
+
+# A base big enough that a copy of exactly 0x10000 is reachable, and a chain
+# two links deep with the second link a REF_DELTA, so one pack exercises
+# both encodings and a base that is itself a delta.
+BIG = bytes(bytearray((i * 7 + 11) & 0xff for i in range(70000)))
+
+SPEC = [
+    {'type': 3, 'data': BIG},
+    {'how': 'ofs', 'base': 0, 'instr': [
+        ('copy', 0, 0x10000),            # the implicit length
+        ('copy', 0x10000, len(BIG) - 0x10000 - 16),
+        ('insert', b'OFS DELTA TAIL..'),
+    ]},
+    {'how': 'ref', 'base': 1, 'instr': [
+        ('copy', 0, 1000),
+        ('insert', b'REF DELTA, on a base that is itself a delta'),
+        ('copy', 2000, 3000),
+    ]},
+]
+
+if __name__ == '__main__':
+    kind = sys.argv[1]
+    if kind == 'fuzz':
+        # One flipped bit each, anywhere in the entry area, with both
+        # checksums and every CRC recomputed afterwards so the flip is the
+        # only lie and the parser is what has to deal with it. Without the
+        # recomputation every mutant is refused by the checksum and the
+        # fuzzer never reaches a single length field.
+        import os
+        import random
+        outdir, count = sys.argv[2], int(sys.argv[3])
+        os.makedirs(outdir, exist_ok=True)
+        rnd = random.Random(20261105)
+        base = build([dict(e) for e in SPEC], 'ok')[0]
+        for i in range(count):
+            at = rnd.randrange(12, len(base) - 20)
+            pk, ix = build([dict(e) for e in SPEC], 'ok',
+                           flip=(at, 1 << rnd.randrange(8)))
+            open('%s/pack-f%d.pack' % (outdir, i), 'wb').write(pk)
+            open('%s/pack-f%d.idx' % (outdir, i), 'wb').write(ix)
+        raise SystemExit(0)
+    outpack, outidx = sys.argv[2], sys.argv[3]
+    spec = [dict(e) for e in SPEC]
+    if kind == 'basesize':
+        spec[1]['base_size'] = len(BIG) + 1
+    elif kind == 'ressize':
+        spec[1]['res_size'] = 99          # a copy overruns it
+    elif kind == 'ressize_ins':
+        spec[1]['instr'] = [('insert', b'OFS DELTA TAIL..')]
+        spec[1]['res_size'] = 4           # an insert overruns it
+    elif kind == 'ressize_long':
+        spec[1]['res_size'] = 70000 + 100  # nothing overruns it and it is
+                                           # still not what came out
+    elif kind == 'bigres':
+        spec[1]['res_size'] = (256 << 20) + 1
+    elif kind == 'instr0':
+        spec[1]['instr'] = spec[1]['instr'] + [('raw', b'\0')]
+    elif kind == 'copyout':
+        spec[1]['instr'] = [('copy', len(BIG) - 8, 16)]
+    elif kind not in ('ok', 'trunc', 'bigsize', 'ofszero', 'ofspast',
+                      'refself'):
+        raise SystemExit('unknown pack fixture ' + kind)
+    pack, idx = build(spec, kind)
+    open(outpack, 'wb').write(pack)
+    open(outidx, 'wb').write(idx)
+PYGEN
+
+PG=$TMP/packs/gen
+mkdir -p "$PG"
+python3 "$TMP/packgen.py" ok "$PG/pack-g.pack" "$PG/pack-g.idx"
+assert "git verify-pack accepts the hand-built pack" \
+	$GIT -C "$SCRATCH" verify-pack "$PG/pack-g.idx"
+rm -f "$PG/re.idx"
+cp "$PG/pack-g.pack" "$PG/re.pack"
+if $GIT -C "$SCRATCH" index-pack -o "$PG/re.idx" "$PG/re.pack" > /dev/null 2>&1; then
+	assert "and git index-pack rebuilds its index byte for byte" \
+		cmp -s "$PG/re.idx" "$PG/pack-g.idx"
+else
+	no "git index-pack could not index the hand-built pack"
+fi
+packls_vs_vpv "packls gen" "$PG/pack-g.idx"
+# Three entries: a 70000-byte blob, an OFS_DELTA of it, and a REF_DELTA of
+# THAT, so one pack holds both encodings and a base that is itself a delta.
+# The first copy instruction asks for exactly 0x10000 bytes with its length
+# bytes absent, which is the implicit default.
+eq "the hand-built pack holds both encodings and a chain of two" \
+	"$(cat "$TMP/p.census")" \
+	"3 objects, 1 read whole, 2 through a delta chain, deepest chain 2, 2 ofs-delta and 1 ref-delta links"
+# git on the far side of the chain: a repository whose only object source is
+# this pack, read by git.
+GREPO=$PG/repo
+$GIT init -q --bare "$GREPO"
+cpw "$PG/pack-g.pack" "$GREPO/objects/pack/pack-g.pack"
+cpw "$PG/pack-g.idx" "$GREPO/objects/pack/pack-g.idx"
+eq "git lists all three objects of the hand-built pack" \
+	"$($GIT --git-dir="$GREPO" cat-file --batch-all-objects --batch-check | wc -l | tr -d ' ')" 3
+gblob=$("$GITOBJ" packls "$PG/pack-g.idx" 2>/dev/null | awk 'NR==3{print $1}')
+"$GITOBJ" raw "$GREPO/objects" "$gblob" > "$TMP/ours" 2>/dev/null
+$GIT --git-dir="$GREPO" cat-file blob "$gblob" > "$TMP/theirs"
+assert "and hands back the same bytes we do for the end of the chain" \
+	cmp -s "$TMP/ours" "$TMP/theirs"
+$GIT --git-dir="$GREPO" fsck > "$TMP/fsck.out" 2>&1
+assert "git fsck is clean over the hand-built pack" sh -c \
+	"! grep -Eiv '^(notice|dangling)' '$TMP/fsck.out' | grep -q ."
+
+# One lie each, and git must call each one a lie too. The message is
+# asserted, not only the status: every one of these refusals would otherwise
+# be indistinguishable from the next.
+gen_refuse() { # <kind> <what it is> <expected message, an extended regex>
+	rm -rf "$PG/$1"
+	mkdir -p "$PG/$1"
+	python3 "$TMP/packgen.py" "$1" "$PG/$1/pack-g.pack" "$PG/$1/pack-g.idx" || {
+		no "could not build the $1 fixture"
+		return
+	}
+	refute "packls refuses $2" "$GITOBJ" packls "$PG/$1/pack-g.idx"
+	assert "and names the rule and the place: $2" sh -c \
+		"'$GITOBJ' packls '$PG/$1/pack-g.idx' 2>&1 >/dev/null | grep -Eq '$3'"
+	assert "git verify-pack refuses $2 too" sh -c \
+		"! $GIT -C '$SCRATCH' verify-pack '$PG/$1/pack-g.idx' >/dev/null 2>&1"
+}
+gen_refuse basesize "a delta whose declared base size is not the base's" \
+	'delta base size disagrees with the base object at [0-9]+'
+gen_refuse ressize "a delta that writes past its own declared result size" \
+	'delta writes past the result size it declares at [0-9]+'
+gen_refuse ressize_ins "a delta whose INSERT overruns its declared result" \
+	'delta writes past the result size it declares at [0-9]+'
+gen_refuse ressize_long "a delta that produces less than its declared result" \
+	'delta result is not the size the delta declares at [0-9]+'
+gen_refuse bigres "a delta result size above OBJ_MAX" \
+	'delta header declares a size above OBJ_MAX at [0-9]+'
+gen_refuse bigsize "an entry size above OBJ_MAX" \
+	'pack entry declares a size above OBJ_MAX at [0-9]+'
+gen_refuse instr0 "a delta instruction byte of 0" \
+	'delta instruction 0 is not an instruction at [0-9]+'
+gen_refuse copyout "a copy instruction reaching past the end of the base" \
+	'delta copies from outside the base object at [0-9]+'
+gen_refuse ofszero "an OFS_DELTA at a distance of zero, naming itself" \
+	'OFS_DELTA base offset is outside the pack at [0-9]+'
+gen_refuse ofspast "an OFS_DELTA whose base is before the pack header" \
+	'OFS_DELTA base offset is outside the pack at [0-9]+'
+gen_refuse refself "a REF_DELTA naming itself, which is a cycle" \
+	'delta chain is deeper than gitobj will follow at [0-9]+'
+gen_refuse trunc "a pack cut off in the middle of its last entry" \
+	'gitobj: .* at [0-9]+'
+# The last one is the only refusal here whose message is not pinned to a
+# rule: a truncated zlib stream fails wherever the decoder happens to run
+# out, and which error that is depends on the bytes. What is asserted is
+# that it refuses, says where, and is not a crash.
+
+# One flipped bit at a time, over the whole entry area, with both checksums
+# and every CRC recomputed so the flip is the only lie. Two things are
+# asserted per mutant. That gitobj never does anything but succeed or refuse
+# cleanly, which is what `refute`'s insistence on exit 1 exists for: a
+# segfault counted as a refusal in all 15 refusal assertions here once. And
+# that gitobj and git agree about whether the pack is still readable, which
+# is a differential comparison rather than an opinion: `packverify` hashes
+# every object back to its name, so it answers the same question
+# `git verify-pack` does.
+FZ=$PG/fz
+FZN=300
+python3 "$TMP/packgen.py" fuzz "$FZ" "$FZN"
+fz_ref=0
+fz_ok=0
+i=0
+: > "$TMP/fz.msgs"
+while [ "$i" -lt "$FZN" ]; do
+	"$GITOBJ" packverify "$FZ/pack-f$i.idx" 2>> "$TMP/fz.msgs" > /dev/null
+	rc=$?
+	$GIT -C "$SCRATCH" verify-pack "$FZ/pack-f$i.idx" > /dev/null 2>&1
+	grc=$?
+	case $rc in
+	0) fz_ok=$((fz_ok + 1)); eq "fuzz $i: git agrees the pack is readable" "$grc" 0 ;;
+	1) fz_ref=$((fz_ref + 1))
+	   if [ "$grc" -ne 0 ]; then ok; else no "fuzz $i: we refuse a pack git reads"; fi ;;
+	*) no "fuzz $i: exit $rc, not a clean refusal" ;;
+	esac
+	i=$((i + 1))
+done
+# A fuzzer whose mutants are all refused by one early check has tested that
+# check and nothing else, and one whose mutants are all accepted has tested
+# nothing at all. Both ends are asserted.
+[ "$fz_ref" -ge 20 ] && ok || no "only $fz_ref of $FZN fuzzed packs were refused"
+[ "$fz_ok" -ge 1 ] && ok || no "every one of the $FZN fuzzed packs was refused"
+# And how many different things they were refused FOR, which is the part the
+# counts cannot show: most of a pack is zlib stream, so most flips land
+# there and are caught by the Adler-32, and a fuzzer that only ever reaches
+# that one check has tested one check.
+fz_kinds=$(sed 's/ at [0-9]*$//' "$TMP/fz.msgs" | sort -u | grep -c .)
+[ "$fz_kinds" -ge 5 ] && ok ||
+	no "the fuzzed packs were refused for only $fz_kinds distinct reasons"
+printf 'pack fuzz: %d mutants, %d refused for %d distinct reasons, %d still readable, all agreeing with git\n' \
+	"$FZN" "$fz_ref" "$fz_kinds" "$fz_ok"
+
+# The guard against every comparison against verify-pack -v passing
+# vacuously, counted over every pack the two sections above read. A
+# standalone clone gets its deltas and its chain depth from the corpora the
+# suite builds; in the collection the siblings add a few thousand more.
+[ "$pls_delta" -ge 150 ] && ok ||
+	no "only $pls_delta delta entries were read through verify-pack -v"
+[ "$pls_depth" -ge 5 ] && ok ||
+	no "the deepest chain read was only $pls_depth"
+printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
+	"$pls_objs" "$pls_delta" "$pls_depth"
+
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

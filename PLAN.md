@@ -162,7 +162,9 @@ Ranked, strongest first, by how little of it we control.
    distinguished from the delta path in the comparison.
 7. ASan + UBSan over the whole suite (`make test-asan`), with both the index
    and the pack trimmed to exactly the bytes read, since `readall()` doubles
-   and a buffer bigger than its data turns the sanitizer off.
+   and a buffer bigger than its data turns the sanitizer off. The hostile
+   input it most wants is in section 10: eleven hand-built packs that lie
+   about a length, and 300 fuzzed ones.
 
 Item 3 was one of four oracles struck off this list for not existing, and
 items 5 and 6 are a second one arriving in pieces. What is missing from item
@@ -515,9 +517,63 @@ by hand.
       found: the suite went from 10 seconds to 34. The per-object sweep is
       most of it, at six processes per object over 1375 objects, and the
       rest is that a one-object command opens every pack in the store.
-- [ ] refusals: OBJ_MAX, truncation, bad varints, mutation fuzz, `test-asan`
+- [x] refusals: OBJ_MAX, truncation, bad varints, mutation fuzz, `test-asan`
       why: every length in a pack is attacker-chosen, and a 4GB delta
       result must be refused, not allocated.
+      files: t/run.sh section 10, which is a pack GENERATOR rather than a
+      mutator, and no change to gitobj.c at all: every check this reaches
+      was already written and none of them had a fixture.
+      proves: eleven fixtures lying about one thing each, every one refused
+      by name and by `git verify-pack` as well. A delta whose declared base
+      size is not the base's, a copy and an insert each overrunning the
+      declared result, a delta producing less than its declared result, a
+      result size and an entry size above OBJ_MAX, an instruction byte of
+      0, a copy reaching past the end of the base, an OFS_DELTA at a
+      distance of zero and one pointing before the pack header, a REF_DELTA
+      naming itself, and a pack cut off mid-entry.
+      proves, for the generator itself: git accepts the well-formed control
+      and resolves its chain, `git index-pack -o` rebuilds its index from
+      the pack alone byte for byte, and `git cat-file blob` hands back the
+      bytes we do out of a repository whose only object source is that
+      pack. The control is a 70000-byte blob, an OFS_DELTA of it and a
+      REF_DELTA of THAT, so one pack carries both encodings, a base that is
+      itself a delta, and a copy of exactly 0x10000 with its length bytes
+      absent.
+      proves, for the fuzz: 300 mutants of the control, one flipped bit
+      each anywhere in the entry area, with both checksums and every CRC
+      recomputed so the flip is the only lie. Per mutant, that gitobj
+      either succeeds or refuses cleanly and nothing else, and that gitobj
+      and git agree on whether the pack is still readable, which is a
+      comparison and not an opinion because `packverify` hashes every
+      object back to its name. 299 refused for 13 distinct reasons, 1 still
+      readable, and the NUMBER OF REASONS is asserted too: most of a pack
+      is zlib stream, so most flips are caught by the Adler-32, and a
+      fuzzer reaching only that check has tested one check.
+      16746 assertions before, 17099 after; 4133 to 4486 cloned alone.
+      found: without recomputing the checksums, every fuzz mutant is
+      refused by the pack checksum and the fuzzer reaches no length field
+      at all. That is the same shape as the index fixtures that were two
+      lies rather than one.
+      found: the fuzz earns itself. Dropping the check that an entry
+      inflated to the size it declares is caught by its own fixture and
+      independently by two of the 300 mutants.
+      found: ten planted defects, nine red. The two result-size bounds
+      needed a fixture each and not one shared one: a declared result
+      SMALLER than what the instructions produce is caught by whichever
+      instruction overruns it first, so the final equality check needs a
+      declared result LARGER than what came out, and the insert bound needs
+      a delta whose first instruction is the one that overruns.
+      survivor: the bound that keeps a varint or a zlib stream off the
+      20-byte pack trailer, and it is unobservable rather than untested.
+      Every offset is checked against the start of the trailer when the
+      index is opened, so the bound only reaches the LAST entry's stream,
+      and no well-formed pack has one that runs over. The truncation
+      fixture does reach it and the only difference is which inflate error
+      comes out: in place it gives "bad literal/length code at 658",
+      extended over the trailer "distance reaches before output start at
+      658". Both refuse at the same offset. Pinning the suite to that text
+      would pin it to where a cut happened to land, so the measurement is
+      in the README instead.
 - [ ] the three sabotages, recorded in the README
       why: a suite whose failure has never been observed is not evidence.
       The delta copy instruction, the tree sort and the object header each

@@ -34,12 +34,13 @@ ls against git batch-check: 3307 objects over 12 repositories, 369 loose and 293
 read 10 pack indexes, 3061 objects
 3173 objects read through a 32-bit offset, 134 through the 64-bit table
 the delta corpus: 124 objects, 79 delta entries, deepest chain 15
-packls: 3433 objects against verify-pack -v, 2016 of them deltas, deepest chain 29
-16746 passed, 0 failed
+pack fuzz: 300 mutants, 299 refused for 13 distinct reasons, 1 still readable, all agreeing with git
+packls: 3436 objects against verify-pack -v, 2018 of them deltas, deepest chain 29
+17099 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
-and the two are byte-identical over all thirteen packs in reach. The columns
+and the two are byte-identical over all fourteen packs in reach. The columns
 are not all of one kind and the mixture is not arbitrary: the type is the one
 at the END of a delta chain, since a delta entry carries none of its own,
 while the size is the one THAT entry declares, which for a delta is the
@@ -56,7 +57,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **4133 passed**, against five bare
+Cloned on its own this suite reports **4486 passed**, against five bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -73,12 +74,12 @@ because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 16746 above, because the sibling
+Inside the collection it reports more: 17099 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-4133: the one a reader gets by cloning this repository and running `make
+4486: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -349,23 +350,79 @@ thin-pack fixture is the one exception and deliberately so: dropping an index
 entry leaves its neighbour's extent spanning the gap, so that pair's CRCs do
 not and cannot agree, and `git verify-pack` refuses it for both reasons.
 
-Three of the four survivors are bounds that only a malformed pack can cross,
-and there is no malformed pack here yet. Treating the 20-byte trailer as
-entry data survives because every offset is checked against the start of the
-trailer when the index is opened, so the bound only matters to a varint or a
-zlib stream running off the end of the LAST entry. Dropping the check that a
-delta's declared base size matches the base, and dropping the check that the
-result is the size the delta declares, survive for the same reason: git's own
-deltas are correct, so nothing in any corpus exercises either. All three are
-the refusals item of `PLAN.md`, which wants a pack built by hand rather than
-by git, and until that exists they are bounds with no test behind them. Said
-here rather than counted as covered.
+Three of those mutations survived everything git can be made to pack, and
+the section below is what kills them. The fourth survivor was written as a
+defect and is not one: having the index lookup search the whole name list
+instead of the one fanout bucket gives the same answer every time, because
+the names are globally sorted and a bucket is a contiguous range of them.
+The fanout saves eight comparisons there and changes no result.
 
-The fourth was written as a defect and is not one. Having the index lookup
-search the whole name list instead of the one fanout bucket gives the same
-answer every time, because the names are globally sorted and the bucket is a
-contiguous range of them. The fanout there saves eight comparisons and
-changes no result, so there is nothing for a test to see.
+## A pack built by hand, because git never gets a length wrong
+
+Every length in a pack is a number chosen by whoever wrote the file, and git
+writes them all correctly, so the checks on them cannot be reached by any
+fixture git produces. Three mutations of the delta code survived the whole of
+the section above for that reason: the declared base size, the declared
+result size, and the bound that keeps a varint or a zlib stream off the pack
+trailer.
+
+So the suite builds packs itself, which puts the fixture builder in the
+position of being the thing that has to be trusted. git settles that three
+ways over the well-formed one: `git verify-pack` accepts it and resolves its
+chain, `git index-pack -o` rebuilds its index from the pack alone byte for
+byte, and `git cat-file blob` hands back the same bytes we do out of a
+repository whose only object source is that pack. The control is three
+entries: a 70000-byte blob, an `OFS_DELTA` of it, and a `REF_DELTA` of THAT,
+so one pack holds both encodings and a base that is itself a delta, and the
+first copy instruction asks for exactly 0x10000 bytes with its length bytes
+absent.
+
+Eleven fixtures then lie about one thing each, and git has to call each one a
+lie too: a delta whose declared base size is not the base's, a copy and an
+insert each overrunning the declared result, a delta that produces less than
+its declared result, a result size and an entry size above OBJ_MAX, an
+instruction byte of 0, a copy reaching past the end of the base, an
+`OFS_DELTA` at a distance of zero and one pointing before the pack header, a
+`REF_DELTA` naming itself, and a pack cut off in the middle of its last
+entry. The message is asserted for all but the last: a truncated zlib stream
+fails wherever the decoder runs out, and which error that is depends on the
+bytes.
+
+Then 300 mutants of the control, one flipped bit each, anywhere in the entry
+area, with both checksums and every CRC recomputed so the flip is the only
+lie. Without that recomputation every mutant is refused by the pack checksum
+and the fuzzer never reaches a single length field. Two things are asserted
+per mutant: that gitobj either succeeds or refuses cleanly, never anything
+else, and that gitobj and git agree about whether the pack is still
+readable, which is a comparison rather than an opinion since `packverify`
+hashes every object back to its name and so answers the same question
+`git verify-pack` does. 299 are refused, for 13 distinct reasons, and 1 is
+still readable. How many reasons is asserted as well as how many refusals:
+most of a pack is zlib stream, so most flips land there and are caught by
+the Adler-32, and a fuzzer that only ever reached that check would have
+tested that check.
+
+The fuzzer earned itself immediately. Dropping the check that an entry
+inflated to the size it declares is caught by its own fixture and
+independently by two of the 300 mutants.
+
+What still survives is the bound that keeps a varint or a zlib stream off the
+pack trailer, and it is unobservable rather than untested. Every offset is
+checked against the start of the trailer when the index is opened, so the
+bound only matters to the LAST entry's stream, and no well-formed pack has
+one that runs over. The truncation fixture does reach it and the difference
+is visible, but only as which inflate error comes out: the bound in place
+gives "bad literal/length code at 658", and extended over the trailer it
+gives "distance reaches before output start at 658". Both refuse, at the same
+offset. Pinning the suite to that text would be pinning it to where a cut
+happened to land, so the measurement is here instead.
+
+`make test-asan` runs all 17099 assertions under ASan and UBSan, this
+section's hand-built and fuzzed packs included, and is clean. That is worth
+no more than the trimming described two sections up makes it worth: the
+index and the pack are both shrunk to exactly the bytes read, and without
+that a read past the end of either lands inside a rounded-up allocation and
+the sanitizer says nothing.
 
 ## What does not work
 
