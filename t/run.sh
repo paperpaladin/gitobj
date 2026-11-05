@@ -1526,10 +1526,13 @@ NDOBJ=$(wc -l < "$TMP/packs/din" | tr -d ' ')
 # and a fixture built without it is the OTHER encoding. That was caught by
 # this section going red, REF_DELTA being the one thing still refused.
 mkdir -p "$TMP/packs/d"
+# --threads=1 because the delta search is threaded and its result is not
+# otherwise reproducible: two runs of the same command over the same objects
+# gave 76 delta entries and then 75.
 DPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty --delta-base-offset \
-	"$TMP/packs/d/dd" < "$TMP/packs/din")
+	--threads=1 "$TMP/packs/d/dd" < "$TMP/packs/din")
 NDPACK=$($GIT --git-dir="$DREPO" pack-objects --window=0 --non-empty \
-	"$TMP/packs/d/nd" < "$TMP/packs/din")
+	--threads=1 "$TMP/packs/d/nd" < "$TMP/packs/din")
 DIDX="$TMP/packs/d/dd-$DPACK.idx"
 NDIDX="$TMP/packs/d/nd-$NDPACK.idx"
 assert "both packs were built from the delta corpus" test -f "$DIDX" -a -f "$NDIDX"
@@ -1553,6 +1556,74 @@ ddepth=$(vpv "$DIDX" | awk 'NF>=7{if($6>m)m=$6}END{print m+0}')
 printf 'the delta corpus: %d objects, %d delta entries, deepest chain %d\n' \
 	"$NDOBJ" "$ndelta" "$ddepth"
 
+# Two lies about an entry header, which is the only way to reach the checks
+# that the header is not self-consistent. Both need the pack edited, and an
+# edit invalidates four things that have nothing to do with the defect: the
+# pack's trailing checksum, the copy of it the index carries, the object's
+# CRC, and the index's own checksum. All four are re-stamped, so each
+# fixture is a single lie and cannot be refused for the wrong reason. The
+# guard on that is that `gitobj idxcrc` still accepts the edited pair.
+cat > "$TMP/packedit.py" <<'PYEDIT'
+import hashlib, struct, sys, zlib
+kind, pk, ix, opk, oix = sys.argv[1:6]
+arg = sys.argv[6] if len(sys.argv) > 6 else None
+p = bytearray(open(pk, 'rb').read())
+b = open(ix, 'rb').read()
+HDR = 1032
+fan = struct.unpack('>256I', b[8:HDR])
+n = fan[255]
+o = HDR
+names = [b[o + 20 * i:o + 20 * i + 20] for i in range(n)]; o += 20 * n
+crcs = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+off = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
+rest = len(b) - 40 - o
+big = list(struct.unpack('>%dQ' % (rest // 8), b[o:o + rest]))
+assert not any(v & 0x80000000 for v in off), 'this edits 32-bit offsets only'
+order = sorted(range(n), key=lambda i: off[i])
+i0 = order[0]
+at = off[i0]
+recrc = True
+if kind == 'type5':      # 5 is the one type number git has never assigned
+    p[at] = (p[at] & 0x8f) | (5 << 4)
+elif kind == 'badsize':   # the declared size, one away from the real one
+    p[at] ^= 1
+elif kind == 'dropname':
+    # Stop the index naming one object, and tell the pack header it holds
+    # one object fewer, which is the only way to reach a REF_DELTA whose
+    # base this pack does not hold. The base's BYTES stay where they are:
+    # what goes is the index entry that would have found them.
+    k = names.index(bytes.fromhex(arg))
+    del names[k], crcs[k], off[k]
+    n -= 1
+    p[8:12] = struct.pack('>I', n)
+    recrc = False
+else:
+    raise SystemExit('unknown pack edit ' + kind)
+p[-20:] = hashlib.sha1(bytes(p[:-20])).digest()
+if recrc:
+    end = off[order[1]] if n > 1 else len(p) - 20
+    crcs[i0] = zlib.crc32(bytes(p[at:end])) & 0xffffffff
+else:
+    # The fanout is counted from the names that are left, so it still
+    # agrees with them.
+    c = [0] * 256
+    for nm in names:
+        c[nm[0]] += 1
+    fan, t = [], 0
+    for j in range(256):
+        t += c[j]
+        fan.append(t)
+out = b'\377tOc' + struct.pack('>I', 2) + struct.pack('>256I', *fan)
+out += b''.join(names)
+out += struct.pack('>%dI' % n, *crcs)
+out += struct.pack('>%dI' % n, *off)
+out += struct.pack('>%dQ' % len(big), *big)
+out += bytes(p[-20:])
+out += hashlib.sha1(out).digest()
+open(opk, 'wb').write(bytes(p))
+open(oix, 'wb').write(out)
+PYEDIT
+
 # Per object, not per file: a diff over a hundred objects says only that
 # something somewhere disagreed. And the census is checked against git's own
 # numbers rather than reported, because every one of these comparisons
@@ -1560,6 +1631,8 @@ printf 'the delta corpus: %d objects, %d delta entries, deepest chain %d\n' \
 pls_objs=0
 pls_delta=0
 pls_depth=0
+last_ofs=0
+last_ref=0
 packls_vs_vpv() { # <label> <idx>
 	local nobj gd gm cd cm
 	"$GITOBJ" packls "$2" > "$TMP/p.ours" 2> "$TMP/p.census"
@@ -1582,6 +1655,11 @@ packls_vs_vpv() { # <label> <idx>
 	cm=$(sed -n 's/.*deepest chain \([0-9]*\).*/\1/p' "$TMP/p.census")
 	eq "$1: the census agrees with git on how many entries are deltas" "$cd" "$gd"
 	eq "$1: and on the deepest chain walked" "$cm" "$gm"
+	# Which encoding carried them, which git's output cannot say: a delta
+	# line looks the same either way. Counted per link rather than per
+	# object, so a chain of 9 contributes 9.
+	last_ofs=$(sed -n 's/.*, \([0-9]*\) ofs-delta and.*/\1/p' "$TMP/p.census")
+	last_ref=$(sed -n 's/.*and \([0-9]*\) ref-delta links.*/\1/p' "$TMP/p.census")
 	pls_delta=$((pls_delta + gd))
 	[ "$gm" -gt "$pls_depth" ] && pls_depth=$gm
 	# The hard invariant, on the far side of the pack: every name git filed
@@ -1596,49 +1674,86 @@ packls_vs_vpv() { # <label> <idx>
 packls_vs_vpv "packls nd" "$NDIDX"
 eq "and every entry of the delta-free pack was read whole" \
 	"$(cat "$TMP/p.census")" \
-	"$NDOBJ objects, $NDOBJ read whole, 0 through a delta chain, deepest chain 0"
+	"$NDOBJ objects, $NDOBJ read whole, 0 through a delta chain, deepest chain 0, 0 ofs-delta and 0 ref-delta links"
 
 # Then the pack git chose the layout for, and every pack in the corpus. The
 # sibling packs are the real evidence here: 2815 objects across eight
 # histories, chains up to 29 deep, none of it arranged by this suite.
 packls_vs_vpv "packls dd" "$DIDX"
+[ "$last_ofs" -ge 70 ] && ok ||
+	no "the OFS_DELTA fixture resolved only $last_ofs ofs-delta links"
+eq "and not one of its links was a REF_DELTA" "$last_ref" 0
 for i in $IDXES; do
 	packls_vs_vpv "packls $(basename "$i")" "$i"
+	# Every pack in the collection came out of `git gc`, which passes
+	# --delta-base-offset, so the corpus provides no REF_DELTA coverage at
+	# all. That is the whole reason the fixture below is built.
+	eq "packls $(basename "$i"): no REF_DELTA, as git gc writes none" \
+		"$last_ref" 0
 done
-# The guard against all of the above passing vacuously. A standalone clone
-# gets its 74 deltas and its chain of 9 from the corpus above; in the
-# collection the siblings add a few thousand more.
-[ "$pls_delta" -ge 70 ] && ok ||
+# The same objects again, packed the other way. `--no-delta-base-offset` is
+# what makes git write REF_DELTA, and nothing in the collection has one,
+# since everything here was packed by `git gc`.
+#
+# A REF_DELTA names its base by hash, so the base can sit anywhere in the
+# pack, before this entry or after it, and finding it is a binary search in
+# the index rather than a subtraction. The resolved objects have to come out
+# the same as from the OFS_DELTA pack, which is the strongest thing available
+# here: the same 124 objects, two encodings, one set of names.
+RD=$TMP/packs/rd
+mkdir -p "$RD"
+RDPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty --threads=1 \
+	--no-delta-base-offset "$RD/rd" < "$TMP/packs/din")
+RDIDX="$RD/rd-$RDPACK.idx"
+assert "a REF_DELTA pack was built from the same objects" test -f "$RDIDX"
+packls_vs_vpv "packls rd" "$RDIDX"
+[ "$last_ref" -ge 70 ] && ok ||
+	no "the REF_DELTA fixture resolved only $last_ref ref-delta links"
+eq "and not one of its links was an OFS_DELTA" "$last_ofs" 0
+# Chains, not just single links: a base reached by name can itself be a
+# REF_DELTA, and that is the half of this item depth is for.
+rdepth=$(sed -n 's/.*deepest chain \([0-9]*\).*/\1/p' "$TMP/p.census")
+[ "$rdepth" -ge 5 ] && ok ||
+	no "the deepest REF_DELTA chain was only $rdepth"
+# The two packs hold the same objects, so `gitobj ls` over the two must
+# agree about every name, type and size. Sorted, because pack order differs
+# between the two layouts and that is not the claim.
+"$GITOBJ" packls "$RDIDX" 2>/dev/null | awk '{print $1, $2}' | sort > "$TMP/p.rd"
+"$GITOBJ" packls "$DIDX" 2>/dev/null | awk '{print $1, $2}' | sort > "$TMP/p.dd"
+assert "both encodings give the same objects the same types" \
+	cmp -s "$TMP/p.rd" "$TMP/p.dd"
+eq "and every object of the REF_DELTA pack hashes back to its own name" \
+	"$("$GITOBJ" packverify "$RDIDX" 2>/dev/null)" "$NDOBJ objects, 0 mismatched"
+# A base that is not in the pack at all is a thin pack, which git sends down
+# a wire and never stores. `git index-pack --fix-thin` is what completes one,
+# so a stored pack whose REF_DELTA base is missing is not a thing git reads
+# either; refusing it is the whole handling.
+TH=$TMP/packs/thin
+rm -rf "$TH"
+mkdir -p "$TH"
+thinvictim=$(vpv "$RDIDX" | awk 'NF>=7{print $7; exit}')
+python3 "$TMP/packedit.py" dropname "$RD/rd-$RDPACK.pack" "$RDIDX" \
+	"$TH/pack-t.pack" "$TH/pack-t.idx" "$thinvictim"
+eq "the thin fixture's index names one object fewer" \
+	"$(($("$GITOBJ" idx "$TH/pack-t.idx" 2>/dev/null | wc -l) + 1))" "$NDOBJ"
+refute "packls refuses a REF_DELTA whose base the pack does not hold" \
+	"$GITOBJ" packls "$TH/pack-t.idx"
+assert "and says so rather than reading some other object" sh -c \
+	"'$GITOBJ' packls '$TH/pack-t.idx' 2>&1 >/dev/null |
+		grep -q 'not an object this pack holds'"
+assert "git verify-pack refuses it too" sh -c \
+	"! $GIT -C '$SCRATCH' verify-pack '$TH/pack-t.idx' >/dev/null 2>&1"
+
+# The guard against all of the above passing vacuously, counted over every
+# pack this section read. A standalone clone gets its deltas and its chain
+# depth from the corpus built above; in the collection the siblings add a
+# few thousand more.
+[ "$pls_delta" -ge 150 ] && ok ||
 	no "only $pls_delta delta entries were read through verify-pack -v"
 [ "$pls_depth" -ge 5 ] && ok ||
 	no "the deepest chain read was only $pls_depth"
 printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
 	"$pls_objs" "$pls_delta" "$pls_depth"
-
-# REF_DELTA is the one encoding still missing, and it is refused cleanly
-# while git reads the same pack. Nothing in any corpus has one, since
-# everything in the collection was packed by `git gc`.
-#
-# These two packs are also what pins which encoding each one holds, and
-# `verify-pack -v` cannot say: it prints a delta's chain length and base
-# name whichever encoding carried them. The discriminator is the refusal.
-# `packls` reading all 121 objects of the pack above is what says its 74
-# deltas are every one an OFS_DELTA, and `packls` stopping on this one with
-# a REF_DELTA message is what says this one is not.
-RD=$TMP/packs/rd
-mkdir -p "$RD"
-RDPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty \
-	--no-delta-base-offset "$RD/rd" < "$TMP/packs/din")
-RDIDX="$RD/rd-$RDPACK.idx"
-rdelta=$(vpv "$RDIDX" | awk 'NF>=7' | grep -c .)
-[ "$rdelta" -ge 50 ] && ok ||
-	no "the no-delta-base-offset pack has only $rdelta delta entries"
-refute "packls refuses a REF_DELTA" "$GITOBJ" packls "$RDIDX"
-assert "and names the entry it stopped at" sh -c \
-	"'$GITOBJ' packls '$RDIDX' 2>&1 >/dev/null | grep -Eq 'REF_DELTA.* at [0-9]+'"
-assert "while git verify-pack reads that same pack" \
-	$GIT -C "$SCRATCH" verify-pack "$RDIDX"
-refute "packverify refuses it too" "$GITOBJ" packverify "$RDIDX"
 
 refute "packls refuses a path that does not end in .idx" \
 	"$GITOBJ" packls "$TMP/packs/self-$SELFPACK.pack"
@@ -1646,50 +1761,6 @@ refute "packls refuses an index with no pack beside it" \
 	"$GITOBJ" packls "$BAD/nopack.idx"
 refute "packls refuses an index it cannot parse" "$GITOBJ" packls "$BAD/trunc.idx"
 
-# Two lies about an entry header, which is the only way to reach the checks
-# that the header is not self-consistent. Both need the pack edited, and an
-# edit invalidates four things that have nothing to do with the defect: the
-# pack's trailing checksum, the copy of it the index carries, the object's
-# CRC, and the index's own checksum. All four are re-stamped, so each
-# fixture is a single lie and cannot be refused for the wrong reason. The
-# guard on that is that `gitobj idxcrc` still accepts the edited pair.
-cat > "$TMP/packedit.py" <<'PYEDIT'
-import hashlib, struct, sys, zlib
-kind, pk, ix, opk, oix = sys.argv[1:6]
-p = bytearray(open(pk, 'rb').read())
-b = open(ix, 'rb').read()
-HDR = 1032
-fan = struct.unpack('>256I', b[8:HDR])
-n = fan[255]
-o = HDR
-names = [b[o + 20 * i:o + 20 * i + 20] for i in range(n)]; o += 20 * n
-crcs = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
-off = list(struct.unpack('>%dI' % n, b[o:o + 4 * n])); o += 4 * n
-rest = len(b) - 40 - o
-big = list(struct.unpack('>%dQ' % (rest // 8), b[o:o + rest]))
-assert not any(v & 0x80000000 for v in off), 'this edits 32-bit offsets only'
-order = sorted(range(n), key=lambda i: off[i])
-i0 = order[0]
-at = off[i0]
-if kind == 'type5':      # 5 is the one type number git has never assigned
-    p[at] = (p[at] & 0x8f) | (5 << 4)
-elif kind == 'badsize':   # the declared size, one away from the real one
-    p[at] ^= 1
-else:
-    raise SystemExit('unknown pack edit ' + kind)
-p[-20:] = hashlib.sha1(bytes(p[:-20])).digest()
-end = off[order[1]] if n > 1 else len(p) - 20
-crcs[i0] = zlib.crc32(bytes(p[at:end])) & 0xffffffff
-out = b'\377tOc' + struct.pack('>I', 2) + struct.pack('>256I', *fan)
-out += b''.join(names)
-out += struct.pack('>%dI' % n, *crcs)
-out += struct.pack('>%dI' % n, *off)
-out += struct.pack('>%dQ' % len(big), *big)
-out += bytes(p[-20:])
-out += hashlib.sha1(out).digest()
-open(opk, 'wb').write(bytes(p))
-open(oix, 'wb').write(out)
-PYEDIT
 PE=$TMP/packs/pe
 pack_refuse() { # <kind> <what it is> <expected message, an extended regex>
 	rm -rf "$PE"

@@ -54,6 +54,10 @@ In scope:
   seven bits per byte after that, and the zlib stream behind it, checked
   against the size the varint declared. An entry's extent comes from the
   next offset in PACK order, which is `git verify-pack -v`'s fourth column.
+* `REF_DELTA`, whose base is a 20-byte name rather than a distance, so the
+  base can sit either side of the entry that uses it and finding it is a
+  binary search over the index's names. A base the pack does not hold is a
+  thin pack, which git only sends down a wire, and is refused.
 * `OFS_DELTA`, whose base is a distance backwards in a varint of its own
   where each continuation byte adds one before shifting, and the delta it
   carries: a base size and a result size, then copy and insert instructions,
@@ -73,10 +77,6 @@ an audit pointed out there was no pack code in `gitobj.c` at all. The index
 was the first part of it to exist and the walk over entries stored whole is
 the second:
 
-* `REF_DELTA`, whose base is a 20-byte name rather than an offset, and so
-  needs the index lookup that `OFS_DELTA` does not. It is read far enough to
-  refuse the entry and say which offset it was at. Chains whose base is
-  itself a `REF_DELTA` are the same item.
 * writing anything but a loose object: no packfile writing, no
   `unpack-objects`. This said `gitobj` was read-only, which it was until
   `write` landed, and listed `mktree` among the missing until that landed
@@ -96,12 +96,12 @@ does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
 **It covers every object in every corpus:** 369 loose, and 3186 read out of
-eleven packs, 1934 of those through a delta chain and 2815 of them in eight
+twelve packs, 2016 of those through a delta chain and 2815 of them in eight
 sibling histories. It said "loose and packed" for a good while before any
 pack code existed, which was the strongest claim in the file and the one
-that was not true; it covered 490 of 3184 one commit ago. What is still out
-of reach is an encoding no corpus contains, REF_DELTA, and a pack this suite
-cannot build, one over two gigabytes.
+that was not true; it covered 490 of 3184 two commits ago. What is still out
+of reach is a pack this suite cannot build, one over two gigabytes, and a
+pack built to be wrong rather than by git, which is the refusals item.
 
 The index has its own invariants, and they are cross-checks rather than
 hashes: the fanout must agree with the name list it indexes, the CRC must
@@ -151,7 +151,7 @@ Ranked, strongest first, by how little of it we control.
    index from the pack alone, so a corpus index is compared against one git
    wrote today from the same bytes.
 6. `git verify-pack -v`, column for column and object by object, over every
-   pack in reach: 3186 objects, 1934 of them deltas. The type and the size
+   pack in reach: 3310 objects, 2016 of them deltas. The type and the size
    come out of the entry header, the size in the pack out of the index's
    sorted offsets, and the chain length and base name out of the walk down
    the chain. The suite also builds a `--window=0` pack and has git assert
@@ -163,10 +163,11 @@ Ranked, strongest first, by how little of it we control.
 
 Item 3 was one of four oracles struck off this list for not existing, and
 items 5 and 6 are a second one arriving in pieces. What is missing from item
-6 is REF_DELTA, which no corpus here contains. Repacking for an encoding the
-corpus lacks was one of the other two struck-off oracles and now exists, as
-the `--no-delta-base-offset` and `--window=0` fixtures. The last one still
-missing is a mutation sweep driven from the suite rather than by hand.
+6 is a pack over two gigabytes, which the suite cannot build. Repacking for
+an encoding the corpus lacks was one of the other two struck-off oracles and
+now exists, as the `--no-delta-base-offset` and `--window=0` fixtures. The
+last one still missing is a mutation sweep driven from the suite rather than
+by hand.
 
 ## Non-goals
 
@@ -438,9 +439,45 @@ missing is a mutation sweep driven from the suite rather than by hand.
       Neither can fire on a delta git wrote, so both want a pack built by
       hand, which is the refusals item below. Recorded in the README rather
       than counted as covered.
-- [ ] REF_DELTA, and chains whose base is itself a delta
+- [x] REF_DELTA, and chains whose base is itself a delta
       why: the corpus has no REF_DELTA in it, so the suite has to make git
       produce one; depth is only meaningfully tested past 2.
+      files: gitobj.c (idx_find, the REF_DELTA arm of pack_at, nofs and
+      nref in the census), t/run.sh section 9 and the dropname edit in
+      packedit.py, README.md
+      proves: the same 124 objects packed a third time with
+      `--no-delta-base-offset`, compared against `git verify-pack -v` per
+      object and column for column, deepest chain 15. Both encodings give
+      every object the same name and type, and all 124 hash back out of
+      both packs. The discriminator for which encoding a pack holds is a
+      census of the two kinds of LINK, counted at every level of every
+      chain: nothing in `verify-pack -v` says, since it prints a chain
+      length and a base name whichever encoding carried them. The
+      OFS_DELTA fixture must resolve no ref-delta link, the REF_DELTA
+      fixture no ofs-delta link, and every corpus pack no ref-delta link
+      at all, which is the assertion that says why the fixture has to
+      exist.
+      proves, for a base the pack does not hold: a fixture that stops the
+      index naming one object and tells the pack header it holds one
+      fewer, leaving the base's bytes where they were. Refused by name,
+      and by `git verify-pack` too. That is the whole handling of a thin
+      pack, which git sends down a wire and never stores.
+      8477 assertions before, 8622 after; 2735 to 2872 cloned alone.
+      found: four planted defects, three red. Leaving the 20-byte base
+      name in front of the zlib stream fails 10, and so does a bucket
+      lower bound off by one in the index lookup. Not refusing a missing
+      base fails exactly ONE assertion and that one is the message: it
+      reads the wrong base instead, and the delta's base-size check then
+      refuses the file anyway with the same exit status. Third mutant here
+      to survive everything but a message assertion.
+      survivor: searching the whole name list instead of the one fanout
+      bucket. Written as a defect and is not one. The names are globally
+      sorted and a bucket is a contiguous range of them, so the fanout
+      saves eight comparisons and changes no answer.
+      found: the delta search in `pack-objects` is threaded and not
+      reproducible. Two runs over the same objects gave 76 delta entries
+      and then 75, which is a fixture whose shape moves between runs.
+      `--threads=1` pins it, at 79 deltas and a deepest chain of 15.
 - [ ] the full `verify-pack -v` diff, and `verify` over packed objects
       why: the strongest oracle in the project, and it cannot be written
       until every column it prints can be computed.

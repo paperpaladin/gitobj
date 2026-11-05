@@ -2,9 +2,9 @@
  * writes loose objects, in one C11 file.
  *
  * The four object types, a packfile's v2 index, and the objects behind it,
- * through OFS_DELTA chains of any depth. NOT REF_DELTA, which names its base
- * by hash rather than by offset: that entry is refused, and nothing git
- * packed in this collection uses it. See README.md, which says so first. The writer compresses
+ * through delta chains of either encoding and any depth. NOT a pack over two
+ * gigabytes, which is the one thing in the index no fixture here can be.
+ * See README.md, which says what else does not work. The writer compresses
  * nothing (zlib stored blocks), which git reads and no one should use for a
  * real repository; that is in README.md too. No libgit2, no zlib, no shelling
  * out to git. git is the authority this is measured against, never a
@@ -1157,6 +1157,11 @@ typedef struct {
 	 * passes while reading nothing, and so does one over a pack whose
 	 * chains are all of length 1. */
 	size_t nbase, ndelta, maxdepth;
+	/* Links rather than objects: one per delta applied, at every level of
+	 * every chain. The two encodings are counted apart because nothing in
+	 * git's output tells them apart, so this is the only thing that can say
+	 * a REF_DELTA fixture really holds REF_DELTAs. */
+	size_t nofs, nref;
 } Pack;
 
 /* What an entry says about itself, as opposed to what it decodes to.
@@ -1291,7 +1296,25 @@ static const char *pack_entry_hdr(const uint8_t *p, size_t n, size_t *at,
  * was. On stderr, so stdout stays byte-comparable with git's output. */
 static void pack_census(const Pack *p) {
 	fprintf(stderr, "%zu objects, %zu read whole, %zu through a delta chain, "
-	        "deepest chain %zu\n", p->x.n, p->nbase, p->ndelta, p->maxdepth);
+	        "deepest chain %zu, %zu ofs-delta and %zu ref-delta links\n",
+	        p->x.n, p->nbase, p->ndelta, p->maxdepth, p->nofs, p->nref);
+}
+
+/* Find a name in the index. The fanout gives the half-open range of entries
+ * whose first byte matches, so the search starts inside one bucket of 256
+ * rather than over the whole list. A REF_DELTA names its base by hash and
+ * this is the lookup an OFS_DELTA does not need. */
+static int idx_find(const Idx *x, const uint8_t id[20], size_t *out) {
+	size_t lo = id[0] ? be32(x->fan + 4 * (id[0] - 1)) : 0;
+	size_t hi = be32(x->fan + 4 * id[0]);
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		int c = memcmp(x->names + 20 * mid, id, 20);
+		if (c < 0) lo = mid + 1;
+		else if (c > 0) hi = mid;
+		else { *out = mid; return 1; }
+	}
+	return 0;
 }
 
 /* OFS_DELTA gives its base as a distance BACKWARDS from the delta entry's
@@ -1416,6 +1439,7 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 	const char *e = pack_entry_hdr(q, n, &at, &t, &sz);
 	if (e) return e;
 	uint64_t boff = 0;
+	int isdelta = 1;
 	if (t == T_OFS_DELTA) {
 		uint64_t dist;
 		if ((e = pack_ofs_delta(q, n, &at, &dist))) return e;
@@ -1424,10 +1448,24 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 		if (!dist || dist > off - PACK_HDR)
 			return "OFS_DELTA base offset is outside the pack";
 		boff = off - dist;
+		p->nofs++;
 	} else if (t == T_REF_DELTA) {
-		return "pack entry is a REF_DELTA, which gitobj cannot resolve yet";
+		/* The base by name, which can sit anywhere in the pack, before
+		 * this entry or after it. A base that is not in this pack at all
+		 * is a thin pack, which git only ever sends down a wire and never
+		 * stores, so it is refused rather than searched for elsewhere. */
+		if (n - at < 20)
+			return "REF_DELTA base name runs past the end of the pack";
+		size_t bi;
+		if (!idx_find(&p->x, q + at, &bi))
+			return "REF_DELTA base is not an object this pack holds";
+		boff = idx_offset(&p->x, bi);
+		at += 20;
+		p->nref++;
 	} else if (t < T_COMMIT || t > T_TAG) {
 		return "pack entry has a type number git does not use";
+	} else {
+		isdelta = 0;
 	}
 
 	Buf z = {0};
@@ -1441,7 +1479,7 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 		bfree(&z);
 		return "pack entry inflated to a size other than the one it declares";
 	}
-	if (t != T_OFS_DELTA) {
+	if (!isdelta) {
 		if (depth > p->maxdepth) p->maxdepth = depth;
 		if (!depth) p->nbase++;
 		if (ent) { ent->type = t; ent->declared = sz; ent->chain = 0; ent->base = 0; }
