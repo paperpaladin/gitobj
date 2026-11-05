@@ -37,7 +37,9 @@ the delta corpus: 124 objects, 79 delta entries, deepest chain 15
 pack fuzz: 300 mutants, 299 refused for 13 distinct reasons, 1 still readable, all agreeing with git
 packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 29
 base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
-17195 passed, 0 failed
+abbreviated names: 1498 of 7 characters resolved, 0 refused
+four-character prefixes: 32 resolved, 4 ambiguous
+18762 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
@@ -58,7 +60,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **4558 passed**, against five bare
+Cloned on its own this suite reports **5101 passed**, against five bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -75,12 +77,12 @@ because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 17195 above, because the sibling
+Inside the collection it reports more: 18762 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-4558: the one a reader gets by cloning this repository and running `make
+5101: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -550,6 +552,41 @@ segfault rather than a wrong answer. The survivor is the early return on a
 duplicate directory, which the depth limit now covers as well: it bounds the
 work rather than the result.
 
+## Abbreviated names, and the store built to make one ambiguous
+
+Every human-facing git command takes a 7-character prefix, and the rule that
+goes with it is that a prefix matching two objects is an error rather than a
+choice. `gitobj name` does that lookup and nothing else, which makes `git
+rev-parse --verify` the oracle: the same lookup, on the other side.
+
+1498 objects of the small corpus are looked up by their first 7 characters,
+and compared against whatever git says rather than against success, because
+a prefix that short can collide and then both of us have to refuse. None of
+them does, here. Four characters is where collisions turn up: 3061 objects
+over 65536 buckets produce them readily.
+
+Which is a problem for a clone with no siblings, where the corpus is 123
+objects per repository and has no 4-character collision at all. The
+ambiguity path went untested there and said so, which is the whole reason
+for the floor on it. There is a store of its own for that now: 600 blobs of
+fixed content, which collide at `bc98` and `bfae` and will collide at the
+same two prefixes on every run, since the content decides the names. Which
+prefixes are ambiguous is read out of git's listing rather than ours, both
+of us then have to refuse them, and a prefix one character longer has to
+resolve.
+
+Three mutations, three red. Returning the first match instead of refusing
+fails 4 assertions, all of them the ambiguous prefixes. Dropping the
+four-character minimum fails 3, and one of those uses a 3-character prefix
+that matches exactly one object, so the length is the only reason to refuse
+it. Comparing the prefix over 40 characters rather than its own length fails
+1537.
+
+The lookup is a linear scan over every name in the store, which is the list
+`ls` builds anyway. The fanout would make it a binary search per pack, and
+it is not where the time goes: a command that wants one object already opens
+every index and every pack in the store to find it.
+
 ## What does not work
 
 The hard invariant, that every object read hashes back to its own name,
@@ -617,9 +654,10 @@ Those paragraphs used to be one line saying the whole thing was read-only,
 which it was until the writer landed. `PLAN.md` had listed `write` and
 `mktree` as though both existed for a good while before either did.
 
-No SHA-256 repositories, no ref parsing, no abbreviated names, no
-`--batch` protocol, no index or worktree. Objects are addressed by full
-40-character name only.
+No SHA-256 repositories, no ref parsing, no `--batch` protocol, no index or
+worktree. An object is addressed by its name or by four or more hex
+characters of it, and nothing else: no `HEAD`, no `main~3`, no `:path`, none
+of the rest of git's revision syntax.
 
 No `.mtimes`, bitmap or multi-pack index files, no cruft packs, no promisor
 or partial clones. Alternates are read, including nested and relative ones,

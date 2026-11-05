@@ -13,6 +13,7 @@ gitobj type   <objdir> <sha>
 gitobj size   <objdir> <sha>
 gitobj hdr    <objdir> <sha> <key>     a commit/tag header's value(s)
 gitobj msg    <objdir> <sha>           a commit/tag message, byte-exact
+gitobj name   <objdir> <sha>           the full name, like `git rev-parse`
 gitobj ls     <objdir>                 every object: sha, type, size
 gitobj verify <objdir>                 hash every object against its own name
 gitobj write  <objdir> <type> [FILE]   store a loose object, print its name
@@ -22,6 +23,10 @@ gitobj idxcrc <pack.idx>               every CRC against the pack beside it
 gitobj packls <pack.idx>               `git verify-pack -v` layout
 gitobj packverify <pack.idx>           hash every packed object against its name
 ```
+
+Every `<sha>` above is a full 40-character name or four or more hex
+characters of one, which is resolved against the store and refused if it
+matches two objects.
 
 `packls` is not `idx` under another name. Its columns are the pack entry's
 type, its inflated size and its size in the pack, and the first two come out
@@ -37,6 +42,12 @@ In scope:
 * loose objects: zlib-wrapped `<type> <len>\0<payload>`, read and write.
   Written as stored blocks, renamed into place, and left alone if the name
   is already there.
+* the whole object store behind one path: loose files, every pack beside
+  them, and whatever `objects/info/alternates` points at, nested to the
+  depth git allows. An object in two of those is listed once, and the loose
+  copy is the one read, which is the order git looks in.
+* abbreviated names, of four or more hex characters, resolved over the whole
+  store and refused when two objects match.
 * the four object types: blob, tree, commit, tag. Trees are parsed and
   pretty-printed the way `git cat-file -p` does. Commits and tags are parsed
   into headers (including multi-line folded ones, such as `gpgsig`) plus a
@@ -180,9 +191,10 @@ by hand.
   `pack-objects`. Reading them is the interesting half.
 * SHA-256 repositories. `extensions.objectFormat = sha256` is refused.
   Everything here assumes 20-byte names.
-* Reachability. No ref parsing, no `rev-parse`, no abbreviated names, no
-  `--batch` protocol, no index/worktree. Objects are addressed by full
-  40-character name only.
+* Reachability. No ref parsing, none of `rev-parse`'s revision syntax, no
+  `--batch` protocol, no index/worktree. An object is addressed by its name
+  or by four or more hex characters of it, which is the one part of
+  `rev-parse` that is here: abbreviated names WERE on this list.
 * The pack `.rev`, `.mtimes`, bitmap and multi-pack index files, cruft
   packs and promisor/partial clones. Alternates WERE on this list and are
   read now, nested and relative ones included; a C-quoted path in the file
@@ -663,11 +675,43 @@ by hand.
 - [ ] `gitobj write` for packed input, i.e. unpack-objects
       why: the natural completion of having both halves, and it makes the
       three-hop `pack -> loose -> git fsck` round trip possible.
-- [ ] abbreviated object names, by binary search over the index fanout
+- [x] abbreviated object names, by binary search over the index fanout
       why: every human-facing git command takes a 7-character prefix, and
       the fanout is read now, so this is a ten-line function over `idx_open`
       plus the ambiguity check. It also needs the loose objects, where the
       fan-out directory does the same job.
+      files: gitobj.c (odb_resolve, name_check, name_resolve, obj_full and
+      the `name` command), t/run.sh section 12 and one assertion in section
+      2 that had the old behaviour, README.md
+      proves: `gitobj name` against `git rev-parse --verify`, the same
+      lookup on the other side, over 1498 objects of the small corpus by
+      their first 7 characters. Compared against whatever git says rather
+      than against success, since a prefix that short can collide and then
+      both of us have to refuse. 32 four-character prefixes resolved and 4
+      refused as ambiguous, with which ones are which read out of git's
+      listing rather than ours, and a prefix one character longer than an
+      ambiguous one has to resolve.
+      17195 assertions before, 18762 after; 4558 to 5101 cloned alone.
+      found: a clone with no siblings had no ambiguous prefix anywhere. 123
+      objects per repository over 65536 buckets collide about never, where
+      3061 collide readily, so the ambiguity path went untested standalone
+      and the floor on it is what said so. A store of its own for it now:
+      600 blobs of fixed content, colliding at bc98 and bfae, the same two
+      on every run because the content decides the names.
+      found: the four-character minimum was in two places, so a mutation of
+      one of them failed a single assertion while the other command went on
+      enforcing it. One `name_check` now, called by both.
+      found: three planted defects, three red. Returning the first match
+      instead of refusing fails 4 assertions, all of them the ambiguous
+      prefixes; dropping the minimum fails 3, one of which uses a
+      3-character prefix matching exactly ONE object so that the length is
+      the only possible reason to refuse it; comparing the prefix over 40
+      characters rather than its own length fails 1537.
+      shortcut: the lookup is a linear scan over every name in the store
+      rather than the binary search this item asked for. The names are
+      already collected for `ls`, and a command that wants one object
+      already opens every index and every pack in the store, so the search
+      is not where the time goes.
 - [x] `objects/info/alternates`, so a repository whose objects live in a
       borrowed object store can be read at all
       why: every `git clone -s` and most CI caches look like this, and we

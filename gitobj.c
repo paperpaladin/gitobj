@@ -1814,17 +1814,6 @@ static int obj_get(Odb *o, const char *hex, Obj *out) {
 	return 0;
 }
 
-/* The same for a caller that wants one object and nothing else. The store is
- * opened and closed around it; an Obj holds its own buffer, so it outlives
- * both. */
-static void obj_read(const char *objdir, const char *hex, Obj *out) {
-	Odb o;
-	odb_open(objdir, &o);
-	int got = obj_get(&o, hex, out);
-	odb_close(&o);
-	if (!got) die2("object not found", hex);
-}
-
 /* Every object in the store, loose and packed, borrowed and its own, by name
  * and without duplicates: an object can be loose AND in a pack, or in two
  * packs, or in this store and an alternate, and `git cat-file
@@ -1848,6 +1837,79 @@ static void odb_names(Odb *o, Names *out) {
 	out->n = w;
 }
 
+/* Resolve an abbreviated name the way git's short-object-ID lookup does:
+ * find every object whose name begins with it and give an answer only if
+ * there is exactly one. Returns the number of matches, capped at 2, since a
+ * caller only needs to know none, one, or more than one.
+ *
+ * Four hex characters is git's own minimum and the caller enforces it. An
+ * odd number of them is fine: this is a prefix of the NAME, not of the
+ * bytes.
+ *
+ * shortcut: a linear scan over every name in the store, which odb_names()
+ * has collected anyway. The fanout would turn it into a binary search per
+ * pack, and the cost here is not the scan: a command that wants one object
+ * already opens every index and every pack in the store to find it. */
+static int odb_resolve(Odb *o, const char *pre, char full[41]) {
+	size_t pn = strlen(pre);
+	Names ns = {0};
+	odb_names(o, &ns);
+	int n = 0;
+	for (size_t i = 0; i < ns.n && n < 2; i++)
+		if (!strncmp(ns.v[i], pre, pn)) {
+			memcpy(full, ns.v[i], 41);
+			n++;
+		}
+	free(ns.v);
+	return n;
+}
+
+/* The one place a name or a prefix is checked for being one. Four hex
+ * characters is git's own minimum, and an odd number of them is fine. */
+static void name_check(const char *hex) {
+	size_t n = strlen(hex);
+	if (n == 40) {
+		uint8_t id[20];
+		if (unhexify(hex, id)) die2("not an object name", hex);
+		return;
+	}
+	if (n < 4 || n > 40 || !ishex(hex, n))
+		die2("not an object name, nor 4 or more hex characters of one", hex);
+}
+
+/* Resolve, and die rather than return a second answer. */
+static void name_resolve(Odb *o, const char *hex, char full[41]) {
+	int k = odb_resolve(o, hex, full);
+	if (!k) die2("object not found", hex);
+	if (k > 1) die2("short object name is ambiguous", hex);
+}
+
+/* The full name of whatever the caller named, which may be a prefix. A
+ * 40-character name is taken as itself, because the exact lookup is a
+ * binary search where resolving a prefix is a walk over the store. */
+static void obj_full(Odb *o, const char *hex, char full[41]) {
+	name_check(hex);
+	if (strlen(hex) == 40) {
+		memcpy(full, hex, 41);
+		return;
+	}
+	name_resolve(o, hex, full);
+}
+
+/* The same for a caller that wants one object and nothing else. The store is
+ * opened and closed around it; an Obj holds its own buffer, so it outlives
+ * both. */
+static void obj_read(const char *objdir, const char *hex, Obj *out) {
+	Odb o;
+	odb_open(objdir, &o);
+	char full[41];
+	obj_full(&o, hex, full);
+	int got = obj_get(&o, full, out);
+	odb_close(&o);
+	if (!got) die2("object not found", hex);
+}
+
+
 /* ------------------------------------------------------------------ main */
 
 static int usage(void) {
@@ -1856,6 +1918,7 @@ static int usage(void) {
 	      "       gitobj mktree <objdir>\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
 	      "       gitobj ls|verify <objdir>\n"
+	      "       gitobj name <objdir> <sha or 4+ hex characters of one>\n"
 	      "       gitobj idx <pack.idx>\n"
 	      "       gitobj idxcrc <pack.idx>\n"
 	      "       gitobj packls <pack.idx>\n"
@@ -1948,6 +2011,22 @@ int main(int argc, char **argv) {
 			tree_print(o.data.p, o.data.n);
 		else writeall(o.data.p, o.data.n);
 		bfree(&o.data);
+		return 0;
+	}
+
+	/* `git rev-parse <prefix>` with nothing else in it: no refs, no
+	 * revision syntax, just the abbreviated-name lookup. */
+	if (!strcmp(cmd, "name") && argc == 4) {
+		name_check(argv[3]);
+		Odb o;
+		odb_open(argv[2], &o);
+		char full[41];
+		/* Not the fast path even for a full name: `name` is asked whether
+		 * the object is THERE, and a 40-character name that is not in the
+		 * store has to be refused rather than echoed back. */
+		name_resolve(&o, argv[3], full);
+		odb_close(&o);
+		printf("%s\n", full);
 		return 0;
 	}
 

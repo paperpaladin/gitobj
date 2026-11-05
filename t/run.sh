@@ -265,8 +265,10 @@ for r in $HAVE_SMALL; do
 	OD="$G/objects"
 	nl=$(loose_shas "$G" | grep -c .)
 	nloose=$((nloose + nl))
+	# Kept per repository rather than overwritten, because section 12 wants
+	# the same list: git's account of what is in the store.
 	$GIT --git-dir="$G" cat-file --batch-all-objects --batch-check |
-		sort > "$TMP/all.list"
+		sort > "$TMP/corpus-all.$r"
 	n=0
 	while read -r sha gt gsz; do
 		n=$((n+1))
@@ -279,7 +281,7 @@ for r in $HAVE_SMALL; do
 		"$GITOBJ" cat "$OD" "$sha" > "$TMP/ours" 2>/dev/null
 		$GIT --git-dir="$G" cat-file -p "$sha" > "$TMP/theirs"
 		assert "cat -p $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
-	done < "$TMP/all.list"
+	done < "$TMP/corpus-all.$r"
 	[ "$n" -gt 0 ] && swept_from="$swept_from $r($n, $nl loose)"
 done
 [ "$nobj" -ge 20 ] && ok || no "only $nobj objects in the small corpora"
@@ -307,7 +309,12 @@ refute "trailing bytes after the zlib stream are refused" \
 printf 'not a zlib stream at all' > "$TMP/bad/objects/ab/${hb:2}"
 refute "a non-zlib loose object is refused" \
 	"$GITOBJ" raw "$TMP/bad/objects" "ab${hb:2}"
-refute "a short object name is refused" "$GITOBJ" type "$OD2" "${hb:0:7}"
+# An abbreviated name is resolved rather than refused now, which is section
+# 12's subject; this one stays here because it is the loose-object path.
+eq "a 7-character prefix of a loose object resolves" \
+	"$("$GITOBJ" type "$OD2" "${hb:0:7}")" "$("$GITOBJ" type "$OD2" "$hb")"
+refute "a prefix below git's minimum of 4 characters is refused" \
+	"$GITOBJ" type "$OD2" "${hb:0:3}"
 refute "a missing object is refused" "$GITOBJ" type "$OD2" \
 	0000000000000000000000000000000000000000
 
@@ -2439,6 +2446,150 @@ eq "an alternate that is not there leaves an empty store empty" \
 refute "and an object is still not found in it" \
 	"$GITOBJ" type "$ALTD/gone/objects" \
 	0000000000000000000000000000000000000000
+
+# =====================================================================
+# 12. abbreviated object names
+# =====================================================================
+# Every human-facing git command takes a 7-character prefix, and the rule
+# that goes with it is that a prefix matching two objects is an error rather
+# than a choice. `git rev-parse` is the oracle and it is the right one: it
+# does the same lookup and nothing else.
+#
+# git's own minimum is four characters. An odd number of them is fine, since
+# this is a prefix of the NAME and not of the bytes.
+abb_ok=0
+abb_amb=0
+for r in $HAVE_SMALL; do
+	G="$TMP/corpus/$r"
+	OD="$G/objects"
+	while read -r sha gt gsz; do
+		# 7 characters, which is git's default abbreviation. Compared
+		# against whatever git says rather than against success: a prefix
+		# this short can collide, and then both of us have to refuse.
+		pre=${sha:0:7}
+		if want=$($GIT --git-dir="$G" rev-parse --verify "$pre" 2>/dev/null); then
+			eq "name $r/$pre" "$("$GITOBJ" name "$OD" "$pre" 2>/dev/null)" "$want"
+			abb_ok=$((abb_ok + 1))
+		else
+			refute "name $r/$pre is refused, as git refuses it" \
+				"$GITOBJ" name "$OD" "$pre"
+			abb_amb=$((abb_amb + 1))
+		fi
+	done < "$TMP/corpus-all.$r"
+done
+[ "$abb_ok" -ge 300 ] && ok || no "only $abb_ok prefixes resolved"
+printf 'abbreviated names: %d of 7 characters resolved, %d refused\n' \
+	"$abb_ok" "$abb_amb"
+
+# Four characters, where an ambiguous prefix can be had. A store of its own
+# for it, because the corpus cannot be relied on to provide one: 3061
+# objects over 65536 buckets collide readily and 123 do not, so in a clone
+# with no siblings the ambiguity path went untested and said so. 600 blobs
+# of fixed content give two colliding prefixes, bc98 and bfae, and they are
+# the same two on every run because the content decides the names.
+AMB=$TMP/ambig
+rm -rf "$AMB" "$TMP/mk/ambig"
+mkdir -p "$TMP/mk/ambig"
+$GIT init -q --bare "$AMB"
+i=0
+: > "$TMP/mk/ambig/paths"
+while [ "$i" -lt 600 ]; do
+	printf 'ambiguity probe %d\n' "$i" > "$TMP/mk/ambig/b$i"
+	echo "$TMP/mk/ambig/b$i" >> "$TMP/mk/ambig/paths"
+	i=$((i+1))
+done
+$GIT --git-dir="$AMB" hash-object -w --stdin-paths \
+	< "$TMP/mk/ambig/paths" > /dev/null
+$GIT --git-dir="$AMB" cat-file --batch-all-objects --batch-check |
+	sort > "$TMP/corpus-all.ambig"
+abb4_ok=0
+abb4_amb=0
+# Both halves come from GIT's listing, so which prefixes are ambiguous is
+# git's account of the store and not ours.
+for r in ambig $HAVE_SMALL; do
+	case $r in
+	ambig) G="$AMB" ;;
+	*)     G="$TMP/corpus/$r" ;;
+	esac
+	OD="$G/objects"
+	awk '{print substr($1,1,4)}' "$TMP/corpus-all.$r" | sort > "$TMP/abb4"
+	for pre in $(uniq -d "$TMP/abb4" | head -4); do
+		refute "a 4-character prefix matching two objects is refused: $r/$pre" \
+			"$GITOBJ" name "$OD" "$pre"
+		assert "and says it is ambiguous rather than absent: $r/$pre" sh -c \
+			"'$GITOBJ' name '$OD' '$pre' 2>&1 | grep -q ambiguous"
+		assert "git refuses it too: $r/$pre" sh -c \
+			"! $GIT --git-dir='$G' rev-parse --verify '$pre' >/dev/null 2>&1"
+		abb4_amb=$((abb4_amb + 1))
+	done
+	for pre in $(uniq -u "$TMP/abb4" | head -4); do
+		eq "a 4-character prefix matching one object resolves: $r/$pre" \
+			"$("$GITOBJ" name "$OD" "$pre" 2>/dev/null)" \
+			"$($GIT --git-dir="$G" rev-parse --verify "$pre")"
+		abb4_ok=$((abb4_ok + 1))
+	done
+done
+# Both paths have to have run. An ambiguity check that never sees an
+# ambiguous prefix is the whole hazard here, and the 600-blob store above
+# exists to make sure one is always there.
+[ "$abb4_amb" -ge 2 ] && ok ||
+	no "only $abb4_amb ambiguous 4-character prefixes, so ambiguity went untested"
+[ "$abb4_ok" -ge 4 ] && ok || no "only $abb4_ok unambiguous 4-character prefixes"
+# A prefix one character longer than an ambiguous one has to resolve: that
+# is the difference between a lookup that compares the prefix it was given
+# and one that compares something else.
+amb1=$(uniq -d < <(awk '{print substr($1,1,4)}' "$TMP/corpus-all.ambig" | sort) | head -1)
+for full in $(awk -v p="$amb1" 'substr($1,1,4)==p{print $1}' "$TMP/corpus-all.ambig"); do
+	eq "and one character more resolves it: ${full:0:5}" \
+		"$("$GITOBJ" name "$AMB/objects" "${full:0:5}" 2>/dev/null)" "$full"
+done
+printf 'four-character prefixes: %d resolved, %d ambiguous\n' "$abb4_ok" "$abb4_amb"
+
+# An odd number of characters, a full name, and the lookup reaching through
+# to the object rather than stopping at its name.
+SOD=$TMP/corpus/self_a/objects
+SG="$GIT --git-dir=$TMP/corpus/self_a"
+ssha=$(head -1 "$TMP/corpus-all.self_a" | cut -d' ' -f1)
+for k in 4 5 7 11 39 40; do
+	eq "a prefix of $k characters resolves" \
+		"$("$GITOBJ" name "$SOD" "${ssha:0:$k}" 2>/dev/null)" "$ssha"
+done
+eq "and cat-file through a prefix agrees with git" \
+	"$("$GITOBJ" type "$SOD" "${ssha:0:7}")" \
+	"$($SG cat-file -t "$ssha")"
+eq "and so does size" \
+	"$("$GITOBJ" size "$SOD" "${ssha:0:7}")" \
+	"$($SG cat-file -s "$ssha")"
+"$GITOBJ" raw "$SOD" "${ssha:0:7}" > "$TMP/ours" 2>/dev/null
+$SG cat-file "$($SG cat-file -t "$ssha")" "$ssha" > "$TMP/theirs"
+assert "and raw bytes through a prefix are the same bytes" \
+	cmp -s "$TMP/ours" "$TMP/theirs"
+
+# Refusals. Three characters is below git's minimum; git calls it ambiguous,
+# we call it too short, and both refuse, which is the part that matters.
+refute "a prefix of 3 characters is refused" \
+	"$GITOBJ" name "$SOD" "${ssha:0:3}"
+assert "git refuses 3 characters too" sh -c \
+	"! $SG rev-parse --verify '${ssha:0:3}' >/dev/null 2>&1"
+# And a 3-character prefix that matches exactly ONE object, so that the
+# length is the only possible reason to refuse it. Without this the rule
+# passes on prefixes that would have been ambiguous anyway.
+uniq3=$(awk '{print substr($1,1,3)}' "$TMP/corpus-all.self_a" | sort | uniq -u | head -1)
+assert "the corpus has a 3-character prefix matching exactly one object" \
+	test -n "$uniq3"
+refute "which is still refused, for its length alone" \
+	"$GITOBJ" name "$SOD" "$uniq3"
+assert "and git refuses that one too" sh -c \
+	"! $SG rev-parse --verify '$uniq3' >/dev/null 2>&1"
+refute "a prefix that is not hex is refused" "$GITOBJ" name "$SOD" zzzz
+refute "a prefix matching nothing is refused" \
+	"$GITOBJ" name "$SOD" ffffffffff
+assert "and says not found rather than ambiguous" sh -c \
+	"'$GITOBJ' name '$SOD' ffffffffff 2>&1 | grep -q 'not found'"
+refute "a 41-character name is refused" \
+	"$GITOBJ" name "$SOD" "${ssha}0"
+refute "and so is a prefix of a name nothing holds, through cat" \
+	"$GITOBJ" cat "$SOD" ffffffffff
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
