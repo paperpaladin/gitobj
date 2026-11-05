@@ -1,11 +1,10 @@
 /* gitobj. git's object database: reads loose objects and pack indexes,
  * writes loose objects, in one C11 file.
  *
- * The four object types, a packfile's v2 index, and the pack entries that
- * index points at as long as they are stored whole. NOT the deltas: both
- * encodings and the instruction stream are planned and absent, so a packed
- * object that git chose to delta has a name, an offset and a CRC here and no
- * content. See README.md, which says so first. The writer compresses
+ * The four object types, a packfile's v2 index, and the objects behind it,
+ * through OFS_DELTA chains of any depth. NOT REF_DELTA, which names its base
+ * by hash rather than by offset: that entry is refused, and nothing git
+ * packed in this collection uses it. See README.md, which says so first. The writer compresses
  * nothing (zlib stored blocks), which git reads and no one should use for a
  * real repository; that is in README.md too. No libgit2, no zlib, no shelling
  * out to git. git is the authority this is measured against, never a
@@ -14,9 +13,9 @@
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
  * read is self-checking: if the bytes we reconstructed hash back to the name
  * we looked them up by, the whole decode path was right. That covers the
- * loose objects and the pack entries stored whole; an index entry has no
- * payload to hash, so its checks are the fanout against the name list and the
- * CRC against the pack. See README.md.
+ * loose objects and every packed object the deltas here can resolve; an index
+ * entry has no payload to hash, so its own checks are the fanout against the
+ * name list and the CRC against the pack. See README.md.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
@@ -1139,12 +1138,40 @@ static int pofscmp(const void *a, const void *b) {
 
 #define PACK_HDR 12
 
+/* A delta chain cannot loop through OFS_DELTA, whose base is strictly
+ * earlier in the pack, so this ceiling is not cycle detection: it is a bound
+ * on how much stack a pack somebody else wrote can ask for, one frame per
+ * link. git's own `pack.depth` default is 50 and the deepest chain in any
+ * corpus here is 29.
+ *
+ * shortcut: recursion, so the ceiling and the stack are the same thing. An
+ * explicit stack of offsets would lift it, and nothing needs that yet. */
+#define DELTA_MAX_DEPTH 256
+
 typedef struct {
 	Idx x;
 	Buf pk;
 	Pofs *ord;          /* every offset, in pack order, with its index entry */
-	size_t nbase;       /* the census: how many entries took each path */
+	/* The census, counted for the object asked for rather than for the
+	 * bases underneath it: a delta test over a pack with no deltas in it
+	 * passes while reading nothing, and so does one over a pack whose
+	 * chains are all of length 1. */
+	size_t nbase, ndelta, maxdepth;
 } Pack;
+
+/* What an entry says about itself, as opposed to what it decodes to.
+ * `git verify-pack -v` prints a mixture of the two and the mixture is not
+ * arbitrary: the type is the one at the END of the chain, because a delta
+ * entry has none of its own, while the size is the one THIS entry declares,
+ * which for a delta is the length of the delta data and not of the object it
+ * produces. Printing the resolved size there is a disagreement with git on
+ * every delta in the pack, which is how this was found. */
+typedef struct {
+	int type;            /* at the end of the chain */
+	size_t declared;     /* what this entry's own varint says */
+	unsigned chain;      /* links to an entry stored whole; 0 if it is one */
+	uint64_t base;       /* the immediate base's offset, when chain > 0 */
+} Ent;
 
 /* Open an index and the pack beside it, and check the two against each
  * other: the object count in the pack header, the pack's own trailing
@@ -1203,6 +1230,21 @@ static void pack_close(Pack *p) {
 	bfree(&p->x.raw);
 }
 
+/* Where an entry sits in pack order. Binary search rather than a reverse
+ * table: an OFS_DELTA names its base by offset and `verify-pack -v` prints
+ * that base's NAME, which is the one place the mapping is wanted. */
+static size_t pack_ord(const Pack *p, uint64_t off) {
+	size_t lo = 0, hi = p->x.n;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (p->ord[mid].off < off) lo = mid + 1;
+		else if (p->ord[mid].off > off) hi = mid;
+		else return mid;
+	}
+	dieval("no object in the index is at this pack offset", (size_t)off);
+	return 0;
+}
+
 /* The bytes an entry occupies: from its own offset to the next offset in
  * pack order, or to the start of the trailer for the last one. This is
  * `verify-pack -v`'s size-in-pack column. */
@@ -1245,36 +1287,186 @@ static const char *pack_entry_hdr(const uint8_t *p, size_t n, size_t *at,
 	return NULL;
 }
 
-/* Read the object at a pack offset. */
-static const char *pack_at(Pack *p, uint64_t off, Obj *out) {
+/* How many objects took each path, and how deep the deepest chain walked
+ * was. On stderr, so stdout stays byte-comparable with git's output. */
+static void pack_census(const Pack *p) {
+	fprintf(stderr, "%zu objects, %zu read whole, %zu through a delta chain, "
+	        "deepest chain %zu\n", p->x.n, p->nbase, p->ndelta, p->maxdepth);
+}
+
+/* OFS_DELTA gives its base as a distance BACKWARDS from the delta entry's
+ * own offset, in a third varint that is neither of the other two: every
+ * continuation byte adds one before shifting, so the encoding has exactly
+ * one representation of each value and the shortest form is the only form.
+ * `(v + 1) << 7`, not a plain shift, is the thing readers get wrong, and
+ * getting it wrong is silent until the distance exceeds 127. */
+static const char *pack_ofs_delta(const uint8_t *p, size_t n, size_t *at,
+                                  uint64_t *dist) {
+	size_t i = *at;
+	if (i >= n) return "OFS_DELTA base offset runs past the end of the pack";
+	uint8_t c = p[i++];
+	uint64_t v = c & 0x7f;
+	int k = 0;
+	while (c & 0x80) {
+		if (i >= n) return "OFS_DELTA base offset runs past the end of the pack";
+		if (++k > 8) return "OFS_DELTA base offset varint is too long";
+		c = p[i++];
+		v = ((v + 1) << 7) | (c & 0x7f);
+	}
+	*at = i;
+	*dist = v;
+	return NULL;
+}
+
+/* The plain 7-bit little-endian varint, which is what the delta header uses
+ * for the base size and the result size. A pack holds three different
+ * varints and this is the ordinary one. */
+static const char *delta_size(const uint8_t *d, size_t n, size_t *at, size_t *out) {
+	size_t i = *at, v = 0;
+	int sh = 0;
+	uint8_t c;
+	do {
+		if (i >= n) return "delta header size varint is truncated";
+		if (sh > 56) return "delta header size varint is too long";
+		c = d[i++];
+		v |= (size_t)(c & 0x7f) << sh;
+		sh += 7;
+		if (v > OBJ_MAX) return "delta header declares a size above OBJ_MAX";
+	} while (c & 0x80);
+	*at = i;
+	*out = v;
+	return NULL;
+}
+
+/* Apply a delta: two sizes, then a stream of copy and insert instructions.
+ *
+ * A copy instruction has the top bit set, and the rest of the byte is a
+ * bitmap of which of seven following bytes are present: four for the offset
+ * into the base, three for the length, each little-endian. An absent byte
+ * is zero, EXCEPT that a length of zero means 0x10000, which is the one
+ * default that is not the identity and the second classic bug here. An
+ * instruction byte with the top bit clear is an insert of that many literal
+ * bytes; zero is not an instruction at all.
+ *
+ * Both sizes are checked rather than trusted. The base size is what says
+ * this delta belongs to this base, and the result size bounds the output, so
+ * neither a copy nor an insert can grow the result past what the header
+ * declared. `out` must be empty: the bounds below are on the whole buffer. */
+static const char *delta_apply(const uint8_t *d, size_t dn,
+                               const uint8_t *b, size_t bn, Buf *out) {
+	size_t at = 0, want_base = 0, want_res = 0;
+	const char *e = delta_size(d, dn, &at, &want_base);
+	if (e) return e;
+	if ((e = delta_size(d, dn, &at, &want_res))) return e;
+	if (want_base != bn) return "delta base size disagrees with the base object";
+	while (at < dn) {
+		uint8_t c = d[at++];
+		if (c & 0x80) {
+			uint64_t off = 0, len = 0;
+			for (int k = 0; k < 4; k++)
+				if (c & (1 << k)) {
+					if (at >= dn) return "delta copy instruction is truncated";
+					off |= (uint64_t)d[at++] << (8 * k);
+				}
+			for (int k = 0; k < 3; k++)
+				if (c & (0x10 << k)) {
+					if (at >= dn) return "delta copy instruction is truncated";
+					len |= (uint64_t)d[at++] << (8 * k);
+				}
+			if (!len) len = 0x10000;
+			if (off > bn || len > bn - off)
+				return "delta copies from outside the base object";
+			if (len > want_res - out->n)
+				return "delta writes past the result size it declares";
+			bwrite(out, b + off, (size_t)len);
+		} else if (c) {
+			if (c > dn - at) return "delta insert instruction is truncated";
+			if (c > want_res - out->n)
+				return "delta writes past the result size it declares";
+			bwrite(out, d + at, c);
+			at += c;
+		} else {
+			return "delta instruction 0 is not an instruction";
+		}
+	}
+	if (out->n != want_res)
+		return "delta result is not the size the delta declares";
+	return NULL;
+}
+
+/* Read the object at a pack offset, resolving a delta by reading its base
+ * the same way. The type comes back from the end of the chain: a delta entry
+ * does not carry one.
+ *
+ * shortcut: no base cache, so a chain of depth N costs N inflations for
+ * every object on it and walking a whole pack is O(objects * depth). The
+ * four-entry LRU that fixes it is in PLAN.md's Milestone 1. */
+static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
+                           unsigned depth) {
 	const uint8_t *q = p->pk.p;
 	/* The trailer is not entry data, so it is not part of what a varint or
 	 * a zlib stream is allowed to read into. */
 	size_t n = p->pk.n - 20;
+	if (depth > DELTA_MAX_DEPTH)
+		return "delta chain is deeper than gitobj will follow";
 	if (off < PACK_HDR || off >= n) return "pack offset is outside the pack";
 	size_t at = (size_t)off;
 	int t;
 	size_t sz;
 	const char *e = pack_entry_hdr(q, n, &at, &t, &sz);
 	if (e) return e;
-	if (t == T_OFS_DELTA || t == T_REF_DELTA)
-		return "pack entry is a delta, which gitobj cannot resolve yet";
-	if (t < T_COMMIT || t > T_TAG)
+	uint64_t boff = 0;
+	if (t == T_OFS_DELTA) {
+		uint64_t dist;
+		if ((e = pack_ofs_delta(q, n, &at, &dist))) return e;
+		/* Zero would name the delta entry itself and anything larger than
+		 * the offset would name a byte before the pack header. */
+		if (!dist || dist > off - PACK_HDR)
+			return "OFS_DELTA base offset is outside the pack";
+		boff = off - dist;
+	} else if (t == T_REF_DELTA) {
+		return "pack entry is a REF_DELTA, which gitobj cannot resolve yet";
+	} else if (t < T_COMMIT || t > T_TAG) {
 		return "pack entry has a type number git does not use";
+	}
 
 	Buf z = {0};
 	size_t used = 0;
 	if ((e = zinflate(q + at, n - at, &z, &used))) { bfree(&z); return e; }
 	/* The declared size is checked against what inflated. git stores both,
 	 * and a reader that trusts the varint reports a length the data does
-	 * not have. */
+	 * not have. For a delta entry this is the size of the delta data, not
+	 * of the object it produces: that one is in the delta's own header. */
 	if (z.n != sz) {
 		bfree(&z);
 		return "pack entry inflated to a size other than the one it declares";
 	}
-	p->nbase++;
-	out->type = t;
-	out->data = z;
+	if (t != T_OFS_DELTA) {
+		if (depth > p->maxdepth) p->maxdepth = depth;
+		if (!depth) p->nbase++;
+		if (ent) { ent->type = t; ent->declared = sz; ent->chain = 0; ent->base = 0; }
+		out->type = t;
+		out->data = z;
+		return NULL;
+	}
+
+	Obj base = {0, {0}};
+	Ent bent = {0, 0, 0, 0};
+	if ((e = pack_at(p, boff, &base, &bent, depth + 1))) { bfree(&z); return e; }
+	Buf res = {0};
+	e = delta_apply(z.p, z.n, base.data.p, base.data.n, &res);
+	bfree(&z);
+	bfree(&base.data);
+	if (e) { bfree(&res); return e; }
+	if (!depth) p->ndelta++;
+	if (ent) {
+		ent->type = bent.type;
+		ent->declared = sz;
+		ent->chain = bent.chain + 1;
+		ent->base = boff;
+	}
+	out->type = bent.type;
+	out->data = res;
 	return NULL;
 }
 
@@ -1509,18 +1701,24 @@ int main(int argc, char **argv) {
 	if (!strcmp(cmd, "packls") && argc == 3) {
 		Pack p;
 		pack_open(argv[2], &p);
-		char hex[41];
+		char hex[41], bhex[41];
 		for (size_t k = 0; k < p.x.n; k++) {
 			Obj o = {0, {0}};
-			const char *e = pack_at(&p, p.ord[k].off, &o);
+			Ent ent = {0, 0, 0, 0};
+			const char *e = pack_at(&p, p.ord[k].off, &o, &ent, 0);
 			if (e) dieat(e, (size_t)p.ord[k].off);
 			hexify(p.x.names + 20 * p.ord[k].i, hex);
-			printf("%s %-6s %zu %llu %llu\n", hex, tname(o.type), o.data.n,
+			printf("%s %-6s %zu %llu %llu", hex, tname(ent.type), ent.declared,
 			       (unsigned long long)pack_extent(&p, k),
 			       (unsigned long long)p.ord[k].off);
+			if (ent.chain) {
+				hexify(p.x.names + 20 * p.ord[pack_ord(&p, ent.base)].i, bhex);
+				printf(" %u %s", ent.chain, bhex);
+			}
+			putchar('\n');
 			bfree(&o.data);
 		}
-		fprintf(stderr, "%zu objects, %zu read whole\n", p.x.n, p.nbase);
+		pack_census(&p);
 		pack_close(&p);
 		return 0;
 	}
@@ -1535,7 +1733,7 @@ int main(int argc, char **argv) {
 		char hex[41], want[41];
 		for (size_t k = 0; k < p.x.n; k++) {
 			Obj o = {0, {0}};
-			const char *e = pack_at(&p, p.ord[k].off, &o);
+			const char *e = pack_at(&p, p.ord[k].off, &o, NULL, 0);
 			if (e) dieat(e, (size_t)p.ord[k].off);
 			uint8_t id[20];
 			objid(o.type, o.data.p, o.data.n, id);
@@ -1548,7 +1746,7 @@ int main(int argc, char **argv) {
 			bfree(&o.data);
 		}
 		printf("%zu objects, %zu mismatched\n", p.x.n, bad);
-		fprintf(stderr, "%zu objects, %zu read whole\n", p.x.n, p.nbase);
+		pack_census(&p);
 		pack_close(&p);
 		return bad ? 1 : 0;
 	}

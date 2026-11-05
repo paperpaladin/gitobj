@@ -1498,6 +1498,20 @@ while [ "$i" -lt 40 ]; do
 		$GIT --git-dir="$DREPO" commit-tree \
 			${dparent:+-p $dparent} "$dt" -m "revision $i of the delta corpus")
 done
+# Three large revisions as well, because the copy instruction's implicit
+# length of 0x10000 is only reached over a base of at least 64KB: git's
+# encoder omits the length bytes for exactly that value and splits any
+# longer run into 0x10000 pieces. With 400-line blobs alone, taking the
+# absent length as 0 instead of 0x10000 is a mutation nothing here can kill,
+# and a standalone clone had no pack that reached it. The edit goes near the
+# END of the file so the unchanged prefix is what gets copied.
+seq 1 20000 | sed 's/^/a line of the big file, number /' > "$DW/big"
+i=0
+while [ "$i" -lt 3 ]; do
+	i=$((i+1))
+	sed -i "$((19990 + i))s/.*/rewritten in big revision $i/" "$DW/big"
+	$GIT --git-dir="$DREPO" hash-object -w "$DW/big" > /dev/null
+done
 printf 'object %s\ntype commit\ntag deltas\ntagger deltas <deltas@invalid> 1012608000 +0000\n\nannotated\n' \
 	"$dparent" | $GIT --git-dir="$DREPO" mktag > /dev/null
 $GIT --git-dir="$DREPO" cat-file --batch-all-objects --batch-check |
@@ -1505,12 +1519,15 @@ $GIT --git-dir="$DREPO" cat-file --batch-all-objects --batch-check |
 NDOBJ=$(wc -l < "$TMP/packs/din" | tr -d ' ')
 [ "$NDOBJ" -ge 100 ] && ok || no "the delta corpus has only $NDOBJ objects"
 
-# Two packs of the same objects. The delta-free one is what this section can
-# read; the other is the layout git chooses for itself, and the next item of
-# PLAN.md is reading it.
+# Two packs of the same objects: one full of OFS_DELTA, one with no delta at
+# all. `--delta-base-offset` is not optional here. Plumbing `pack-objects`
+# leaves `pack.useDeltaBaseOffset` off and writes REF_DELTA, where `git gc`
+# and `git repack` pass the flag, so every pack in the corpus is OFS_DELTA
+# and a fixture built without it is the OTHER encoding. That was caught by
+# this section going red, REF_DELTA being the one thing still refused.
 mkdir -p "$TMP/packs/d"
-DPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty "$TMP/packs/d/dd" \
-	< "$TMP/packs/din")
+DPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty --delta-base-offset \
+	"$TMP/packs/d/dd" < "$TMP/packs/din")
 NDPACK=$($GIT --git-dir="$DREPO" pack-objects --window=0 --non-empty \
 	"$TMP/packs/d/nd" < "$TMP/packs/din")
 DIDX="$TMP/packs/d/dd-$DPACK.idx"
@@ -1537,39 +1554,92 @@ printf 'the delta corpus: %d objects, %d delta entries, deepest chain %d\n' \
 	"$NDOBJ" "$ndelta" "$ddepth"
 
 # Per object, not per file: a diff over a hundred objects says only that
-# something somewhere disagreed.
-"$GITOBJ" packls "$NDIDX" > "$TMP/p.ours" 2> "$TMP/p.census"
-eq "packls exits 0 on a delta-free pack" "$?" 0
-vpv "$NDIDX" > "$TMP/p.theirs"
-eq "packls prints a line per object, as verify-pack -v does" \
-	"$(wc -l < "$TMP/p.ours" | tr -d ' ')" "$(wc -l < "$TMP/p.theirs" | tr -d ' ')"
-nd_cmp=0
-while IFS= read -r a <&3 && IFS= read -r b <&4; do
-	nd_cmp=$((nd_cmp + 1))
-	eq "packls ${b%% *}" "$a" "$b"
-done 3< "$TMP/p.ours" 4< "$TMP/p.theirs"
-[ "$nd_cmp" -ge 100 ] && ok ||
-	no "only $nd_cmp objects compared against verify-pack -v"
-# The census, so none of the above can pass having read nothing: every entry
-# in this pack has to have been read out of the pack.
-eq "and every entry was read whole out of the pack" "$(cat "$TMP/p.census")" \
-	"$NDOBJ objects, $NDOBJ read whole"
+# something somewhere disagreed. And the census is checked against git's own
+# numbers rather than reported, because every one of these comparisons
+# passes over a pack with no delta in it while the delta code never runs.
+pls_objs=0
+pls_delta=0
+pls_depth=0
+packls_vs_vpv() { # <label> <idx>
+	local nobj gd gm cd cm
+	"$GITOBJ" packls "$2" > "$TMP/p.ours" 2> "$TMP/p.census"
+	eq "$1: packls exits 0" "$?" 0
+	vpv "$2" > "$TMP/p.theirs"
+	nobj=$(wc -l < "$TMP/p.theirs" | tr -d ' ')
+	eq "$1: a line per object, as verify-pack -v prints" \
+		"$(wc -l < "$TMP/p.ours" | tr -d ' ')" "$nobj"
+	local a b
+	while IFS= read -r a <&3 && IFS= read -r b <&4; do
+		pls_objs=$((pls_objs + 1))
+		eq "$1 ${b%% *}" "$a" "$b"
+	done 3< "$TMP/p.ours" 4< "$TMP/p.theirs"
+	# git counts the deltas and the deepest chain from its own output: a
+	# delta line has seven fields where an entry stored whole has five, and
+	# the sixth is the chain length.
+	gd=$(awk 'NF>=7' "$TMP/p.theirs" | grep -c .)
+	gm=$(awk 'NF>=7{if($6>m)m=$6}END{print m+0}' "$TMP/p.theirs")
+	cd=$(sed -n 's/.*, \([0-9]*\) through a delta chain.*/\1/p' "$TMP/p.census")
+	cm=$(sed -n 's/.*deepest chain \([0-9]*\).*/\1/p' "$TMP/p.census")
+	eq "$1: the census agrees with git on how many entries are deltas" "$cd" "$gd"
+	eq "$1: and on the deepest chain walked" "$cm" "$gm"
+	pls_delta=$((pls_delta + gd))
+	[ "$gm" -gt "$pls_depth" ] && pls_depth=$gm
+	# The hard invariant, on the far side of the pack: every name git filed
+	# an object under is the SHA-1 of what came back out of the entry, delta
+	# chain and all.
+	eq "$1: every object hashes back to its own name" \
+		"$("$GITOBJ" packverify "$2" 2>/dev/null)" "$nobj objects, 0 mismatched"
+}
 
-# The hard invariant, on the far side of the pack: the name git filed each
-# object under has to be the SHA-1 of what came out of the entry.
-eq "every object in the pack hashes back to its own name" \
-	"$("$GITOBJ" packverify "$NDIDX" 2>/dev/null)" "$NDOBJ objects, 0 mismatched"
+# The delta-free pack first, where the census has to say that nothing took
+# the delta path at all.
+packls_vs_vpv "packls nd" "$NDIDX"
+eq "and every entry of the delta-free pack was read whole" \
+	"$(cat "$TMP/p.census")" \
+	"$NDOBJ objects, $NDOBJ read whole, 0 through a delta chain, deepest chain 0"
 
-# A delta is refused cleanly rather than half-read, and git reads the very
-# same pack perfectly. That pair is what a missing feature needs: its
-# failure mode is not an absent error message, it is a confident wrong
-# answer about something that looked close enough.
-refute "packls refuses a pack with deltas in it" "$GITOBJ" packls "$DIDX"
+# Then the pack git chose the layout for, and every pack in the corpus. The
+# sibling packs are the real evidence here: 2815 objects across eight
+# histories, chains up to 29 deep, none of it arranged by this suite.
+packls_vs_vpv "packls dd" "$DIDX"
+for i in $IDXES; do
+	packls_vs_vpv "packls $(basename "$i")" "$i"
+done
+# The guard against all of the above passing vacuously. A standalone clone
+# gets its 74 deltas and its chain of 9 from the corpus above; in the
+# collection the siblings add a few thousand more.
+[ "$pls_delta" -ge 70 ] && ok ||
+	no "only $pls_delta delta entries were read through verify-pack -v"
+[ "$pls_depth" -ge 5 ] && ok ||
+	no "the deepest chain read was only $pls_depth"
+printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
+	"$pls_objs" "$pls_delta" "$pls_depth"
+
+# REF_DELTA is the one encoding still missing, and it is refused cleanly
+# while git reads the same pack. Nothing in any corpus has one, since
+# everything in the collection was packed by `git gc`.
+#
+# These two packs are also what pins which encoding each one holds, and
+# `verify-pack -v` cannot say: it prints a delta's chain length and base
+# name whichever encoding carried them. The discriminator is the refusal.
+# `packls` reading all 121 objects of the pack above is what says its 74
+# deltas are every one an OFS_DELTA, and `packls` stopping on this one with
+# a REF_DELTA message is what says this one is not.
+RD=$TMP/packs/rd
+mkdir -p "$RD"
+RDPACK=$($GIT --git-dir="$DREPO" pack-objects --non-empty \
+	--no-delta-base-offset "$RD/rd" < "$TMP/packs/din")
+RDIDX="$RD/rd-$RDPACK.idx"
+rdelta=$(vpv "$RDIDX" | awk 'NF>=7' | grep -c .)
+[ "$rdelta" -ge 50 ] && ok ||
+	no "the no-delta-base-offset pack has only $rdelta delta entries"
+refute "packls refuses a REF_DELTA" "$GITOBJ" packls "$RDIDX"
 assert "and names the entry it stopped at" sh -c \
-	"'$GITOBJ' packls '$DIDX' 2>&1 >/dev/null | grep -Eq 'is a delta.* at [0-9]+'"
+	"'$GITOBJ' packls '$RDIDX' 2>&1 >/dev/null | grep -Eq 'REF_DELTA.* at [0-9]+'"
 assert "while git verify-pack reads that same pack" \
-	$GIT -C "$SCRATCH" verify-pack "$DIDX"
-refute "packverify refuses it too" "$GITOBJ" packverify "$DIDX"
+	$GIT -C "$SCRATCH" verify-pack "$RDIDX"
+refute "packverify refuses it too" "$GITOBJ" packverify "$RDIDX"
+
 refute "packls refuses a path that does not end in .idx" \
 	"$GITOBJ" packls "$TMP/packs/self-$SELFPACK.pack"
 refute "packls refuses an index with no pack beside it" \

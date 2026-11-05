@@ -54,6 +54,13 @@ In scope:
   seven bits per byte after that, and the zlib stream behind it, checked
   against the size the varint declared. An entry's extent comes from the
   next offset in PACK order, which is `git verify-pack -v`'s fourth column.
+* `OFS_DELTA`, whose base is a distance backwards in a varint of its own
+  where each continuation byte adds one before shifting, and the delta it
+  carries: a base size and a result size, then copy and insert instructions,
+  where a copy's offset and length come from whichever of seven following
+  bytes the instruction byte's bitmap claims are present. An absent byte is
+  0, except that an absent length is 0x10000. Chains of any depth, bounded
+  at 256 links because the reader recurses.
 * the pack v2 index: the 256-entry cumulative fanout checked against the
   sorted name list it indexes, the CRC of every object's packed bytes checked
   against the pack, and both offset encodings, including the escape into the
@@ -66,14 +73,10 @@ an audit pointed out there was no pack code in `gitobj.c` at all. The index
 was the first part of it to exist and the walk over entries stored whole is
 the second:
 
-* both delta encodings: `OFS_DELTA` with its own distinct negative-offset
-  varint, and `REF_DELTA` with a 20-byte base name. `T_OFS_DELTA = 6` and
-  `T_REF_DELTA = 7` are read now, but only far enough to refuse the entry
-  and say which offset it was at.
-* delta application: base/result size varints and the copy/insert
-  instruction stream, including the copy instruction's optional-byte bitmap
-  where an absent byte means 0 for the offset and 0x10000 for the size.
-* delta chains of any depth, where a base is itself a delta.
+* `REF_DELTA`, whose base is a 20-byte name rather than an offset, and so
+  needs the index lookup that `OFS_DELTA` does not. It is read far enough to
+  refuse the entry and say which offset it was at. Chains whose base is
+  itself a `REF_DELTA` are the same item.
 * writing anything but a loose object: no packfile writing, no
   `unpack-objects`. This said `gitobj` was read-only, which it was until
   `write` landed, and listed `mktree` among the missing until that landed
@@ -92,15 +95,13 @@ the delta chain beneath it. If a single byte of any of that is wrong the hash
 does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
-**It covers 490 of the 3184 objects the suite reads, 15%:** the 369 loose
-ones and the 121 in a pack built with `--window=0`, which holds no delta.
-None of the 2815 objects in the eight sibling packs is covered, because every
-one of those packs has a delta in it and `packverify` stops at the first one.
-This section said "loose and packed" and that was the strongest claim in the
-file and the one that was not true. The counts move with every commit or
-repack in a sibling: they were 699 of 2062 at the last commit, and the
-denominator grew rather than the numerator shrinking, since all eight
-siblings have been repacked since and hold no loose object at all now.
+**It covers every object in every corpus:** 369 loose, and 3186 read out of
+eleven packs, 1934 of those through a delta chain and 2815 of them in eight
+sibling histories. It said "loose and packed" for a good while before any
+pack code existed, which was the strongest claim in the file and the one
+that was not true; it covered 490 of 3184 one commit ago. What is still out
+of reach is an encoding no corpus contains, REF_DELTA, and a pack this suite
+cannot build, one over two gigabytes.
 
 The index has its own invariants, and they are cross-checks rather than
 hashes: the fanout must agree with the name list it indexes, the CRC must
@@ -149,22 +150,23 @@ Ranked, strongest first, by how little of it we control.
    git accepts, including for every corrupt fixture. The third builds an
    index from the pack alone, so a corpus index is compared against one git
    wrote today from the same bytes.
-6. `git verify-pack -v` over a pack with no delta in it, column for column
-   and object by object: the type and the inflated size come out of the
-   entry header, and the size in the pack out of the index's sorted offsets.
-   A pack git chose the layout for cannot be compared this way yet, so the
-   suite builds a `--window=0` one from a corpus of its own and makes git
-   assert that it really holds no delta.
+6. `git verify-pack -v`, column for column and object by object, over every
+   pack in reach: 3186 objects, 1934 of them deltas. The type and the size
+   come out of the entry header, the size in the pack out of the index's
+   sorted offsets, and the chain length and base name out of the walk down
+   the chain. The suite also builds a `--window=0` pack and has git assert
+   that it holds no delta, which is the only way the whole-entry path is
+   distinguished from the delta path in the comparison.
 7. ASan + UBSan over the whole suite (`make test-asan`), with both the index
    and the pack trimmed to exactly the bytes read, since `readall()` doubles
    and a buffer bigger than its data turns the sanitizer off.
 
 Item 3 was one of four oracles struck off this list for not existing, and
 items 5 and 6 are a second one arriving in pieces. What is missing from item
-6 is every object git chose to delta, which is most of every real pack. The
-other two struck-off oracles still do not exist: repacking for encodings the
-corpus lacks, and a mutation sweep driven from the suite rather than by
-hand.
+6 is REF_DELTA, which no corpus here contains. Repacking for an encoding the
+corpus lacks was one of the other two struck-off oracles and now exists, as
+the `--no-delta-base-offset` and `--window=0` fixtures. The last one still
+missing is a mutation sweep driven from the suite rather than by hand.
 
 ## Non-goals
 
@@ -382,13 +384,60 @@ hand.
       opened, so the bound only matters to a varint or a zlib stream that
       runs off the end of the LAST entry, and no fixture does that. It
       belongs to the refusals item below.
-- [ ] OFS_DELTA: the negative-offset varint
+- [x] OFS_DELTA: the negative-offset varint
       why: a *different* varint from the size encoding, and the one most
       readers get wrong: `(ofs + 1) << 7`, not a plain shift.
-- [ ] delta application: the copy/insert instruction stream
+- [x] delta application: the copy/insert instruction stream
       why: the optional-byte bitmap with its 0 and 0x10000 defaults is the
       other classic bug, and refusing an oversized result size belongs in
       the same commit as the allocation it guards.
+      files: gitobj.c (DELTA_MAX_DEPTH, the Ent struct, pack_ord,
+      pack_census, pack_ofs_delta, delta_size, delta_apply, and pack_at
+      grown into a recursion), t/run.sh section 9, README.md
+      proves: `gitobj packls` is byte-identical to `git verify-pack -v`
+      over all eleven packs in reach, compared per object: 3186 objects,
+      1934 of them deltas, chains up to 29 deep, 2815 of the objects in
+      eight sibling histories nothing here arranged. All 3186 hash back to
+      their own names, which is the hard invariant reaching packed objects
+      for the first time. The census of how many entries took the delta
+      path, and of the deepest chain walked, is compared against git's own
+      figures out of `verify-pack -v`'s field count and sixth column, so a
+      run in which the delta code never fired could not agree.
+      5358 assertions before, 8477 after; 2471 to 2735 cloned alone, which
+      is the number to quote.
+      found: `verify-pack -v`'s size column for a delta entry is the length
+      of the DELTA DATA, not of the object the delta produces. Its type
+      column is the resolved type. So the line mixes what the entry says
+      with what it decodes to, and printing the resolved size there
+      disagrees with git on every delta in every pack.
+      found: plumbing `pack-objects` writes REF_DELTA. It leaves
+      `pack.useDeltaBaseOffset` off where `git gc` and `git repack` pass
+      `--delta-base-offset`, so every pack in the collection is OFS_DELTA
+      and the fixture built to exercise OFS_DELTA was the other encoding
+      entirely. The section went red because REF_DELTA is still refused,
+      which is the only reason it did not pass as an OFS_DELTA test that
+      never read an OFS_DELTA. That refusal is also what pins the encoding
+      of each fixture, since `verify-pack -v` prints a chain length and a
+      base name whichever encoding carried them.
+      found: the corpus could not reach the copy instruction's implicit
+      length of 0x10000. git's encoder omits a copy's length bytes for
+      exactly that value and splits any longer run into pieces of it, so it
+      needs a base of at least 64KB, and the fixture's blobs were 400 lines
+      each. Taking the absent length as 0 died in the collection, where cc
+      has big blobs, and SURVIVED in a standalone clone. Three revisions of
+      a 20000-line file are in the fixture now and it dies in both.
+      found: fourteen planted defects, eleven red, counting the pack walk's
+      seven again against the bigger suite. The OFS_DELTA varint without
+      its `+ 1` fails 45 assertions, the copy bitmap read as three offset
+      bytes and four length bytes fails 45, a delta header varint shifted
+      by 8 instead of 7 fails 45, an absent copy length taken as 0 fails
+      10, and a chain length reported as 1 for every delta fails 680, one
+      per delta entry in the corpus.
+      survivor: the delta's declared base size, checked against the base,
+      and its declared result size, checked against what was produced.
+      Neither can fire on a delta git wrote, so both want a pack built by
+      hand, which is the refusals item below. Recorded in the README rather
+      than counted as covered.
 - [ ] REF_DELTA, and chains whose base is itself a delta
       why: the corpus has no REF_DELTA in it, so the suite has to make git
       produce one; depth is only meaningfully tested past 2.
