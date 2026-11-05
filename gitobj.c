@@ -1147,22 +1147,6 @@ static int pofscmp(const void *a, const void *b) {
  * explicit stack of offsets would lift it, and nothing needs that yet. */
 #define DELTA_MAX_DEPTH 256
 
-typedef struct {
-	Idx x;
-	Buf pk;
-	Pofs *ord;          /* every offset, in pack order, with its index entry */
-	/* The census, counted for the object asked for rather than for the
-	 * bases underneath it: a delta test over a pack with no deltas in it
-	 * passes while reading nothing, and so does one over a pack whose
-	 * chains are all of length 1. */
-	size_t nbase, ndelta, maxdepth;
-	/* Links rather than objects: one per delta applied, at every level of
-	 * every chain. The two encodings are counted apart because nothing in
-	 * git's output tells them apart, so this is the only thing that can say
-	 * a REF_DELTA fixture really holds REF_DELTAs. */
-	size_t nofs, nref;
-} Pack;
-
 /* What an entry says about itself, as opposed to what it decodes to.
  * `git verify-pack -v` prints a mixture of the two and the mixture is not
  * arbitrary: the type is the one at the END of the chain, because a delta
@@ -1176,6 +1160,60 @@ typedef struct {
 	unsigned chain;      /* links to an entry stored whole; 0 if it is one */
 	uint64_t base;       /* the immediate base's offset, when chain > 0 */
 } Ent;
+
+/* A cache of resolved objects, keyed on pack offset, so that a base shared
+ * by several deltas is inflated once rather than once per delta on it.
+ * Without it a chain of depth N costs N inflations for every object on it
+ * and walking a pack is O(objects * chain depth): 1923 inflations for cc's
+ * 538 objects, where git does 538.
+ *
+ * It holds BASES only. A cache consulted for the object actually asked for
+ * would make a walk over a whole pack answer out of itself after the first
+ * pass, and `packverify` would then be hashing the cache rather than the
+ * pack.
+ *
+ * PLAN.md asked for four entries, on the reasoning that git's delta window
+ * keeps a base within a few entries of the deltas on it. Four does almost
+ * nothing: measured over cc's 538 objects, 1771 inflations against 1856
+ * without any cache at all. The reasoning was about the pack LAYOUT and the
+ * cost is in the chain DEPTH, which reaches 29 there, so a four-entry cache
+ * is flushed by every object it resolves. 16 entries gives 1033 inflations,
+ * 64 gives 729, and 256 gives 719, so 64 is where it stops paying.
+ *
+ * shortcut: a linear scan over the slots, and whichever was used longest ago
+ * goes. 64 slots is 64 comparisons per lookup, which is nothing beside an
+ * inflate, and a heap would be the wrong trade until the cache is much
+ * bigger. The byte budget is not a shortcut: one entry can be an OBJ_MAX
+ * object and the sizes are chosen by whoever wrote the pack. */
+#define DBASE_N 64
+#define DBASE_MAX ((size_t)16 << 20)
+
+typedef struct {
+	uint64_t off;       /* 0 for an empty slot; a real offset is never 0 */
+	Ent ent;
+	Buf data;
+	unsigned long used;
+} Dbase;
+
+typedef struct {
+	Idx x;
+	Buf pk;
+	Pofs *ord;          /* every offset, in pack order, with its index entry */
+	Dbase cache[DBASE_N];
+	size_t cbytes;
+	unsigned long clock;
+	size_t ninflate, nhit;
+	/* The census, counted for the object asked for rather than for the
+	 * bases underneath it: a delta test over a pack with no deltas in it
+	 * passes while reading nothing, and so does one over a pack whose
+	 * chains are all of length 1. */
+	size_t nbase, ndelta, maxdepth;
+	/* Links rather than objects: one per delta applied, at every level of
+	 * every chain. The two encodings are counted apart because nothing in
+	 * git's output tells them apart, so this is the only thing that can say
+	 * a REF_DELTA fixture really holds REF_DELTAs. */
+	size_t nofs, nref;
+} Pack;
 
 /* Open an index and the pack beside it, and check the two against each
  * other: the object count in the pack header, the pack's own trailing
@@ -1229,6 +1267,8 @@ static void pack_open(const char *idxpath, Pack *p) {
 }
 
 static void pack_close(Pack *p) {
+	for (int i = 0; i < DBASE_N; i++) bfree(&p->cache[i].data);
+	p->cbytes = 0;
 	free(p->ord);
 	bfree(&p->pk);
 	bfree(&p->x.raw);
@@ -1295,8 +1335,59 @@ static const char *pack_entry_hdr(const uint8_t *p, size_t n, size_t *at,
  * was. On stderr, so stdout stays byte-comparable with git's output. */
 static void pack_census(const Pack *p) {
 	fprintf(stderr, "%zu objects, %zu read whole, %zu through a delta chain, "
-	        "deepest chain %zu, %zu ofs-delta and %zu ref-delta links\n",
-	        p->x.n, p->nbase, p->ndelta, p->maxdepth, p->nofs, p->nref);
+	        "deepest chain %zu, %zu ofs-delta and %zu ref-delta links, "
+	        "%zu inflations and %zu base-cache hits\n",
+	        p->x.n, p->nbase, p->ndelta, p->maxdepth, p->nofs, p->nref,
+	        p->ninflate, p->nhit);
+}
+
+/* A hit hands back a COPY, because the caller owns and frees what it gets,
+ * and it hands back the ENTRY FACTS too. Those are not re-derivable from the
+ * bytes: a cached object has no entry to read a declared size or a chain
+ * length out of, so a cache that returned only the data left the type at 0
+ * and every chain length at 1. That was 85 of cc's 538 objects hashing to
+ * nothing, which is how this was found. */
+static int dbase_get(Pack *p, uint64_t off, Obj *out, Ent *ent) {
+	for (int i = 0; i < DBASE_N; i++) {
+		if (p->cache[i].off != off) continue;
+		p->cache[i].used = ++p->clock;
+		p->nhit++;
+		*ent = p->cache[i].ent;
+		out->type = p->cache[i].ent.type;
+		out->data.p = NULL;
+		out->data.n = out->data.cap = 0;
+		bwrite(&out->data, p->cache[i].data.p, p->cache[i].data.n);
+		return 1;
+	}
+	return 0;
+}
+
+static void dbase_evict(Pack *p) {
+	int v = -1;
+	for (int i = 0; i < DBASE_N; i++)
+		if (p->cache[i].off && (v < 0 || p->cache[i].used < p->cache[v].used))
+			v = i;
+	if (v < 0) return;
+	p->cbytes -= p->cache[v].data.n;
+	bfree(&p->cache[v].data);
+	p->cache[v].off = 0;
+}
+
+static void dbase_put(Pack *p, uint64_t off, const Obj *o, const Ent *ent) {
+	if (o->data.n > DBASE_MAX) return;
+	int v;
+	for (;;) {
+		v = -1;
+		for (int i = 0; i < DBASE_N; i++)
+			if (!p->cache[i].off) { v = i; break; }
+		if (v >= 0 && p->cbytes + o->data.n <= DBASE_MAX) break;
+		dbase_evict(p);
+	}
+	p->cache[v].off = off;
+	p->cache[v].ent = *ent;
+	p->cache[v].used = ++p->clock;
+	bwrite(&p->cache[v].data, o->data.p, o->data.n);
+	p->cbytes += o->data.n;
 }
 
 /* Find a name in the index. The fanout gives the half-open range of entries
@@ -1420,11 +1511,30 @@ static const char *delta_apply(const uint8_t *d, size_t dn,
  * the same way. The type comes back from the end of the chain: a delta entry
  * does not carry one.
  *
- * shortcut: no base cache, so a chain of depth N costs N inflations for
- * every object on it and walking a whole pack is O(objects * depth). The
- * four-entry LRU that fixes it is in PLAN.md's Milestone 1. */
+ * The census is kept here rather than in pack_resolve below, so that it
+ * counts the object asked for and not the bases underneath it. */
+static const char *pack_resolve(Pack *p, uint64_t off, Obj *out, Ent *me,
+                                unsigned depth);
+
 static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
                            unsigned depth) {
+	Ent me = {0, 0, 0, 0};
+	const char *e = pack_resolve(p, off, out, &me, depth);
+	if (e) return e;
+	if (!depth) {
+		/* The chain length as the entry reports it, not the recursion
+		 * depth: with the base cache a chain can be resolved without the
+		 * recursion ever reaching its far end. */
+		if (me.chain > p->maxdepth) p->maxdepth = me.chain;
+		if (me.chain) p->ndelta++;
+		else p->nbase++;
+	}
+	if (ent) *ent = me;
+	return NULL;
+}
+
+static const char *pack_resolve(Pack *p, uint64_t off, Obj *out, Ent *me,
+                                unsigned depth) {
 	const uint8_t *q = p->pk.p;
 	/* The trailer is not entry data, so it is not part of what a varint or
 	 * a zlib stream is allowed to read into. */
@@ -1432,6 +1542,9 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 	if (depth > DELTA_MAX_DEPTH)
 		return "delta chain is deeper than gitobj will follow";
 	if (off < PACK_HDR || off >= n) return "pack offset is outside the pack";
+	/* Bases only, which is what `depth` says: the object the caller asked
+	 * for is always read out of the pack. */
+	if (depth && dbase_get(p, off, out, me)) return NULL;
 	size_t at = (size_t)off;
 	int t;
 	size_t sz;
@@ -1469,6 +1582,7 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 
 	Buf z = {0};
 	size_t used = 0;
+	p->ninflate++;
 	if ((e = zinflate(q + at, n - at, &z, &used))) { bfree(&z); return e; }
 	/* The declared size is checked against what inflated. git stores both,
 	 * and a reader that trusts the varint reports a length the data does
@@ -1479,11 +1593,11 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 		return "pack entry inflated to a size other than the one it declares";
 	}
 	if (!isdelta) {
-		if (depth > p->maxdepth) p->maxdepth = depth;
-		if (!depth) p->nbase++;
-		if (ent) { ent->type = t; ent->declared = sz; ent->chain = 0; ent->base = 0; }
+		me->type = t;
+		me->declared = sz;
 		out->type = t;
 		out->data = z;
+		if (depth) dbase_put(p, off, out, me);
 		return NULL;
 	}
 
@@ -1495,15 +1609,13 @@ static const char *pack_at(Pack *p, uint64_t off, Obj *out, Ent *ent,
 	bfree(&z);
 	bfree(&base.data);
 	if (e) { bfree(&res); return e; }
-	if (!depth) p->ndelta++;
-	if (ent) {
-		ent->type = bent.type;
-		ent->declared = sz;
-		ent->chain = bent.chain + 1;
-		ent->base = boff;
-	}
+	me->type = bent.type;
+	me->declared = sz;
+	me->chain = bent.chain + 1;
+	me->base = boff;
 	out->type = bent.type;
 	out->data = res;
+	if (depth) dbase_put(p, off, out, me);
 	return NULL;
 }
 

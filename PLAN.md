@@ -189,10 +189,12 @@ by hand.
   stored blocks, which git reads perfectly and which grow the file by ~0.03%:
   five bytes of block header per 65535 of payload, plus six of framing. That
   is the whole of the compression side, and Milestone 1 is where it changes.
-* Being fast. When there is a pack reader, every object will be inflated
-  from scratch with no delta base cache, so walking a pack will be
-  O(objects * chain depth) inflations. There is no pack reader either; this
-  file says so at the top and then described both in the present tense.
+* Being fast. Every object is inflated from scratch, and a delta is
+  re-applied for every object on its chain whose base has dropped out of the
+  64-entry base cache: 4260 inflations over the whole suite where no cache
+  needs 8791 and git needs one per object. A command that wants one object
+  opens every pack in the store to find it. This used to say there was no
+  pack reader and then describe one in the present tense.
 
 ## Commit sequence
 
@@ -602,11 +604,53 @@ by hand.
       why: stored blocks mean `gitobj write` produces a loose object ~1.0003x
       the payload size where git produces ~0.3x. git reads it, so nothing is
       broken, but no one would use this to write a real repository.
-- [ ] a delta base cache, so a chain of depth N costs N inflations once,
+- [x] a delta base cache, so a chain of depth N costs N inflations once,
   not N inflations per object in it
       why: `packls` over a whole pack would be the slowest thing in the
       suite, and the fix is a four-entry LRU keyed on pack offset. (`packls`
       does not exist; see the note at the head of this file.)
+      files: gitobj.c (DBASE_N, DBASE_MAX, Dbase, dbase_get, dbase_evict,
+      dbase_put, and pack_at split into a census wrapper around
+      pack_resolve), t/run.sh sections 9 and 10, README.md
+      proves: three things per pack read, every one of them a number rather
+      than a claim. That every entry reached was either inflated or found in
+      the cache, which is arithmetic over the census. That the inflations
+      never fall BELOW the object count, since a cache answering for the
+      object asked for would let a walk over a pack answer out of itself and
+      `packverify` would be hashing the cache. And that the inflations come
+      to fewer than git's own sum of chain lengths plus the object count,
+      which is what the walk costs with no cache, so the saving is measured
+      against git. Over the whole suite: 4260 inflations and 1615 hits where
+      no cache needs 8791.
+      17099 assertions before, 17153 after; 4486 to 4516 cloned alone.
+      found: four entries does almost nothing. 1771 inflations against 1856
+      without any cache, over cc. The why: this item's reasoning was about
+      the pack LAYOUT, where git keeps a base near its deltas, and the cost
+      is in the chain DEPTH, which reaches 29 there, so every object
+      resolved flushes a four-entry cache on the way down. 16 entries gives
+      1033, 64 gives 729, 256 gives 719. It is 64 with a 16MB budget, and a
+      whole-pack walk over cc goes from 0.41s to 0.26s.
+      found: a cached base has no entry header left to read, so caching the
+      bytes alone left every cached base with type 0 and every chain length
+      at 1. 85 of cc's 538 objects hashed to nothing and the depth column
+      disagreed with git on every delta. The cache stores the entry facts
+      beside the bytes.
+      found: no pack-order walk can see the rule that the cache holds bases
+      only, because an OFS_DELTA base is always earlier in the pack and so
+      is never the object asked for next. Only a REF_DELTA can name a base
+      that comes AFTER it, and nothing git packs here does, so there is a
+      hand-built pack of two entries for it: a REF_DELTA followed by its own
+      base, which git accepts. One assertion in the suite notices that
+      mutation and it is that fixture's census.
+      found: four planted defects, two red. A cache keyed on nothing, so
+      any entry matches, fails 118 assertions beginning with `gitobj
+      verify` over the siblings; removing the cache fails 12, all of them
+      the saving-against-git check.
+      survivor: both halves of the byte budget, never evicting and refusing
+      to cache an object bigger than the whole budget. No corpus here has
+      16MB of live bases, so neither is observable. They bound memory
+      against sizes chosen by whoever wrote the pack, which is a reason to
+      have them rather than a reason a test can see them.
 - [ ] an index git itself wrote with a 64-bit offset in it
       why: the escape is exercised now, by an index the suite rewrites so
       that git resolves a real pack through the table and by offsets written

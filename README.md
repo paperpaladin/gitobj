@@ -35,12 +35,13 @@ read 10 pack indexes, 3061 objects
 3173 objects read through a 32-bit offset, 134 through the 64-bit table
 the delta corpus: 124 objects, 79 delta entries, deepest chain 15
 pack fuzz: 300 mutants, 299 refused for 13 distinct reasons, 1 still readable, all agreeing with git
-packls: 3436 objects against verify-pack -v, 2018 of them deltas, deepest chain 29
-17099 passed, 0 failed
+packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 29
+base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
+17153 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
-and the two are byte-identical over all fourteen packs in reach. The columns
+and the two are byte-identical over all fifteen packs in reach. The columns
 are not all of one kind and the mixture is not arbitrary: the type is the one
 at the END of a delta chain, since a delta entry carries none of its own,
 while the size is the one THAT entry declares, which for a delta is the
@@ -57,7 +58,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **4486 passed**, against five bare
+Cloned on its own this suite reports **4516 passed**, against five bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -74,12 +75,12 @@ because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 17099 above, because the sibling
+Inside the collection it reports more: 17153 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-4486: the one a reader gets by cloning this repository and running `make
+4516: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -455,20 +456,64 @@ them under. This one is also the clearest measure of what the suite has
 grown into rather than of the defect, because the same sabotage failed 45
 assertions three commits ago, before `ls` and `verify` read packs at all.
 
+## The base cache, and why four entries were not enough
+
+A chain of depth N costs N inflations for every object on it, so walking a
+whole pack is O(objects times chain depth): 1856 entry reads for cc's 538
+objects, where git does 538. `PLAN.md` asked for a four-entry cache keyed on
+pack offset, on the reasoning that git's delta window keeps a base within a
+few entries of the deltas on it.
+
+Four entries does almost nothing. Measured over cc: 1771 inflations against
+1856 with no cache at all, a saving of 5%. The reasoning was about the pack
+LAYOUT and the cost is in the chain DEPTH, which reaches 29 there, so every
+object resolved flushes a four-entry cache on its way down. 16 entries gives
+1033, 64 gives 729, and 256 gives 719, so 64 is where it stops paying. With
+64 and a 16MB budget, a whole-pack walk over cc goes from 0.41s to 0.26s.
+
+The cache holds BASES only, never the object actually asked for. That is not
+an optimisation detail: a cache consulted for the asked-for object would let
+a walk over a pack answer out of itself, and `packverify` would then be
+hashing the cache rather than the pack.
+
+Nothing in a pack-order walk can see that rule, though, because an
+`OFS_DELTA` base is always earlier in the pack and so is never the object
+asked for next. Only a `REF_DELTA` can name a base that comes AFTER it, and
+nothing git packs here does. So there is a hand-built pack of two entries, a
+`REF_DELTA` followed by its own base, which git accepts; with the rule
+removed, reading it inflates one entry and takes a cache hit where it should
+inflate both, and that is the one assertion in the suite that notices.
+
+Three things are asserted about the cache for every pack read. That every
+entry reached was either inflated or found in the cache, which is arithmetic
+and catches an accounting slip. That the inflations never fall below the
+object count, which is the rule above. And that the inflations come to fewer
+than git's own sum of chain lengths plus the object count, which is what the
+walk would cost with no cache, so the saving is measured against git rather
+than asserted to exist.
+
+Four mutations, two red. A cache keyed on nothing, so that any entry
+matches, fails 118 assertions, beginning with `gitobj verify` over the
+siblings. Removing the cache entirely fails 12, all of them the
+saving-against-git check. The two survivors are both the byte budget:
+never evicting, and caching an object too big for the budget, are both
+invisible because no corpus here has 16MB of live bases. They are a
+resource bound on sizes chosen by whoever wrote the pack, which is a reason
+to have them and not a reason a test can see them.
+
+The first version of this cache was wrong in a way worth keeping. A cached
+entry has no entry header left to read, so caching the bytes alone left
+every cached base with type 0 and every chain length at 1: 85 of cc's 538
+objects hashed to nothing, and the depth column disagreed with git on every
+delta. The cache stores the entry facts beside the bytes now.
+
 ## What does not work
 
-There is no delta base cache, so a chain of depth N costs N inflations for
-every object on it. `packls` over cc's 538 objects does 1923 inflations where
-git would do 538, which is why it is still fast enough not to matter at this
-size and will matter at a bigger one. It is a four-entry LRU keyed on pack
-offset, in Milestone 1.
-
-The hard invariant, that every object read hashes back to its own name, now
-covers every object in every corpus: 369 loose, and 3433 read out of thirteen
-packs, 2016 of those through a delta chain. It said 490 of 3184 three commits
-ago. What it does not cover is a pack this suite cannot build, which is one
-over two gigabytes, and a pack built to be wrong rather than by git, which is
-the refusals item.
+The hard invariant, that every object read hashes back to its own name,
+covers every object in every corpus: 369 loose, and 3438 read out of fifteen
+packs, 2019 of those through a delta chain. It said 490 of 3184 four commits
+ago. The one thing it does not cover is a pack over two gigabytes, which this
+suite cannot build.
 
 `gitobj ls` and `gitobj verify` read a whole object store now, loose files
 and packs together, and an object that is in both is listed once. `gitobj
@@ -538,10 +583,10 @@ or partial clones, no alternates. No v1 pack index: it is refused by name
 rather than read, since it has no CRCs and git has not written one since
 2007.
 
-Not fast. Every object is inflated from scratch, every delta in a chain is
-re-applied for every object on that chain, and a command that wants one
-object opens every pack in the store. `make test` takes 34 seconds, where it
-took 10 before it read any packs.
+Not fast. Every object is inflated from scratch, a delta is re-applied for
+every object on its chain whose base has fallen out of the cache, and a
+command that wants one object opens every pack in the store. `make test`
+takes 33 seconds, where it took 10 before it read any packs.
 
 ## Why this file exists
 

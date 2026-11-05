@@ -1680,6 +1680,9 @@ PYEDIT
 pls_objs=0
 pls_delta=0
 pls_depth=0
+pls_inf=0
+pls_hit=0
+pls_nocache=0
 last_ofs=0
 last_ref=0
 packls_vs_vpv() { # <label> <idx>
@@ -1711,6 +1714,40 @@ packls_vs_vpv() { # <label> <idx>
 	last_ref=$(sed -n 's/.*and \([0-9]*\) ref-delta links.*/\1/p' "$TMP/p.census")
 	pls_delta=$((pls_delta + gd))
 	[ "$gm" -gt "$pls_depth" ] && pls_depth=$gm
+	# The base cache, against arithmetic and against git. Every entry the
+	# reader reaches is either inflated or served from the cache, so those
+	# two counts have to add up to the objects plus the links walked; the
+	# inflations can never fall below the object count, because a cache
+	# that answered for the object ASKED for would make a walk over a pack
+	# answer out of itself; and git's own sum of chain lengths is what the
+	# walk would cost with no cache at all, so the saving is measured
+	# rather than asserted to exist.
+	local cinf chit cofs cref gsum
+	cinf=$(sed -n 's/.*, \([0-9]*\) inflations.*/\1/p' "$TMP/p.census")
+	chit=$(sed -n 's/.*and \([0-9]*\) base-cache hits.*/\1/p' "$TMP/p.census")
+	cofs=$(sed -n 's/.*, \([0-9]*\) ofs-delta and.*/\1/p' "$TMP/p.census")
+	cref=$(sed -n 's/.*and \([0-9]*\) ref-delta links.*/\1/p' "$TMP/p.census")
+	gsum=$(awk 'NF>=7{s+=$6}END{print s+0}' "$TMP/p.theirs")
+	eq "$1: every entry reached was either inflated or found in the cache" \
+		"$((cinf + chit))" "$((nobj + cofs + cref))"
+	if [ "$cinf" -ge "$nobj" ]; then ok
+	else no "$1: $cinf inflations for $nobj objects, so the cache answered for an object rather than a base"; fi
+	if [ "$gsum" -eq 0 ]; then
+		eq "$1: a pack with no delta needs no cache hit" "$chit" 0
+	elif [ "$gd" -lt 20 ]; then
+		# Too few deltas for a cache to have anything to save: a base read
+		# once is a base read once. All that is asked here is that the
+		# cache has not made it worse.
+		if [ "$cinf" -le "$((nobj + gsum))" ]; then ok
+		else no "$1: $cinf inflations where no cache at all needs $((nobj + gsum))"; fi
+	elif [ "$cinf" -lt "$((nobj + gsum))" ]; then
+		ok
+	else
+		no "$1: the base cache saved nothing: $cinf inflations where git's chain lengths say $((nobj + gsum))"
+	fi
+	pls_inf=$((pls_inf + cinf))
+	pls_hit=$((pls_hit + chit))
+	pls_nocache=$((pls_nocache + nobj + gsum))
 	# The hard invariant, on the far side of the pack: every name git filed
 	# an object under is the SHA-1 of what came back out of the entry, delta
 	# chain and all.
@@ -1723,7 +1760,7 @@ packls_vs_vpv() { # <label> <idx>
 packls_vs_vpv "packls nd" "$NDIDX"
 eq "and every entry of the delta-free pack was read whole" \
 	"$(cat "$TMP/p.census")" \
-	"$NDOBJ objects, $NDOBJ read whole, 0 through a delta chain, deepest chain 0, 0 ofs-delta and 0 ref-delta links"
+	"$NDOBJ objects, $NDOBJ read whole, 0 through a delta chain, deepest chain 0, 0 ofs-delta and 0 ref-delta links, $NDOBJ inflations and 0 base-cache hits"
 
 # Then the pack git chose the layout for, and every pack in the corpus. The
 # sibling packs are the real evidence here: 2815 objects across eight
@@ -1942,29 +1979,41 @@ def build(spec, kind, flip=None):
 
     flip is (offset, mask), applied to the pack body before either checksum
     or any CRC is computed, so a flipped byte is the fixture's only lie."""
-    content = []
-    types = []
-    payload = []
-    etype = []
+    n = len(spec)
+    content = [None] * n
+    types = [None] * n
+    payload = [None] * n
+    etype = [None] * n
     for i, e in enumerate(spec):
         if 'data' in e:
-            content.append(e['data'])
-            types.append(e['type'])
-            payload.append(e['data'])
-            etype.append(e['type'])
-        else:
+            content[i] = e['data']
+            types[i] = e['type']
+            payload[i] = e['data']
+            etype[i] = e['type']
+    # Resolved in dependency order rather than in pack order, because a
+    # REF_DELTA may name a base that comes AFTER it in the pack: the base is
+    # found by hash, not by position.
+    todo = True
+    while todo:
+        todo = False
+        for i, e in enumerate(spec):
+            if content[i] is not None:
+                continue
             b = e['base']
+            if content[b] is None:
+                todo = True
+                continue
             res = apply_instr(content[b], e['instr'])
-            content.append(res)
-            types.append(types[b])
+            content[i] = res
+            types[i] = types[b]
             bs = e.get('base_size', len(content[b]))
             rs = e.get('res_size', len(res))
-            d = dvarint(bs) + dvarint(rs) + b''.join(
+            payload[i] = dvarint(bs) + dvarint(rs) + b''.join(
                 op[1] if op[0] == 'raw' else
                 copy(op[1], op[2]) if op[0] == 'copy' else insert(op[1])
                 for op in e['instr'])
-            payload.append(d)
-            etype.append(6 if e['how'] == 'ofs' else 7)
+            etype[i] = 6 if e['how'] == 'ofs' else 7
+    assert all(c is not None for c in content), 'a delta base that is not there'
 
     names = [oid(types[i], content[i]) for i in range(len(spec))]
 
@@ -2037,6 +2086,18 @@ def order_next(offs, i):
 # both encodings and a base that is itself a delta.
 BIG = bytes(bytearray((i * 7 + 11) & 0xff for i in range(70000)))
 
+# A REF_DELTA whose base comes AFTER it in the pack, which only a REF_DELTA
+# can do. It is the one shape in which an object is asked for by name having
+# already been read as somebody's base, so it is the only thing that can see
+# whether the base cache answers for the object asked for or only for bases.
+SPEC_FWD = [
+    {'how': 'ref', 'base': 1, 'instr': [
+        ('copy', 0, 1024),
+        ('insert', b'a REF_DELTA that comes before its own base'),
+    ]},
+    {'type': 3, 'data': BIG},
+]
+
 SPEC = [
     {'type': 3, 'data': BIG},
     {'how': 'ofs', 'base': 0, 'instr': [
@@ -2073,7 +2134,7 @@ if __name__ == '__main__':
             open('%s/pack-f%d.idx' % (outdir, i), 'wb').write(ix)
         raise SystemExit(0)
     outpack, outidx = sys.argv[2], sys.argv[3]
-    spec = [dict(e) for e in SPEC]
+    spec = [dict(e) for e in (SPEC_FWD if kind == 'reffwd' else SPEC)]
     if kind == 'basesize':
         spec[1]['base_size'] = len(BIG) + 1
     elif kind == 'ressize':
@@ -2090,8 +2151,8 @@ if __name__ == '__main__':
         spec[1]['instr'] = spec[1]['instr'] + [('raw', b'\0')]
     elif kind == 'copyout':
         spec[1]['instr'] = [('copy', len(BIG) - 8, 16)]
-    elif kind not in ('ok', 'trunc', 'bigsize', 'ofszero', 'ofspast',
-                      'refself'):
+    elif kind not in ('ok', 'reffwd', 'trunc', 'bigsize', 'ofszero',
+                      'ofspast', 'refself'):
         raise SystemExit('unknown pack fixture ' + kind)
     pack, idx = build(spec, kind)
     open(outpack, 'wb').write(pack)
@@ -2118,7 +2179,7 @@ packls_vs_vpv "packls gen" "$PG/pack-g.idx"
 # bytes absent, which is the implicit default.
 eq "the hand-built pack holds both encodings and a chain of two" \
 	"$(cat "$TMP/p.census")" \
-	"3 objects, 1 read whole, 2 through a delta chain, deepest chain 2, 2 ofs-delta and 1 ref-delta links"
+	"3 objects, 1 read whole, 2 through a delta chain, deepest chain 2, 2 ofs-delta and 1 ref-delta links, 5 inflations and 1 base-cache hits"
 # git on the far side of the chain: a repository whose only object source is
 # this pack, read by git.
 GREPO=$PG/repo
@@ -2135,6 +2196,21 @@ assert "and hands back the same bytes we do for the end of the chain" \
 $GIT --git-dir="$GREPO" fsck > "$TMP/fsck.out" 2>&1
 assert "git fsck is clean over the hand-built pack" sh -c \
 	"! grep -Eiv '^(notice|dangling)' '$TMP/fsck.out' | grep -q ."
+
+# A REF_DELTA that comes BEFORE its base, which no OFS_DELTA can be and
+# which nothing git packs here is. It is the only shape in which an object is
+# asked for by name after having already been read as another object's base,
+# and so the only one that can tell whether the base cache answers for the
+# object asked for or only for bases. Serving the asked-for object out of the
+# cache would make a walk over a pack answer out of itself, and `packverify`
+# would then be hashing the cache.
+python3 "$TMP/packgen.py" reffwd "$PG/pack-f.pack" "$PG/pack-f.idx"
+assert "git verify-pack accepts a REF_DELTA that precedes its base" \
+	$GIT -C "$SCRATCH" verify-pack "$PG/pack-f.idx"
+packls_vs_vpv "packls reffwd" "$PG/pack-f.idx"
+eq "and reading it inflates both entries rather than one and a cache hit" \
+	"$(cat "$TMP/p.census")" \
+	"2 objects, 1 read whole, 1 through a delta chain, deepest chain 1, 0 ofs-delta and 1 ref-delta links, 3 inflations and 0 base-cache hits"
 
 # One lie each, and git must call each one a lie too. The message is
 # asserted, not only the status: every one of these refusals would otherwise
@@ -2235,6 +2311,8 @@ printf 'pack fuzz: %d mutants, %d refused for %d distinct reasons, %d still read
 	no "the deepest chain read was only $pls_depth"
 printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
 	"$pls_objs" "$pls_delta" "$pls_depth"
+printf 'base cache: %d inflations and %d hits, against %d inflations with no cache\n' \
+	"$pls_inf" "$pls_hit" "$pls_nocache"
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
