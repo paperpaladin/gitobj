@@ -37,7 +37,7 @@ the delta corpus: 124 objects, 79 delta entries, deepest chain 15
 pack fuzz: 300 mutants, 299 refused for 13 distinct reasons, 1 still readable, all agreeing with git
 packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 29
 base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
-17153 passed, 0 failed
+17195 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
@@ -58,7 +58,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **4516 passed**, against five bare
+Cloned on its own this suite reports **4558 passed**, against five bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -75,12 +75,12 @@ because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 17153 above, because the sibling
+Inside the collection it reports more: 17195 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-4516: the one a reader gets by cloning this repository and running `make
+4558: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -507,6 +507,49 @@ every cached base with type 0 and every chain length at 1: 85 of cc's 538
 objects hashed to nothing, and the depth column disagreed with git on every
 delta. The cache stores the entry facts beside the bytes now.
 
+## A store that borrows another one
+
+`objects/info/alternates` lists other object directories to look in, one per
+line. `git clone -s` writes it and most CI caches look like it, and an object
+in an alternate is in the repository as far as every git command is
+concerned, `cat-file --batch-all-objects` included. A reader that ignores the
+file reports "object not found" for a repository git reads perfectly, which
+is what this one did until now.
+
+The fixture is git's own doing rather than a line this suite composed: `git
+clone -s --bare` of a self corpus repository, done twice, once where the
+source is loose and once where it is packed. The borrowing clone is checked
+for having no object and no pack of its own, because without that the
+comparison could be passing on a copy. Then `git cat-file
+--batch-all-objects --batch-check` against `gitobj ls` line for line, and
+`gitobj verify` over all 123.
+
+Five more shapes, all of them hand-written because git only ever writes the
+first. A relative path, which resolves against the objects directory holding
+the file and not against the current directory. A chain of three, since an
+alternate may have alternates of its own. A cycle. The same cycle spelled
+with relative paths. And a file holding a comment, a blank line and a
+directory that is not there, where git complains about the one it cannot use
+and carries on: that complaint is an assertion here rather than noise in the
+output, because carrying on is the behaviour being matched.
+
+The two cycle guards catch different things, and finding that out took
+planting them. A directory already in the list is not searched again, which
+ends a cycle spelled the same way round both times. A de-duplicated LIST is
+not the same thing as a terminating WALK, and the first version here only
+had the former: it skipped the duplicate entry and then read that
+directory's alternates file again anyway, so a two-repository cycle
+recursed until the stack ran out. The depth limit of five, which is git's
+own, is what ends a cycle spelled two ways, and relative paths make that
+easy since each hop appends to the path and no two strings are ever equal.
+
+Five mutations, four red. Ignoring the file fails 15 assertions, resolving a
+relative path against the current directory fails 4, reading only the first
+line fails 4, and dropping the depth limit fails 3, one of which is a
+segfault rather than a wrong answer. The survivor is the early return on a
+duplicate directory, which the depth limit now covers as well: it bounds the
+work rather than the result.
+
 ## What does not work
 
 The hard invariant, that every object read hashes back to its own name,
@@ -579,7 +622,11 @@ No SHA-256 repositories, no ref parsing, no abbreviated names, no
 40-character name only.
 
 No `.mtimes`, bitmap or multi-pack index files, no cruft packs, no promisor
-or partial clones, no alternates. No v1 pack index: it is refused by name
+or partial clones. Alternates are read, including nested and relative ones,
+but a C-quoted path in the file is not: git accepts a line beginning with a
+double quote as a quoted path, nothing writes one in practice, and such a
+line is taken literally here and the directory is then simply not found. No
+v1 pack index: it is refused by name
 rather than read, since it has no CRCs and git has not written one since
 2007.
 

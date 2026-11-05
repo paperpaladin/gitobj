@@ -1704,45 +1704,139 @@ static void packs_close(Packs *ps) {
 	ps->n = ps->cap = 0;
 }
 
+/* ------------------------------------------------- the object store, and
+ *                                                    the ones it borrows
+ *
+ * `objects/info/alternates` is a list of other object directories to look
+ * in, one per line, which is what `git clone -s` writes and what most CI
+ * caches look like. An object in an alternate is in the repository as far as
+ * every git command is concerned, `cat-file --batch-all-objects` included,
+ * so a reader that ignores the file reports "object not found" for a
+ * repository git reads perfectly.
+ *
+ * A relative path is relative to the objects directory holding the file,
+ * not to the current directory. An alternate may have alternates of its
+ * own, and git follows those too.
+ *
+ * shortcut: no C-quoted paths. git accepts a line beginning with a double
+ * quote as a quoted path, which nothing writes in practice; such a line is
+ * taken literally here and the directory is then simply not there. */
+#define ALT_MAX 5         /* git's own default depth for nested alternates */
+
+typedef struct { char (*v)[4096]; size_t n, cap; } Dirs;
+
+/* 0 if this directory is already in the list, which is how a cycle ends. */
+static int dirs_add(Dirs *d, const char *path) {
+	for (size_t i = 0; i < d->n; i++)
+		if (!strcmp(d->v[i], path)) return 0;
+	if (d->n == d->cap) {
+		d->cap = d->cap ? d->cap * 2 : 4;
+		char (*q)[4096] = realloc(d->v, d->cap * 4096);
+		if (!q) die("out of memory");
+		d->v = q;
+	}
+	snprintf(d->v[d->n++], 4096, "%s", path);
+	return 1;
+}
+
+/* The directory, then everything its alternates file points at, in the
+ * order git searches. An alternate that is not there is skipped rather than
+ * refused, which is what git does: the file is a hint about where objects
+ * MIGHT be. The primary directory is added whether it exists or not, so a
+ * wrong objdir still fails loudly.
+ *
+ * Two guards, and they catch different things. A directory already in the
+ * list is not searched again, which ends a cycle spelled the same way round
+ * both times; without it the recursion runs until the stack does, and a
+ * de-duplicated LIST is not the same thing as a terminating walk. The depth
+ * limit is what ends a cycle spelled two ways, which relative paths make
+ * easy: each hop appends to the path, so no two strings are ever equal. */
+static void alt_scan(Dirs *d, const char *objdir, int depth) {
+	if (!dirs_add(d, objdir)) return;
+	if (depth >= ALT_MAX) return;
+	char path[4096];
+	if ((size_t)snprintf(path, sizeof path, "%s/info/alternates", objdir)
+	    >= sizeof path)
+		return;
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+	char line[4096];
+	while (fgets(line, sizeof line, f)) {
+		size_t k = strlen(line);
+		while (k && (line[k - 1] == '\n' || line[k - 1] == '\r')) line[--k] = 0;
+		if (!k || line[0] == '#') continue;
+		char sub[4096];
+		if (line[0] == '/')
+			snprintf(sub, sizeof sub, "%s", line);
+		else
+			snprintf(sub, sizeof sub, "%s/%s", objdir, line);
+		DIR *t = opendir(sub);
+		if (!t) continue;
+		closedir(t);
+		alt_scan(d, sub, depth + 1);
+	}
+	fclose(f);
+}
+
+typedef struct { Dirs dirs; Packs packs; } Odb;
+
+static void odb_open(const char *objdir, Odb *o) {
+	memset(o, 0, sizeof *o);
+	alt_scan(&o->dirs, objdir, 0);
+	for (size_t i = 0; i < o->dirs.n; i++) packs_open(o->dirs.v[i], &o->packs);
+}
+
+static void odb_close(Odb *o) {
+	packs_close(&o->packs);
+	free(o->dirs.v);
+	o->dirs.v = NULL;
+	o->dirs.n = o->dirs.cap = 0;
+}
+
 /* One object, by name, from a loose file or from whichever pack holds it.
  * Loose first, which is the order git looks in, and it matters: an object
  * can be both, and a repack leaves the loose copy behind until it is
  * pruned. The two copies are the same bytes or one of them is corrupt, and
  * `verify` is what says which. */
-static int obj_get(const char *objdir, Packs *ps, const char *hex, Obj *out) {
+static int obj_get(Odb *o, const char *hex, Obj *out) {
 	uint8_t want[20];
 	if (unhexify(hex, want)) die2("not a 40-character object name", hex);
-	if (loose_read(objdir, hex, out)) return 1;
-	for (size_t i = 0; i < ps->n; i++) {
+	for (size_t i = 0; i < o->dirs.n; i++)
+		if (loose_read(o->dirs.v[i], hex, out)) return 1;
+	for (size_t i = 0; i < o->packs.n; i++) {
 		size_t k;
-		if (!idx_find(&ps->v[i].x, want, &k)) continue;
-		const char *e = pack_at(&ps->v[i], idx_offset(&ps->v[i].x, k), out, NULL, 0);
+		if (!idx_find(&o->packs.v[i].x, want, &k)) continue;
+		const char *e = pack_at(&o->packs.v[i],
+		                        idx_offset(&o->packs.v[i].x, k), out, NULL, 0);
 		if (e) die2(hex, e);
 		return 1;
 	}
 	return 0;
 }
 
-/* The same for a caller that wants one object and nothing else. The packs
- * are opened and closed around it; an Obj holds its own buffer, so it
- * outlives them. */
+/* The same for a caller that wants one object and nothing else. The store is
+ * opened and closed around it; an Obj holds its own buffer, so it outlives
+ * both. */
 static void obj_read(const char *objdir, const char *hex, Obj *out) {
-	Packs ps = {0, 0, 0};
-	packs_open(objdir, &ps);
-	int got = obj_get(objdir, &ps, hex, out);
-	packs_close(&ps);
+	Odb o;
+	odb_open(objdir, &o);
+	int got = obj_get(&o, hex, out);
+	odb_close(&o);
 	if (!got) die2("object not found", hex);
 }
 
-/* Every object in the store, loose and packed, by name and without
- * duplicates: an object can be loose AND in a pack, or in two packs, and
- * `git cat-file --batch-all-objects` lists it once. */
-static void store_names(const char *objdir, Packs *ps, Names *out) {
-	loose_names(objdir, out);
+/* Every object in the store, loose and packed, borrowed and its own, by name
+ * and without duplicates: an object can be loose AND in a pack, or in two
+ * packs, or in this store and an alternate, and `git cat-file
+ * --batch-all-objects` lists it once. */
+static void odb_names(Odb *o, Names *out) {
+	/* Every directory in the list exists: alt_scan only adds an alternate
+	 * it could open, and the primary is the caller's own argument. */
+	for (size_t i = 0; i < o->dirs.n; i++) loose_names(o->dirs.v[i], out);
 	char hex[41];
-	for (size_t i = 0; i < ps->n; i++)
-		for (size_t k = 0; k < ps->v[i].x.n; k++) {
-			hexify(ps->v[i].x.names + 20 * k, hex);
+	for (size_t i = 0; i < o->packs.n; i++)
+		for (size_t k = 0; k < o->packs.v[i].x.n; k++) {
+			hexify(o->packs.v[i].x.names + 20 * k, hex);
 			nadd(out, hex);
 		}
 	if (!out->n) return;
@@ -1989,15 +2083,16 @@ int main(int argc, char **argv) {
 	if (argc == 3 && (!strcmp(cmd, "ls") || !strcmp(cmd, "verify"))) {
 		int vfy = !strcmp(cmd, "verify");
 		Names ns = {0};
-		Packs ps = {0, 0, 0};
-		packs_open(argv[2], &ps);
-		store_names(argv[2], &ps, &ns);
+		Odb db;
+		odb_open(argv[2], &db);
+		odb_names(&db, &ns);
 		size_t bad = 0, nloose = 0;
 		for (size_t i = 0; i < ns.n; i++) {
 			Obj o = {0, {0}};
-			if (!obj_get(argv[2], &ps, ns.v[i], &o))
+			if (!obj_get(&db, ns.v[i], &o))
 				die2("object not found", ns.v[i]);
-			if (loose_exists(argv[2], ns.v[i])) nloose++;
+			for (size_t k = 0; k < db.dirs.n; k++)
+				if (loose_exists(db.dirs.v[k], ns.v[i])) { nloose++; break; }
 			if (vfy) {
 				/* The hard invariant. The name is a SHA-1 over the whole
 				 * serialisation, so this one comparison covers the zlib
@@ -2019,9 +2114,11 @@ int main(int argc, char **argv) {
 		if (vfy) printf("%zu objects, %zu mismatched\n", ns.n, bad);
 		/* Which of them came out of a pack, because a store whose packs
 		 * were never opened reports zero mismatches just as happily. */
-		fprintf(stderr, "%zu objects, %zu loose, %zu from %zu pack%s\n",
-		        ns.n, nloose, ns.n - nloose, ps.n, ps.n == 1 ? "" : "s");
-		packs_close(&ps);
+		fprintf(stderr, "%zu objects, %zu loose, %zu from %zu pack%s, "
+		        "%zu object director%s\n", ns.n, nloose, ns.n - nloose,
+		        db.packs.n, db.packs.n == 1 ? "" : "s", db.dirs.n,
+		        db.dirs.n == 1 ? "y" : "ies");
+		odb_close(&db);
 		free(ns.v);
 		return bad ? 1 : 0;
 	}

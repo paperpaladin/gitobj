@@ -142,6 +142,10 @@ mk_selfcorpus() {
 		$GIT --git-dir="$G" commit-tree "$tree" -m "corpus commit in $name") || return 1
 	printf 'object %s\ntype commit\ntag %s\ntagger corpus <corpus@invalid> 978307200 +0000\n\nannotated\n' \
 		"$commit" "$name" | $GIT --git-dir="$G" mktag > /dev/null || return 1
+	# A ref, so that `git clone -s` has something to clone. It points at an
+	# object that is already there and so moves no name; everything else
+	# here reads the object store directly and does not care.
+	$GIT --git-dir="$G" update-ref refs/heads/main "$commit" || return 1
 	# One of them is moved wholesale into a pack. A clone with no siblings
 	# otherwise has nothing but loose objects in its corpus, and every
 	# comparison below would run over one half of the store while reporting
@@ -1837,7 +1841,8 @@ eq "ls lists an object that is both loose and packed exactly once" \
 assert "and agrees with git line for line" cmp -s "$TMP/b.ours" "$TMP/b.theirs"
 # Loose first, which is the order git looks in.
 eq "and reads the loose copy rather than the packed one" \
-	"$(cat "$TMP/b.census")" "$NSELF objects, $NSELF loose, 0 from 1 pack"
+	"$(cat "$TMP/b.census")" \
+	"$NSELF objects, $NSELF loose, 0 from 1 pack, 1 object directory"
 
 TH=$TMP/packs/thin
 rm -rf "$TH"
@@ -2313,6 +2318,127 @@ printf 'packls: %d objects against verify-pack -v, %d of them deltas, deepest ch
 	"$pls_objs" "$pls_delta" "$pls_depth"
 printf 'base cache: %d inflations and %d hits, against %d inflations with no cache\n' \
 	"$pls_inf" "$pls_hit" "$pls_nocache"
+
+# =====================================================================
+# 11. alternates: an object store that borrows another one
+# =====================================================================
+# `objects/info/alternates` lists other object directories to look in, one
+# per line. It is what `git clone -s` writes and what most CI caches look
+# like, and an object in an alternate is in the repository as far as every
+# git command is concerned, `cat-file --batch-all-objects` included. A reader
+# that ignores the file reports "object not found" for a repository git reads
+# perfectly, which is what this one did.
+#
+# The oracle is the same one section 3 uses, over a store whose objects are
+# all somebody else's: `git cat-file --batch-all-objects --batch-check`
+# against `gitobj ls`, line for line.
+ALTD=$TMP/alt
+mkdir -p "$ALTD"
+alt_vs_git() { # <label> <git-dir> <expected object count>
+	# git's stderr is kept rather than discarded: for one of the fixtures
+	# below it is the oracle, since git complains about an alternate it
+	# cannot use and carries on, which is the behaviour being matched.
+	$GIT --git-dir="$2" cat-file --batch-all-objects --batch-check \
+		2> "$TMP/a.giterr" | sort > "$TMP/a.theirs"
+	"$GITOBJ" ls "$2/objects" > "$TMP/a.ours" 2> "$TMP/a.census"
+	eq "$1: ls exits 0" "$?" 0
+	eq "$1: git finds the objects the alternate holds" \
+		"$(wc -l < "$TMP/a.theirs" | tr -d ' ')" "$3"
+	assert "$1: and we list exactly what git lists" \
+		cmp -s "$TMP/a.ours" "$TMP/a.theirs"
+	eq "$1: and verify hashes every one of them" \
+		"$("$GITOBJ" verify "$2/objects" 2>/dev/null)" "$3 objects, 0 mismatched"
+}
+
+# The real shape first, both ways round: a loose source and a packed one.
+# `git clone -s` is what writes the file, so the fixture is git's own doing
+# rather than a line this suite composed.
+for src in self_a self_p; do
+	rm -rf "$ALTD/$src"
+	$GIT clone -q -s --bare "$TMP/corpus/$src" "$ALTD/$src" 2>/dev/null
+	assert "clone -s wrote an alternates file for $src" \
+		test -s "$ALTD/$src/objects/info/alternates"
+	# The borrowing store has nothing of its own: that is the whole point,
+	# and without checking it the comparison could be passing on a copy.
+	eq "and the clone of $src has no object of its own" \
+		"$(loose_shas "$ALTD/$src" | grep -c .)" 0
+	eq "nor a pack of its own" \
+		"$(ls "$ALTD/$src/objects/pack/"*.idx 2>/dev/null | grep -c .)" 0
+	alt_vs_git "alternates ($src)" "$ALTD/$src" "$NSELF"
+	# One object, read through the alternate, against git.
+	asha=$(head -1 "$TMP/a.theirs" | cut -d' ' -f1)
+	eq "a single object read through the alternate of $src" \
+		"$("$GITOBJ" type "$ALTD/$src/objects" "$asha")" \
+		"$($GIT --git-dir="$ALTD/$src" cat-file -t "$asha")"
+	"$GITOBJ" raw "$ALTD/$src/objects" "$asha" > "$TMP/ours" 2>/dev/null
+	$GIT --git-dir="$ALTD/$src" cat-file "$("$GITOBJ" type "$ALTD/$src/objects" "$asha")" \
+		"$asha" > "$TMP/theirs"
+	assert "and byte for byte" cmp -s "$TMP/ours" "$TMP/theirs"
+done
+# Two directories, which is what the census has to say, and it is the guard
+# against the above passing because the objects were there all along.
+eq "the store that borrows reports both directories" \
+	"$(sed 's/.*, //' "$TMP/a.census")" "2 object directories"
+
+# A relative path, which is relative to the objects directory holding the
+# file and not to the current directory. git writes an absolute path, so
+# this form only appears when somebody writes it by hand, and it is the one
+# a reader is most likely to resolve against the wrong thing.
+rm -rf "$ALTD/rel"
+$GIT init -q --bare "$ALTD/rel"
+printf '../../../corpus/self_a/objects\n' > "$ALTD/rel/objects/info/alternates"
+alt_vs_git "alternates (relative path)" "$ALTD/rel" "$NSELF"
+
+# A chain: this store borrows one that borrows another. git follows those
+# too, to a depth of five.
+rm -rf "$ALTD/chain"
+$GIT init -q --bare "$ALTD/chain"
+printf '%s\n' "$ALTD/rel/objects" > "$ALTD/chain/objects/info/alternates"
+alt_vs_git "alternates (a chain of three)" "$ALTD/chain" "$NSELF"
+
+# A cycle. There is no object here that is not reachable anyway, so what is
+# asserted is that it terminates and still answers: a reader that follows
+# the file without a guard does not come back.
+rm -rf "$ALTD/loop" "$ALTD/loop2"
+$GIT init -q --bare "$ALTD/loop"
+$GIT init -q --bare "$ALTD/loop2"
+printf '%s\n' "$ALTD/loop2/objects" > "$ALTD/loop/objects/info/alternates"
+printf '%s\n%s\n' "$ALTD/loop/objects" "$TMP/corpus/self_a/objects" \
+	> "$ALTD/loop2/objects/info/alternates"
+alt_vs_git "alternates (a cycle)" "$ALTD/loop" "$NSELF"
+
+# The same cycle spelled with relative paths, which is the one the
+# de-duplication cannot see: each hop appends to the path, so no two strings
+# are ever equal and only the depth limit ends it. There is a real alternate
+# in the first file as well, so the walk still has to come back with the
+# objects rather than merely survive.
+rm -rf "$ALTD/rloop" "$ALTD/rloop2"
+$GIT init -q --bare "$ALTD/rloop"
+$GIT init -q --bare "$ALTD/rloop2"
+printf '../../rloop2/objects\n%s\n' "$TMP/corpus/self_a/objects" \
+	> "$ALTD/rloop/objects/info/alternates"
+printf '../../rloop/objects\n' > "$ALTD/rloop2/objects/info/alternates"
+alt_vs_git "alternates (a cycle spelled two ways)" "$ALTD/rloop" "$NSELF"
+
+# Lines git ignores, and a directory that is not there. git treats the file
+# as a hint about where objects might be, so a stale entry is skipped rather
+# than refused, and an empty store with a bad alternate is empty rather than
+# broken.
+rm -rf "$ALTD/junk"
+$GIT init -q --bare "$ALTD/junk"
+printf '# a comment\n\n%s/no/such/dir\n%s\n' "$ALTD" "$TMP/corpus/self_a/objects" \
+	> "$ALTD/junk/objects/info/alternates"
+alt_vs_git "alternates (comments and a missing directory)" "$ALTD/junk" "$NSELF"
+assert "git complains about the directory that is not there and carries on" \
+	grep -q 'no/such/dir' "$TMP/a.giterr"
+rm -rf "$ALTD/gone"
+$GIT init -q --bare "$ALTD/gone"
+printf '%s/no/such/dir\n' "$ALTD" > "$ALTD/gone/objects/info/alternates"
+eq "an alternate that is not there leaves an empty store empty" \
+	"$("$GITOBJ" verify "$ALTD/gone/objects" 2>/dev/null)" "0 objects, 0 mismatched"
+refute "and an object is still not found in it" \
+	"$GITOBJ" type "$ALTD/gone/objects" \
+	0000000000000000000000000000000000000000
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

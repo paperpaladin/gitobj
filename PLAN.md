@@ -184,7 +184,9 @@ by hand.
   `--batch` protocol, no index/worktree. Objects are addressed by full
   40-character name only.
 * The pack `.rev`, `.mtimes`, bitmap and multi-pack index files, cruft
-  packs, promisor/partial clones, and alternates (`objects/info/alternates`).
+  packs and promisor/partial clones. Alternates WERE on this list and are
+  read now, nested and relative ones included; a C-quoted path in the file
+  is not, and is taken literally.
 * Writing with any real compression. Loose objects are emitted as zlib
   stored blocks, which git reads perfectly and which grow the file by ~0.03%:
   five bytes of block header per 65535 of payload, plus six of framing. That
@@ -666,10 +668,45 @@ by hand.
       the fanout is read now, so this is a ten-line function over `idx_open`
       plus the ambiguity check. It also needs the loose objects, where the
       fan-out directory does the same job.
-- [ ] `objects/info/alternates`, so a repository whose objects live in a
+- [x] `objects/info/alternates`, so a repository whose objects live in a
       borrowed object store can be read at all
       why: every `git clone -s` and most CI caches look like this, and we
       currently report "object not found" with no hint why.
+      files: gitobj.c (ALT_MAX, Dirs, dirs_add, alt_scan, Odb, odb_open,
+      odb_close, odb_names, and obj_get over a list of directories rather
+      than one), t/run.sh section 11 plus a ref in the corpus builder so
+      `git clone -s` has something to clone, README.md
+      proves: `git clone -s --bare` of a self corpus repository, twice,
+      once where the source is loose and once where it is packed. The
+      borrowing clone is checked for having no object and no pack of its
+      own, since otherwise the comparison could pass on a copy. Then `git
+      cat-file --batch-all-objects --batch-check` against `gitobj ls` line
+      for line, `gitobj verify` over all 123, and one object read through
+      the alternate byte for byte. Five hand-written shapes as well, since
+      git only ever writes the first: a relative path, a chain of three, a
+      cycle, the same cycle spelled relatively, and a file holding a
+      comment, a blank line and a directory that is not there.
+      17153 assertions before, 17195 after; 4516 to 4558 cloned alone.
+      found: a de-duplicated LIST is not a terminating WALK. The first
+      version skipped a duplicate directory when adding it and then read
+      that directory's alternates file anyway, so a two-repository cycle
+      recursed until the stack ran out: a segfault, reached by `gitobj ls`
+      on a store git reads fine. The early return is in the walk now.
+      found: the two cycle guards catch different things. Skipping a
+      directory already in the list ends a cycle spelled the same way round
+      both times; the depth limit of five, which is git's own, is what ends
+      one spelled two ways, and relative paths make that easy because each
+      hop appends to the path and no two strings are ever equal. There is a
+      fixture for each.
+      found: five planted defects, four red. Ignoring the file fails 15
+      assertions, resolving a relative path against the current directory
+      fails 4, reading only the first line fails 4, and dropping the depth
+      limit fails 3.
+      survivor: the early return on a duplicate directory, now that the
+      depth limit covers the same-spelling cycle as well. It bounds the
+      work rather than the result.
+      found: git complains about an alternate it cannot use and carries on,
+      which is an assertion here rather than a line of noise in the output.
 - [ ] write packfiles: delta search, `.idx` generation, `verify-pack` on our
       own output
       why: the one direction of the format that is entirely unimplemented,
