@@ -12,10 +12,10 @@
  *
  * A git object's name IS the SHA-1 of "<type> <len>\0<payload>", so every
  * read is self-checking: if the bytes we reconstructed hash back to the name
- * we looked them up by, the whole decode path was right. That covers the
- * loose objects and every packed object the deltas here can resolve; an index
- * entry has no payload to hash, so its own checks are the fanout against the
- * name list and the CRC against the pack. See README.md.
+ * we looked them up by, the whole decode path was right. That covers every
+ * object in the store, loose or packed; an index entry on its own has no
+ * payload to hash, so its own checks are the fanout against the name list and
+ * the CRC against the pack. See README.md.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
@@ -579,6 +579,14 @@ static void loose_path(char *buf, size_t cap, const char *objdir, const char *he
 		die("object path too long");
 }
 
+/* Is there a loose file for this name? Asked for the census only: the
+ * reader does not care which half of the store an object came from. */
+static int loose_exists(const char *objdir, const char *hex) {
+	char path[4096];
+	loose_path(path, sizeof path, objdir, hex);
+	return access(path, R_OK) == 0;
+}
+
 static int loose_read(const char *objdir, const char *hex, Obj *out) {
 	char path[4096];
 	loose_path(path, sizeof path, objdir, hex);
@@ -594,15 +602,6 @@ static int loose_read(const char *objdir, const char *hex, Obj *out) {
 	bfree(&raw);
 	if (e) { bfree(&plain); die2(path, e); }
 	return 1;
-}
-
-/* Find an object by full 40-character name. Exits 1 if it is not there:
- * every caller wants the object, none wants to carry on without it. */
-static void obj_read(const char *objdir, const char *hex, Obj *out) {
-	uint8_t want[20];
-	if (unhexify(hex, want)) die2("not a 40-character object name", hex);
-	if (loose_read(objdir, hex, out)) return;
-	die2("object not found", hex);
 }
 
 /* Store an object as a loose file, the way git does: the bytes go to a
@@ -1557,6 +1556,92 @@ static void loose_names(const char *objdir, Names *out) {
 
 static int cmpname(const void *a, const void *b) { return strcmp(a, b); }
 
+/* Every pack in an object store. A missing or unreadable objects/pack is not
+ * an error: a repository with no pack is the normal case for a fresh one,
+ * and `git init --bare` leaves the directory there and empty. */
+typedef struct { Pack *v; size_t n, cap; } Packs;
+
+static void packs_open(const char *objdir, Packs *ps) {
+	char dir[4096];
+	if ((size_t)snprintf(dir, sizeof dir, "%s/pack", objdir) >= sizeof dir)
+		die("object path too long");
+	DIR *d = opendir(dir);
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		size_t l = strlen(e->d_name);
+		if (l < 5 || strcmp(e->d_name + l - 4, ".idx")) continue;
+		char path[4096];
+		if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= sizeof path)
+			continue;
+		if (ps->n == ps->cap) {
+			ps->cap = ps->cap ? ps->cap * 2 : 4;
+			Pack *q = realloc(ps->v, ps->cap * sizeof *q);
+			if (!q) die("out of memory");
+			ps->v = q;
+		}
+		pack_open(path, &ps->v[ps->n++]);
+	}
+	closedir(d);
+}
+
+static void packs_close(Packs *ps) {
+	for (size_t i = 0; i < ps->n; i++) pack_close(&ps->v[i]);
+	free(ps->v);
+	ps->v = NULL;
+	ps->n = ps->cap = 0;
+}
+
+/* One object, by name, from a loose file or from whichever pack holds it.
+ * Loose first, which is the order git looks in, and it matters: an object
+ * can be both, and a repack leaves the loose copy behind until it is
+ * pruned. The two copies are the same bytes or one of them is corrupt, and
+ * `verify` is what says which. */
+static int obj_get(const char *objdir, Packs *ps, const char *hex, Obj *out) {
+	uint8_t want[20];
+	if (unhexify(hex, want)) die2("not a 40-character object name", hex);
+	if (loose_read(objdir, hex, out)) return 1;
+	for (size_t i = 0; i < ps->n; i++) {
+		size_t k;
+		if (!idx_find(&ps->v[i].x, want, &k)) continue;
+		const char *e = pack_at(&ps->v[i], idx_offset(&ps->v[i].x, k), out, NULL, 0);
+		if (e) die2(hex, e);
+		return 1;
+	}
+	return 0;
+}
+
+/* The same for a caller that wants one object and nothing else. The packs
+ * are opened and closed around it; an Obj holds its own buffer, so it
+ * outlives them. */
+static void obj_read(const char *objdir, const char *hex, Obj *out) {
+	Packs ps = {0, 0, 0};
+	packs_open(objdir, &ps);
+	int got = obj_get(objdir, &ps, hex, out);
+	packs_close(&ps);
+	if (!got) die2("object not found", hex);
+}
+
+/* Every object in the store, loose and packed, by name and without
+ * duplicates: an object can be loose AND in a pack, or in two packs, and
+ * `git cat-file --batch-all-objects` lists it once. */
+static void store_names(const char *objdir, Packs *ps, Names *out) {
+	loose_names(objdir, out);
+	char hex[41];
+	for (size_t i = 0; i < ps->n; i++)
+		for (size_t k = 0; k < ps->v[i].x.n; k++) {
+			hexify(ps->v[i].x.names + 20 * k, hex);
+			nadd(out, hex);
+		}
+	if (!out->n) return;
+	qsort(out->v, out->n, 41, cmpname);
+	size_t w = 1;
+	for (size_t i = 1; i < out->n; i++)
+		if (strcmp(out->v[i], out->v[w - 1]))
+			memcpy(out->v[w++], out->v[i], 41);
+	out->n = w;
+}
+
 /* ------------------------------------------------------------------ main */
 
 static int usage(void) {
@@ -1792,12 +1877,15 @@ int main(int argc, char **argv) {
 	if (argc == 3 && (!strcmp(cmd, "ls") || !strcmp(cmd, "verify"))) {
 		int vfy = !strcmp(cmd, "verify");
 		Names ns = {0};
-		loose_names(argv[2], &ns);
-		qsort(ns.v, ns.n, 41, cmpname);
-		size_t bad = 0;
+		Packs ps = {0, 0, 0};
+		packs_open(argv[2], &ps);
+		store_names(argv[2], &ps, &ns);
+		size_t bad = 0, nloose = 0;
 		for (size_t i = 0; i < ns.n; i++) {
 			Obj o = {0, {0}};
-			obj_read(argv[2], ns.v[i], &o);
+			if (!obj_get(argv[2], &ps, ns.v[i], &o))
+				die2("object not found", ns.v[i]);
+			if (loose_exists(argv[2], ns.v[i])) nloose++;
 			if (vfy) {
 				/* The hard invariant. The name is a SHA-1 over the whole
 				 * serialisation, so this one comparison covers the zlib
@@ -1817,6 +1905,11 @@ int main(int argc, char **argv) {
 			bfree(&o.data);
 		}
 		if (vfy) printf("%zu objects, %zu mismatched\n", ns.n, bad);
+		/* Which of them came out of a pack, because a store whose packs
+		 * were never opened reports zero mismatches just as happily. */
+		fprintf(stderr, "%zu objects, %zu loose, %zu from %zu pack%s\n",
+		        ns.n, nloose, ns.n - nloose, ps.n, ps.n == 1 ? "" : "s");
+		packs_close(&ps);
 		free(ns.v);
 		return bad ? 1 : 0;
 	}

@@ -114,7 +114,7 @@ refute "hash rejects an unknown type" "$GITOBJ" hash frobnicate "$TMP/fix/hello"
 # types are present. Nothing is packed, which also means the whole-repository
 # `ls` comparison below has something to run against -- every sibling in the
 # collection has a packfile, so that oracle was skipping entirely.
-SELF_CORPUS="self_a self_b self_c"
+SELF_CORPUS="self_a self_b self_c self_p"
 SELF_BLOBS=120
 
 mk_selfcorpus() {
@@ -142,6 +142,22 @@ mk_selfcorpus() {
 		$GIT --git-dir="$G" commit-tree "$tree" -m "corpus commit in $name") || return 1
 	printf 'object %s\ntype commit\ntag %s\ntagger corpus <corpus@invalid> 978307200 +0000\n\nannotated\n' \
 		"$commit" "$name" | $GIT --git-dir="$G" mktag > /dev/null || return 1
+	# One of them is moved wholesale into a pack. A clone with no siblings
+	# otherwise has nothing but loose objects in its corpus, and every
+	# comparison below would run over one half of the store while reporting
+	# a count that looks like the whole of it. `repack` is no use here:
+	# nothing in these repositories is reachable from a ref, so it would
+	# leave 119 of the 120 blobs loose and drop the rest.
+	case $name in
+	*_p)
+		$GIT --git-dir="$G" cat-file --batch-all-objects --batch-check |
+			awk '{print $1}' > "$TMP/mk/$name/all" || return 1
+		$GIT --git-dir="$G" pack-objects --non-empty --delta-base-offset \
+			--threads=1 "$G/objects/pack/pack" \
+			< "$TMP/mk/$name/all" > /dev/null || return 1
+		rm -rf "$G/objects"/??
+		;;
+	esac
 	echo "$name"
 }
 
@@ -159,11 +175,18 @@ for r in $HAVE_SELF; do
 		test "$($GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
 			--batch-check | awk '{print $2}' | sort -u | tr '\n' ' ')" \
 		= "blob commit tag tree "
-	# No .idx, rather than no pack/ directory: `git init --bare` creates an
-	# empty objects/pack/, so testing for the directory's absence asserted
-	# something that is never true and said nothing about packing.
-	assert "$r is unpacked, so ls can be compared whole" \
-		test -z "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)"
+	# Which half of the store this repository is. Both shapes have to be
+	# present, and the assertion is per repository rather than over the set
+	# because a corpus that drifted to all-loose or all-packed would still
+	# clear a floor. No .idx, rather than no pack/ directory: `git init
+	# --bare` creates an empty objects/pack/, so testing for the
+	# directory's absence asserted something that is never true.
+	case $r in
+	*_p) assert "$r is packed, so the packed half of the store is read" \
+		test -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ;;
+	*)   assert "$r is unpacked, so the loose half of the store is read" \
+		test -z "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ;;
+	esac
 done
 
 # The sibling repositories are an ADDITIONAL corpus: real histories, far more
@@ -223,36 +246,46 @@ loose_shas() {
 		sed -E 's|.*/([0-9a-f]{2})/([0-9a-f]+)$|\1\2|' | sort
 }
 
+# git enumerates the set under test. `cat-file --batch-all-objects` lists
+# every object in the store, loose and packed alike, so the sweep covers
+# whatever is there rather than whatever we happened to look for. It used to
+# drive off loose_shas, which found nothing at all in cc, tarx or inflate:
+# every sibling has been repacked, so the sweep that the README described as
+# running over three real histories was running over the self corpus alone
+# and clearing its floor of 20 with that.
+nobj=0
 nloose=0
-loose_from=
+swept_from=
 for r in $HAVE_SMALL; do
 	G="$TMP/corpus/$r"
 	OD="$G/objects"
+	nl=$(loose_shas "$G" | grep -c .)
+	nloose=$((nloose + nl))
+	$GIT --git-dir="$G" cat-file --batch-all-objects --batch-check |
+		sort > "$TMP/all.list"
 	n=0
-	for sha in $(loose_shas "$G"); do
-		nloose=$((nloose+1))
+	while read -r sha gt gsz; do
 		n=$((n+1))
-		t=$("$GITOBJ" type "$OD" "$sha")
-		gt=$($GIT --git-dir="$G" cat-file -t "$sha")
-		eq "type $r/$sha" "$t" "$gt"
-		eq "size $r/$sha" "$("$GITOBJ" size "$OD" "$sha")" \
-			"$($GIT --git-dir="$G" cat-file -s "$sha")"
+		nobj=$((nobj+1))
+		eq "type $r/$sha" "$("$GITOBJ" type "$OD" "$sha")" "$gt"
+		eq "size $r/$sha" "$("$GITOBJ" size "$OD" "$sha")" "$gsz"
 		"$GITOBJ" raw "$OD" "$sha" > "$TMP/ours" 2>/dev/null
 		$GIT --git-dir="$G" cat-file "$gt" "$sha" > "$TMP/theirs"
 		assert "raw $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
 		"$GITOBJ" cat "$OD" "$sha" > "$TMP/ours" 2>/dev/null
 		$GIT --git-dir="$G" cat-file -p "$sha" > "$TMP/theirs"
 		assert "cat -p $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
-	done
-	[ "$n" -gt 0 ] && loose_from="$loose_from $r($n)"
+	done < "$TMP/all.list"
+	[ "$n" -gt 0 ] && swept_from="$swept_from $r($n, $nl loose)"
 done
-[ "$nloose" -ge 20 ] && ok || no "only $nloose loose objects in the small corpora"
-# Which repositories this ran over, and not only how many objects. Every
-# sibling in the collection is fully packed today, so cc, tarx and inflate
-# contribute nothing to it and the sweep is over the self corpus alone,
-# which the floor above cannot show and the README used to get wrong.
-printf 'per-object cat-file sweep: %d loose objects over%s\n' "$nloose" \
-	"${loose_from:- nothing}"
+[ "$nobj" -ge 20 ] && ok || no "only $nobj objects in the small corpora"
+# Both halves of the store, counted. A sweep over an all-packed repository
+# and a sweep over an all-loose one exercise entirely different code for
+# every one of the four comparisons above, and the floor cannot tell them
+# apart.
+[ "$((nobj - nloose))" -ge 20 ] && ok ||
+	no "only $((nobj - nloose)) of the swept objects came out of a pack"
+printf 'per-object cat-file sweep:%s\n' "${swept_from:- nothing}"
 
 # Refusals. A loose object file is one zlib stream and nothing else, so each
 # of these is a distinct lie about the bytes.
@@ -285,7 +318,7 @@ printf 'sibling corpus (big): %d of %d present\n' \
 	"$(printf '%s\n' $CORPUS_BIG | grep -c .)"
 total_verified=0
 for r in $HAVE_SMALL $HAVE_BIG; do
-	out=$("$GITOBJ" verify "$TMP/corpus/$r/objects")
+	out=$("$GITOBJ" verify "$TMP/corpus/$r/objects" 2>"$TMP/v.census")
 	rc=$?
 	eq "verify $r exits 0" "$rc" 0
 	n=${out##*$'\n'}
@@ -297,41 +330,56 @@ for r in $HAVE_SMALL $HAVE_BIG; do
 	total_verified=$((total_verified + n))
 done
 # The count itself is an assertion: a verify that walked an empty directory
-# also reports zero mismatches.
+# also reports zero mismatches. It counted only loose objects until `verify`
+# learned to read a pack, and 8 of the 11 repositories here hold nothing but
+# packed objects, so what it was really pinning was the self corpus.
 [ "$total_verified" -ge 300 ] && ok || no "only $total_verified objects verified"
-printf 'verified %d loose objects across %s\n' "$total_verified" \
+printf 'verified %d objects across %s\n' "$total_verified" \
 	"$(echo $HAVE_SMALL $HAVE_BIG | tr '\n' ' ')"
 
 # `gitobj ls` against `git cat-file --batch-all-objects --batch-check`, which
-# emits exactly the same three fields. Only repositories with no packfile can
-# be compared whole this way. `ls` reads loose objects only: section 9 reads
-# pack entries and `packls` prints the same three fields for them, but
-# nothing joins the two listings yet, so a repository with a packfile still
-# cannot be compared whole. See README.md.
-# This is the ONLY place `gitobj ls` is compared against git over a whole
-# repository, and the skip below is silent -- so when every corpus repo has a
-# packfile (7 of the 9 do today) the loop body never runs and the oracle
-# contributes nothing, with no line to say so. Counted now, and at least one
-# pack-free repo is required.
+# emits exactly the same three fields for the same set of objects: every
+# object in the store, loose and packed, each listed once even when it is
+# both. This used to run only over a repository with no packfile, and 8 of
+# the 11 have one, so it was skipping almost everything and saying so in a
+# line nobody counted.
+#
+# Per line rather than as a file diff for the same reason the index and the
+# pack comparisons are: over three thousand objects, `cmp` says only that
+# something somewhere disagreed.
 ls_compared=0
+ls_objs=0
+ls_loose=0
+ls_packed=0
 for r in $HAVE_SMALL $HAVE_BIG; do
-	if [ -n "$(ls "$TMP/corpus/$r/objects/pack/"*.idx 2>/dev/null)" ]; then
-		echo "SKIP ls $r: has a packfile, so it cannot be compared whole" >&2
-		continue
-	fi
-	ls_compared=$((ls_compared + 1))
 	$GIT --git-dir="$TMP/corpus/$r" cat-file --batch-all-objects \
 		--batch-check | sort > "$TMP/theirs"
-	"$GITOBJ" ls "$TMP/corpus/$r/objects" > "$TMP/ours"
-	assert "ls $r matches git batch-check" cmp -s "$TMP/ours" "$TMP/theirs"
-	nl=$(wc -l < "$TMP/theirs")
+	"$GITOBJ" ls "$TMP/corpus/$r/objects" > "$TMP/ours" 2> "$TMP/ls.census"
+	eq "ls $r exits 0" "$?" 0
+	nl=$(wc -l < "$TMP/theirs" | tr -d ' ')
+	eq "ls $r lists as many objects as git does" \
+		"$(wc -l < "$TMP/ours" | tr -d ' ')" "$nl"
+	a=; b=
+	while IFS= read -r a <&3 && IFS= read -r b <&4; do
+		ls_objs=$((ls_objs + 1))
+		eq "ls $r ${b%% *}" "$a" "$b"
+	done 3< "$TMP/ours" 4< "$TMP/theirs"
 	[ "$nl" -ge 50 ] && ok || no "ls corpus $r has only $nl objects"
+	ls_compared=$((ls_compared + 1))
+	ls_loose=$((ls_loose + $(sed -n 's/.*, \([0-9]*\) loose.*/\1/p' "$TMP/ls.census")))
+	ls_packed=$((ls_packed + $(sed -n 's/.*loose, \([0-9]*\) from.*/\1/p' "$TMP/ls.census")))
 done
-if [ "$ls_compared" -gt 0 ]; then
-	ok
-else
-	no "ls: every corpus repo has a packfile, so the whole-repository ls comparison did not run"
-fi
+eq "every corpus repository was compared whole" "$ls_compared" \
+	"$(printf '%s\n' $HAVE_SMALL $HAVE_BIG | grep -c .)"
+[ "$ls_objs" -ge 300 ] && ok ||
+	no "only $ls_objs objects compared by the whole-repository ls"
+# Both halves of every store. 8 of the 11 repositories hold nothing but
+# packed objects and the other 3 nothing but loose ones, so without this the
+# comparison could be whole and still have read only one kind.
+[ "$ls_loose" -ge 300 ] && ok || no "only $ls_loose of the listed objects were loose"
+[ "$ls_packed" -ge 100 ] && ok || no "only $ls_packed of the listed objects were packed"
+printf 'ls against git batch-check: %d objects over %d repositories, %d loose and %d packed\n' \
+	"$ls_objs" "$ls_compared" "$ls_loose" "$ls_packed"
 
 # A deliberately corrupted loose object: same filename, different content.
 # verify must notice, because that is the only thing it is for.
@@ -353,7 +401,8 @@ cp -r "$TMP/corpus/$corpus_src/objects/"[0-9a-f][0-9a-f] "$TMP/corrupt/objects/"
 # overwrite one without this. copy_corpus does the same thing for the sibling
 # copies; the self corpus needs it too.
 chmod -R u+rw "$TMP/corrupt"
-victim=$("$GITOBJ" ls "$TMP/corrupt/objects" | awk '$2=="blob"{print $1; exit}')
+victim=$("$GITOBJ" ls "$TMP/corrupt/objects" 2>/dev/null |
+	awk '$2=="blob"{print $1; exit}')
 assert "and found a blob in it to be the victim" test -n "$victim"
 printf 'tampered\n' > "$TMP/t.in"
 # (A `"$GITOBJ" hash blob` on this file used to sit here with its output sent
@@ -777,12 +826,12 @@ assert "git still reads it after the second write" cmp -s "$TMP/ours" "$TMP/wstd
 # Our own reader over our own writer, and the hard invariant over the lot.
 # `verify` recomputes every name from the inflated bytes, so this is the
 # whole write path checked against the names git agreed with above.
-out=$("$GITOBJ" verify "$WOD")
+out=$("$GITOBJ" verify "$WOD" 2>/dev/null)
 eq "verify over everything we wrote exits 0" "$?" 0
 case $out in *", 0 mismatched") ok ;; *) no "verify of our own objects: $out" ;; esac
 eq "verify counted every object we wrote" "${out##*$'\n'}" "$nwritten objects, 0 mismatched"
 $WG cat-file --batch-all-objects --batch-check | sort > "$TMP/theirs"
-"$GITOBJ" ls "$WOD" > "$TMP/ours"
+"$GITOBJ" ls "$WOD" > "$TMP/ours" 2>/dev/null
 assert "ls of our own store matches git batch-check" cmp -s "$TMP/ours" "$TMP/theirs"
 
 refute "write rejects an unknown type" \
@@ -1728,6 +1777,31 @@ eq "and every object of the REF_DELTA pack hashes back to its own name" \
 # a wire and never stores. `git index-pack --fix-thin` is what completes one,
 # so a stored pack whose REF_DELTA base is missing is not a thing git reads
 # either; refusing it is the whole handling.
+# An object that is loose AND packed, which nothing else here is: the self
+# corpus has no pack and every sibling has no loose object. git lists such an
+# object once, so `gitobj ls` must too, and without this fixture dropping the
+# de-duplication is a mutation nothing can kill. The pack built above holds
+# exactly the objects of the repository it was built from, so copying it in
+# beside them gives every object two copies.
+BOTH=$TMP/packs/both
+rm -rf "$BOTH"
+$GIT init -q --bare "$BOTH"
+for d in "$SELFREPO/objects/"??; do cp -r "$d" "$BOTH/objects/"; done
+cpw "$SELFIDX" "$BOTH/objects/pack/pack-$SELFPACK.idx"
+cpw "$TMP/packs/self-$SELFPACK.pack" "$BOTH/objects/pack/pack-$SELFPACK.pack"
+eq "the both-copies fixture has every object twice" \
+	"$(($(loose_shas "$BOTH" | grep -c .) + $("$GITOBJ" idx "$SELFIDX" 2>/dev/null | wc -l)))" \
+	"$((NSELF * 2))"
+$GIT --git-dir="$BOTH" cat-file --batch-all-objects --batch-check |
+	sort > "$TMP/b.theirs"
+"$GITOBJ" ls "$BOTH/objects" > "$TMP/b.ours" 2> "$TMP/b.census"
+eq "ls lists an object that is both loose and packed exactly once" \
+	"$(wc -l < "$TMP/b.ours" | tr -d ' ')" "$NSELF"
+assert "and agrees with git line for line" cmp -s "$TMP/b.ours" "$TMP/b.theirs"
+# Loose first, which is the order git looks in.
+eq "and reads the loose copy rather than the packed one" \
+	"$(cat "$TMP/b.census")" "$NSELF objects, $NSELF loose, 0 from 1 pack"
+
 TH=$TMP/packs/thin
 rm -rf "$TH"
 mkdir -p "$TH"

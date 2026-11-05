@@ -96,8 +96,8 @@ does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
 **It covers every object in every corpus:** 369 loose, and 3186 read out of
-twelve packs, 2016 of those through a delta chain and 2815 of them in eight
-sibling histories. It said "loose and packed" for a good while before any
+thirteen packs, 2016 of those through a delta chain and 2815 of them in
+eight sibling histories. It said "loose and packed" for a good while before any
 pack code existed, which was the strongest claim in the file and the one
 that was not true; it covered 490 of 3184 two commits ago. What is still out
 of reach is a pack this suite cannot build, one over two gigabytes, and a
@@ -122,12 +122,15 @@ Ranked, strongest first, by how little of it we control.
 1. The object name itself. Not an oracle we wrote: git chose the filename
    and the index entry, we recompute the hash. Applies to every object in
    every corpus, with no fixtures to maintain.
-2. `git cat-file -p` / `-t` / `-s`, object by object. Over every loose
-   object in every corpus repository, which today means the self corpus
-   alone: the siblings have all been repacked and hold none. The tree
-   pretty-printer, the mode formatting and the raw commit/tag bytes are all
-   pinned here. Reaching the siblings again needs `cat` and `raw` to read
-   packed objects, which is the last of the pack items below.
+2. `git cat-file -p` / `-t` / `-s`, object by object, over every object of
+   the small corpus, loose and packed: 1375 objects, 1006 of them out of a
+   pack. git chooses the set, through `cat-file --batch-all-objects`, so
+   the sweep covers what is in the store rather than what it went looking
+   for. The tree pretty-printer, the mode formatting and the raw commit and
+   tag bytes are all pinned here.
+   `git cat-file --batch-all-objects --batch-check` against `gitobj ls`
+   over a whole store is the same oracle at a coarser grain and a wider
+   reach: 3307 objects over 12 repositories, compared line by line.
 3. `git fsck --strict` and `git cat-file -p` over a bare repository whose
    every object `gitobj write` and `gitobj mktree` put there. git inflates
    our zlib stream, re-hashes it and parses the trees and commits, so this
@@ -151,7 +154,7 @@ Ranked, strongest first, by how little of it we control.
    index from the pack alone, so a corpus index is compared against one git
    wrote today from the same bytes.
 6. `git verify-pack -v`, column for column and object by object, over every
-   pack in reach: 3310 objects, 2016 of them deltas. The type and the size
+   pack in reach: 3433 objects, 2016 of them deltas. The type and the size
    come out of the entry header, the size in the pack out of the index's
    sorted offsets, and the chain length and base name out of the walk down
    the chain. The suite also builds a `--window=0` pack and has git assert
@@ -478,9 +481,40 @@ by hand.
       reproducible. Two runs over the same objects gave 76 delta entries
       and then 75, which is a fixture whose shape moves between runs.
       `--threads=1` pins it, at 79 deltas and a deepest chain of 15.
-- [ ] the full `verify-pack -v` diff, and `verify` over packed objects
+- [x] the full `verify-pack -v` diff, and `verify` over packed objects
       why: the strongest oracle in the project, and it cannot be written
       until every column it prints can be computed.
+      files: gitobj.c (loose_exists, Packs, packs_open, packs_close,
+      obj_get, store_names, obj_read moved below the pack section, and
+      `ls`/`verify` over a whole store), t/run.sh sections 2, 3 and 9,
+      README.md
+      proves: `gitobj ls` is compared against `git cat-file
+      --batch-all-objects --batch-check` over every corpus repository
+      whole, line by line: 3307 objects over 12 repositories, 369 loose
+      and 2938 packed. `gitobj verify` hashes all 3307 back to their own
+      names. The per-object `cat-file` sweep now covers every object of
+      the small corpus rather than its loose ones, 1375 objects of which
+      1006 come out of a pack, with `type`, `size`, `raw` and `cat -p`
+      each compared per object.
+      proves, for de-duplication: a bare repository holding every object
+      BOTH loose and packed, which nothing else here is, since the self
+      corpus has no pack and every sibling has no loose object. git lists
+      such an object once and so must we, and the census says the loose
+      copy is the one that was read, which is the order git looks in.
+      8622 assertions before, 16746 after; 2872 to 4133 cloned alone.
+      found: a standalone clone had no packed object in its corpus at all,
+      so both new floors failed there and every comparison in sections 2
+      and 3 was over loose objects only. One of the four self-built
+      repositories is moved wholesale into a pack now. `git repack` could
+      not do it: nothing in those repositories is reachable from a ref, so
+      it leaves 119 of the 120 blobs loose.
+      found: three planted defects, three red. Listing loose objects only
+      fails 378 assertions, dropping the de-duplication fails 3 and only
+      against the both-copies fixture, and reading packs before loose files
+      fails 1546.
+      found: the suite went from 10 seconds to 34. The per-object sweep is
+      most of it, at six processes per object over 1375 objects, and the
+      rest is that a one-object command opens every pack in the store.
 - [ ] refusals: OBJ_MAX, truncation, bad varints, mutation fuzz, `test-asan`
       why: every length in a pack is attacker-chosen, and a 4GB delta
       result must be refused, not allocated.

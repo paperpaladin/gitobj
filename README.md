@@ -20,20 +20,26 @@ f55cee9ad6bf4ba21828ed2409ce2bb378a697be commit 1199 651 50072
 0eda167000fac0757223e1bb1d45bb38402455d3 commit 72 80 50804 1 fb2f17948db733ec0a52bbe6ba0c31663ad2d24a
 538 objects, 121 read whole, 417 through a delta chain, deepest chain 29
 
+$ gitobj ls ../cc/.git/objects | head -2
+00b08fcfd7569c4407399d58abdb585cb5b0643d commit 2474
+00e813579e96a58252d7324af1f0e21b11249363 commit 1186
+538 objects, 0 loose, 538 from 1 pack
+
 $ make test
 sibling corpus (small): 3 of 3 present
+per-object cat-file sweep: self_a(123, 123 loose) self_b(123, 123 loose) self_c(123, 123 loose) self_p(123, 0 loose) cc(538, 0 loose) tarx(218, 0 loose) inflate(250, 0 loose)
 sibling corpus (big): 5 of 5 present
-per-object cat-file sweep: 369 loose objects over self_a(123) self_b(123) self_c(123)
-verified 369 loose objects across self_a self_b self_c cc tarx inflate psh unrepro cmark httpd wasmi
-read 9 pack indexes, 2938 objects
-3050 objects read through a 32-bit offset, 134 through the 64-bit table
+verified 3307 objects across self_a self_b self_c self_p cc tarx inflate psh unrepro cmark httpd wasmi
+ls against git batch-check: 3307 objects over 12 repositories, 369 loose and 2938 packed
+read 10 pack indexes, 3061 objects
+3173 objects read through a 32-bit offset, 134 through the 64-bit table
 the delta corpus: 124 objects, 79 delta entries, deepest chain 15
-packls: 3310 objects against verify-pack -v, 2016 of them deltas, deepest chain 29
-8622 passed, 0 failed
+packls: 3433 objects against verify-pack -v, 2016 of them deltas, deepest chain 29
+16746 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
-and the two are byte-identical over all twelve packs in reach. The columns
+and the two are byte-identical over all thirteen packs in reach. The columns
 are not all of one kind and the mixture is not arbitrary: the type is the one
 at the END of a delta chain, since a delta entry carries none of its own,
 while the size is the one THAT entry declares, which for a delta is the
@@ -50,24 +56,29 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **2872 passed**, against four bare
-repositories it builds itself. Three hold 120 blobs each through one
+Cloned on its own this suite reports **4133 passed**, against five bare
+repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
-those three is then packed with `git pack-objects`, so the index reader has a
-pack of its own and a standalone clone exercises it.
+those four is then moved wholesale into a pack, because a clone with no
+siblings would otherwise have nothing but loose objects in its corpus, and
+every comparison would run over one half of the store while reporting a count
+that looks like the whole of it. (`git repack` is no use for that: nothing in
+these repositories is reachable from a ref, so it would leave 119 of the 120
+blobs loose.) Another is packed with `git pack-objects` into a directory
+beside it, which is what the index reader reads.
 
-The fourth is for the pack reader and is described under the pack walk below,
-because the first three cannot do that job: their blobs are a few dozen bytes
+The fifth is for the deltas and is described under the pack walk below,
+because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 8622 above, because the sibling
+Inside the collection it reports more: 16746 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-2872: the one a reader gets by cloning this repository and running `make
+4133: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -86,19 +97,28 @@ it cannot be satisfied by being self-consistently wrong. It is the reason
 this repo has no expected-output files.
 
 Everything else is `git cat-file -p` / `-t` / `-s` and `git log --format=`,
-object by object, over every loose object of the `CORPUS_SMALL` set: the
-three repositories the suite builds, and cc, tarx and inflate if they are
-there. Those last three contribute NOTHING to it at the moment, and did when
-this was written: all eight siblings have since been repacked and hold no
-loose object at all, so the 369 objects the sweep covers are the self
-corpus's own. The suite prints which repositories it got them from for that
-reason, rather than only how many it found, since the floor of 20 was being
-cleared by a corpus the suite builds itself whatever the neighbours did.
+object by object, over every object of the `CORPUS_SMALL` set, loose and
+packed: the four repositories the suite builds, and cc, tarx and inflate if
+they are there. 1375 objects, 1006 of them out of a pack.
+
+git chooses the set. `cat-file --batch-all-objects` lists what is in the
+store, so the sweep covers whatever is there rather than whatever it went
+looking for. It used to walk the fan-out directories instead, which found
+nothing at all in cc, tarx or inflate: every sibling in the collection has
+been repacked since those were added, so the sweep the previous version of
+this paragraph described as running over three real histories was running
+over the suite's own corpus and clearing its floor of 20 objects with that.
+Hence the per-repository line in the output, and an assertion that both
+halves of the store were read: 8 of the 12 corpus repositories hold nothing
+but packed objects and 3 nothing but loose ones.
 
 The other five siblings get `gitobj verify` over their whole object store,
-which now finds nothing in them either, plus a whole-repository `gitobj ls`
-comparison for the ones with no packfile. This said "nine", the size of the
-corpus, not the reach of the per-object sweep.
+3307 objects across all twelve, plus a `gitobj ls` comparison against `git
+cat-file --batch-all-objects --batch-check` over each one whole, compared
+line by line. That comparison also used to be restricted to a repository
+with no packfile, so it was skipping 8 of the 11 and saying so in a line
+nobody counted. This said "nine", the size of the corpus, not the reach of
+the per-object sweep.
 
 For `gitobj write` the oracle runs the other way: every loose object of the
 tree/commit/tag fixture is re-serialised into a bare repository git created
@@ -356,11 +376,18 @@ size and will matter at a bigger one. It is a four-entry LRU keyed on pack
 offset, in Milestone 1.
 
 The hard invariant, that every object read hashes back to its own name, now
-covers every object in every corpus: 369 loose, and 3310 read out of twelve
-packs, 2016 of those through a delta chain. It said 490 of 3184 two commits
+covers every object in every corpus: 369 loose, and 3433 read out of thirteen
+packs, 2016 of those through a delta chain. It said 490 of 3184 three commits
 ago. What it does not cover is a pack this suite cannot build, which is one
 over two gigabytes, and a pack built to be wrong rather than by git, which is
 the refusals item.
+
+`gitobj ls` and `gitobj verify` read a whole object store now, loose files
+and packs together, and an object that is in both is listed once. `gitobj
+cat`, `raw`, `type`, `size`, `hdr` and `msg` find a packed object too. What
+none of them does is open a pack more than once per run, so the one-object
+commands read every index and every pack in the store to answer about one
+object: 3ms for a packed object in cc, where git is nearer a tenth of that.
 
 The CRC is the strongest thing available to an index reader, and it is not
 the same claim. It says the packed bytes between two offsets are the bytes
@@ -371,9 +398,9 @@ says nothing about whether those bytes inflate to anything.
 Its hard invariant said the suite hashes "every object in every corpus
 repository, loose and packed", its in-scope list described the v2 index, both
 delta encodings and delta chains of any depth, and its oracle list included
-`git verify-pack -v` diffed against a `gitobj packls`. The index was the
-first of those to exist and `packls` is the second; the diff against it is
-real but partial, since it can only be run over a pack that holds no delta.
+`git verify-pack -v` diffed against a `gitobj packls`. Every one of those
+exists now, four commits after the audit, and the hard invariant is finally
+the claim it had been making all along.
 
 A pack over two gigabytes is the one thing in the index the suite cannot
 obtain, so no index git itself wrote with a 64-bit offset in it has ever been
@@ -423,7 +450,10 @@ or partial clones, no alternates. No v1 pack index: it is refused by name
 rather than read, since it has no CRCs and git has not written one since
 2007.
 
-Not fast. Every object is inflated from scratch.
+Not fast. Every object is inflated from scratch, every delta in a chain is
+re-applied for every object on that chain, and a command that wants one
+object opens every pack in the store. `make test` takes 34 seconds, where it
+took 10 before it read any packs.
 
 ## Why this file exists
 
