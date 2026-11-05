@@ -1923,6 +1923,7 @@ static int usage(void) {
 	      "       gitobj idxcrc <pack.idx>\n"
 	      "       gitobj packls <pack.idx>\n"
 	      "       gitobj packverify <pack.idx>\n"
+	      "       gitobj unpack <pack.idx> <objdir>\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
 	      "       gitobj msg <objdir> <sha>\n", stderr);
 	return 2;
@@ -2129,6 +2130,42 @@ int main(int argc, char **argv) {
 		pack_census(&p);
 		pack_close(&p);
 		return 0;
+	}
+
+	/* `git unpack-objects` without the pack having to arrive on stdin: every
+	 * object of a pack, written out as a loose one. It is the two halves of
+	 * this program meeting, so the name is recomputed from what came out of
+	 * the pack rather than copied from the index: a writer handed the name
+	 * it is meant to produce cannot be caught producing another. An object
+	 * whose name does not check out is reported and NOT written, because
+	 * the one thing worse than refusing to unpack a pack is filing an
+	 * object under a name that is not its hash. */
+	if (!strcmp(cmd, "unpack") && argc == 4) {
+		Pack p;
+		pack_open(argv[2], &p);
+		size_t bad = 0, n = 0;
+		char hex[41], want[41];
+		for (size_t k = 0; k < p.x.n; k++) {
+			Obj o = {0, {0}};
+			const char *e = pack_at(&p, p.ord[k].off, &o, NULL, 0);
+			if (e) dieat(e, (size_t)p.ord[k].off);
+			uint8_t id[20];
+			objid(o.type, o.data.p, o.data.n, id);
+			hexify(id, hex);
+			hexify(p.x.names + 20 * p.ord[k].i, want);
+			if (strcmp(hex, want)) {
+				printf("MISMATCH %s hashes to %s\n", want, hex);
+				bad++;
+			} else {
+				loose_write(argv[3], hex, o.type, o.data.p, o.data.n);
+				n++;
+			}
+			bfree(&o.data);
+		}
+		printf("%zu objects written, %zu mismatched\n", n, bad);
+		pack_census(&p);
+		pack_close(&p);
+		return bad ? 1 : 0;
 	}
 
 	/* The hard invariant, over packed objects: the name git filed an object

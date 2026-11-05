@@ -2028,6 +2028,15 @@ def build(spec, kind, flip=None):
     assert all(c is not None for c in content), 'a delta base that is not there'
 
     names = [oid(types[i], content[i]) for i in range(len(spec))]
+    if kind == 'wrongname':
+        # The pack then holds bytes that are not what the index says they
+        # are: one byte of the base blob is changed AFTER the names are
+        # computed, so it and everything delta'd against it come out under a
+        # hash the index does not carry. Everything else about the files
+        # stays true, both checksums and all the CRCs included.
+        b = bytearray(payload[0])
+        b[0] ^= 0xff
+        payload[0] = bytes(b)
 
     # Lay the entries out, which is what fixes the offsets the deltas need.
     body = bytearray()
@@ -2163,8 +2172,8 @@ if __name__ == '__main__':
         spec[1]['instr'] = spec[1]['instr'] + [('raw', b'\0')]
     elif kind == 'copyout':
         spec[1]['instr'] = [('copy', len(BIG) - 8, 16)]
-    elif kind not in ('ok', 'reffwd', 'trunc', 'bigsize', 'ofszero',
-                      'ofspast', 'refself'):
+    elif kind not in ('ok', 'reffwd', 'wrongname', 'trunc', 'bigsize',
+                      'ofszero', 'ofspast', 'refself'):
         raise SystemExit('unknown pack fixture ' + kind)
     pack, idx = build(spec, kind)
     open(outpack, 'wb').write(pack)
@@ -2590,6 +2599,90 @@ refute "a 41-character name is refused" \
 	"$GITOBJ" name "$SOD" "${ssha}0"
 refute "and so is a prefix of a name nothing holds, through cat" \
 	"$GITOBJ" cat "$SOD" ffffffffff
+
+# =====================================================================
+# 13. unpack: a pack read out into loose objects, which git then reads
+# =====================================================================
+# This is the two halves of the program meeting. The pack reader produces
+# the bytes, the loose writer files them, and `git unpack-objects` does the
+# same job from the same pack, so the two stores can be compared whole.
+#
+# The name is recomputed from what came out of the pack rather than copied
+# from the index: a writer handed the name it is meant to produce cannot be
+# caught producing another. An object whose name does not check out is
+# reported and not written.
+UP=$TMP/unpack
+unpack_vs_git() { # <label> <idx> <count>
+	local ours theirs
+	rm -rf "$UP"
+	mkdir -p "$UP"
+	ours=$UP/ours
+	theirs=$UP/theirs
+	$GIT init -q --bare "$ours"
+	$GIT init -q --bare "$theirs"
+	# Both targets start empty, which is what makes "the object is there"
+	# mean "we put it there": a write test can pass by finding its object
+	# already present.
+	eq "$1: the target starts empty" \
+		"$($GIT --git-dir="$ours" cat-file --batch-all-objects --batch-check |
+			wc -l | tr -d ' ')" 0
+	eq "$1: unpack writes every object of the pack" \
+		"$("$GITOBJ" unpack "$2" "$ours/objects" 2>/dev/null)" \
+		"$3 objects written, 0 mismatched"
+	$GIT --git-dir="$theirs" unpack-objects < "${2%.idx}.pack" > /dev/null 2>&1
+	eq "$1: git unpack-objects writes the same number" \
+		"$($GIT --git-dir="$theirs" cat-file --batch-all-objects --batch-check |
+			wc -l | tr -d ' ')" "$3"
+	$GIT --git-dir="$ours" cat-file --batch-all-objects --batch-check |
+		sort > "$TMP/u.ours"
+	$GIT --git-dir="$theirs" cat-file --batch-all-objects --batch-check |
+		sort > "$TMP/u.theirs"
+	local a b
+	while IFS= read -r a <&3 && IFS= read -r b <&4; do
+		eq "$1 ${b%% *}" "$a" "$b"
+	done 3< "$TMP/u.ours" 4< "$TMP/u.theirs"
+	# fsck --strict is the half that matters: it inflates every loose
+	# object we wrote, re-hashes it against the name we filed it under, and
+	# parses the trees and commits.
+	$GIT --git-dir="$ours" fsck --strict > "$TMP/u.fsck" 2>&1
+	assert "$1: git fsck --strict is clean over what we unpacked" sh -c \
+		"! grep -Eiv '^(notice|dangling)' '$TMP/u.fsck' | grep -q ."
+	# And the loose store reads back as the pack did, object for object,
+	# which is the third hop: pack to loose to git.
+	local nchk=0
+	while read -r sha gt gsz; do
+		nchk=$((nchk + 1))
+		eq "$1 cat-file -p $sha" \
+			"$($GIT --git-dir="$ours" cat-file -p "$sha" | cksum)" \
+			"$($GIT --git-dir="$theirs" cat-file -p "$sha" | cksum)"
+	done < "$TMP/u.theirs"
+	[ "$nchk" -eq "$3" ] && ok || no "$1: compared $nchk of $3 objects"
+}
+unpack_vs_git "unpack dd" "$DIDX" "$NDOBJ"
+unpack_vs_git "unpack rd" "$RDIDX" "$NDOBJ"
+unpack_vs_git "unpack self" "$SELFIDX" "$NSELF"
+unpack_vs_git "unpack by hand" "$PG/pack-g.idx" 3
+
+# A pack whose bytes are not what its index says they are. Nothing is
+# written: the one thing worse than refusing to unpack a pack is filing an
+# object under a name that is not its hash.
+rm -rf "$PG/wrongname"
+mkdir -p "$PG/wrongname"
+python3 "$TMP/packgen.py" wrongname "$PG/wrongname/pack-w.pack" \
+	"$PG/wrongname/pack-w.idx"
+rm -rf "$UP/bad"
+$GIT init -q --bare "$UP/bad"
+refute "unpack refuses a pack whose objects do not hash to their names" \
+	"$GITOBJ" unpack "$PG/wrongname/pack-w.idx" "$UP/bad/objects"
+eq "and writes none of them" \
+	"$(loose_shas "$UP/bad" | grep -c .)" 0
+assert "and names the object the index is wrong about" sh -c \
+	"'$GITOBJ' unpack '$PG/wrongname/pack-w.idx' '$UP/bad/objects' 2>/dev/null |
+		grep -q '^MISMATCH [0-9a-f]\{40\} hashes to [0-9a-f]\{40\}$'"
+assert "git verify-pack refuses it too" sh -c \
+	"! $GIT -C '$SCRATCH' verify-pack '$PG/wrongname/pack-w.idx' >/dev/null 2>&1"
+refute "packverify refuses it as well" \
+	"$GITOBJ" packverify "$PG/wrongname/pack-w.idx"
 
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

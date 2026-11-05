@@ -39,7 +39,7 @@ packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 
 base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
 abbreviated names: 1498 of 7 characters resolved, 0 refused
 four-character prefixes: 32 resolved, 4 ambiguous
-18762 passed, 0 failed
+19535 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
@@ -60,7 +60,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **5101 passed**, against five bare
+Cloned on its own this suite reports **5874 passed**, against five bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -77,12 +77,12 @@ because the first four cannot do that job: their blobs are a few dozen bytes
 each and git does not attempt a delta below 50 bytes, so no window setting
 makes it produce one.
 
-Inside the collection it reports more: 18762 above, because the sibling
+Inside the collection it reports more: 19535 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-5101: the one a reader gets by cloning this repository and running `make
+5874: the one a reader gets by cloning this repository and running `make
 test`.
 
 The 134 objects that reach the 64-bit offset table are the same number in
@@ -587,6 +587,40 @@ The lookup is a linear scan over every name in the store, which is the list
 it is not where the time goes: a command that wants one object already opens
 every index and every pack in the store to find it.
 
+## Unpacking, where the two halves meet
+
+`gitobj unpack` reads every object out of a pack and files it as a loose
+one, which is what `git unpack-objects` does, so the two stores can be
+compared whole. Four packs go through it: the two delta fixtures, the self
+corpus's own, and the one built by hand.
+
+The name is recomputed from what came out of the pack rather than copied
+from the index. A writer handed the name it is meant to produce cannot be
+caught producing another, and that is exactly the shape of a round trip
+through two halves of the same program. An object whose name does not check
+out is reported and NOT written: the one thing worse than refusing to unpack
+a pack is filing an object under a name that is not its hash. The fixture
+for it is a pack whose base blob has one byte changed after its names were
+computed, so nothing in it hashes to what the index says; git refuses that
+pack too.
+
+`git fsck --strict` over the result is the half that matters. It inflates
+every loose object we wrote, re-hashes it against the name we filed it
+under, and parses the trees and commits, so the three hops are pack to
+loose to git with git on the far side. Then the listings are compared line
+by line against `git unpack-objects`' own store, and `cat-file -p` object by
+object between the two.
+
+Both targets are created empty and checked for it, because a write test can
+pass by finding its object already there.
+
+Three mutations, two red. Writing every object as a blob fails 249
+assertions, starting with fsck. Writing the object despite a name that does
+not check out fails 1, and that one assertion is the whole point of it.
+Filing the object under the name the INDEX gave rather than the one we
+computed was written as a defect and is not one: the two are equal wherever
+anything is written at all, since the mismatch branch writes nothing.
+
 ## What does not work
 
 The hard invariant, that every object read hashes back to its own name,
@@ -648,7 +682,8 @@ git's own fsck objects to what git produced -- because a refusal with no
 outside authority behind it is just an opinion.
 
 A tree is the only object gitobj constructs. There is no commit or tag
-builder, no packfile writing, and no `unpack-objects`.
+builder and no packfile writing. Unpacking a pack into loose objects does
+work, and has its own section above.
 
 Those paragraphs used to be one line saying the whole thing was read-only,
 which it was until the writer landed. `PLAN.md` had listed `write` and

@@ -22,6 +22,7 @@ gitobj idx    <pack.idx>               `git show-index` layout: offset, name, cr
 gitobj idxcrc <pack.idx>               every CRC against the pack beside it
 gitobj packls <pack.idx>               `git verify-pack -v` layout
 gitobj packverify <pack.idx>           hash every packed object against its name
+gitobj unpack <pack.idx> <objdir>      every object of a pack, written loose
 ```
 
 Every `<sha>` above is a full 40-character name or four or more hex
@@ -672,9 +673,32 @@ by hand.
       pack over two gigabytes, so the one thing still untested is an index
       git PRODUCED with a large offset: `git index-pack` choosing the escape
       itself. That needs 2GB of pack and a suite willing to spend it.
-- [ ] `gitobj write` for packed input, i.e. unpack-objects
+- [x] `gitobj write` for packed input, i.e. unpack-objects
       why: the natural completion of having both halves, and it makes the
       three-hop `pack -> loose -> git fsck` round trip possible.
+      files: gitobj.c (the `unpack` command), t/run.sh section 13 plus a
+      `wrongname` fixture in the pack generator, README.md
+      proves: four packs read out into fresh bare repositories, compared
+      against `git unpack-objects`' own store line by line and then object
+      by object with `cat-file -p`, with `git fsck --strict` clean over
+      ours. fsck is the half that matters: it inflates every loose object
+      we wrote, re-hashes it against the name we filed it under, and parses
+      the trees and commits, so the three hops are pack to loose to git.
+      Both targets are created empty and checked for it, since a write test
+      can pass by finding its object already present.
+      proves, for a pack that is wrong: one whose base blob has a byte
+      changed after its names were computed, so nothing in it hashes to
+      what the index says. Nothing is written, the object is named, and git
+      refuses that pack as well.
+      18762 assertions before, 19535 after; 5101 to 5874 cloned alone.
+      found: three planted defects, two red. Writing every object as a blob
+      fails 249 assertions beginning with fsck; writing an object whose
+      name does not check out fails 1, which is the assertion that exists
+      for it.
+      survivor: filing the object under the name the INDEX gave rather than
+      the one we computed. Written as a defect and is not one: the two are
+      equal wherever anything is written, because the mismatch branch
+      writes nothing.
 - [x] abbreviated object names, by binary search over the index fanout
       why: every human-facing git command takes a 7-character prefix, and
       the fanout is read now, so this is a ten-line function over `idx_open`
