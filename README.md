@@ -979,6 +979,15 @@ none of them does is open a pack more than once per run, so the one-object
 commands read every index and every pack in the store to answer about one
 object: 3ms for a packed object in cc, where git is nearer a tenth of that.
 
+Two recorded survivors are both the bound that keeps a varint or a zlib
+stream off the pack trailer, and SHA-256 did not make either observable. The
+trailer is 32 bytes there rather than 20, so the window the bound guards is
+half again as wide, which was reason enough to re-run it rather than reason
+about it: with the bound deleted the suite still reports 21139 passed, 0
+failed. Every offset is checked against the start of the trailer when the
+index is opened, so the bound only ever reaches the last entry's stream, and
+no well-formed pack has one that runs over.
+
 The CRC is the strongest thing available to an index reader, and it is not
 the same claim. It says the packed bytes between two offsets are the bytes
 git had when it wrote the index, which pins the offsets and the extents, and

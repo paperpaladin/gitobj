@@ -459,11 +459,15 @@ by hand.
       fixture re-stamps the four checksums an edit invalidates and
       `gitobj idxcrc` accepting the pair is the guard that it is a single
       lie.
-      survivor: treating the 20-byte pack trailer as entry data. Every
-      offset is checked against the start of the trailer when the index is
-      opened, so the bound only matters to a varint or a zlib stream that
-      runs off the end of the LAST entry, and no fixture does that. It
-      belongs to the refusals item below.
+      survivor: treating the pack trailer as entry data. Every offset is
+      checked against the start of the trailer when the index is opened, so
+      the bound only matters to a varint or a zlib stream that runs off the
+      end of the LAST entry, and no fixture does that. It belongs to the
+      refusals item below. Re-measured after SHA-256 landed, where the
+      trailer is 32 bytes rather than 20 and the window the bound guards is
+      therefore wider: still a survivor, 21139 passed and 0 failed with it
+      planted. Measured rather than argued from the shape, since the
+      reasoning above is exactly the kind that has been wrong here before.
 - [x] OFS_DELTA: the negative-offset varint
       why: a *different* varint from the size encoding, and the one most
       readers get wrong: `(ofs + 1) << 7`, not a plain shift.
@@ -637,8 +641,8 @@ by hand.
       instruction overruns it first, so the final equality check needs a
       declared result LARGER than what came out, and the insert bound needs
       a delta whose first instruction is the one that overruns.
-      survivor: the bound that keeps a varint or a zlib stream off the
-      20-byte pack trailer, and it is unobservable rather than untested.
+      survivor: the bound that keeps a varint or a zlib stream off the pack
+      trailer, and it is unobservable rather than untested.
       Every offset is checked against the start of the trailer when the
       index is opened, so the bound only reaches the LAST entry's stream,
       and no well-formed pack has one that runs over. The truncation
