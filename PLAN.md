@@ -6,6 +6,7 @@
 libraries, no shelling out to git.
 
 ```
+gitobj [--object-format=sha1|sha256] <command> ...
 gitobj hash   <type> [FILE]            name an object without storing it
 gitobj cat    <objdir> <sha>           like `git cat-file -p`
 gitobj raw    <objdir> <sha>           the payload bytes, no pretty-printing
@@ -26,9 +27,15 @@ gitobj unpack <pack.idx> <objdir>      every object of a pack, written loose
 gitobj pack   <objdir> <out> <window>  names on stdin, write out.pack+out.idx
 ```
 
-Every `<sha>` above is a full 40-character name or four or more hex
-characters of one, which is resolved against the store and refused if it
-matches two objects.
+Every `<sha>` above is a full name, 40 hex characters under SHA-1 and 64
+under SHA-256, or four or more hex characters of one, which is resolved
+against the store and refused if it matches two objects.
+
+`--object-format` comes before the subcommand and defaults to sha1. git takes
+it from `extensions.objectFormat` in a repository's config; gitobj is handed
+an object directory, which need not be inside a repository, so it is told.
+A loose store whose names are the other format's length is refused, naming
+the flag it wanted, rather than reported as empty.
 
 `packls` is not `idx` under another name. Its columns are the pack entry's
 type, its inflated size and its size in the pack, and the first two come out
@@ -42,6 +49,11 @@ of them did.
 
 In scope:
 
+* both object formats. They differ in the hash and in nothing else, so the
+  loose header, the tree entry, the pack entry header, the index layout and
+  every checksum are one set of readers parameterised on a length. SHA-256
+  itself is the SHA-256 half of `../sha2`, vendored the way `../inflate`'s
+  DEFLATE is, without that file's SHA-224/384/512, HMAC, PBKDF2 or HKDF.
 * loose objects: zlib-wrapped `<type> <len>\0<payload>`, read and write,
   with both DEFLATE halves vendored from `../inflate`. Written through a
   temporary name and renamed into place, and left alone if the name is
@@ -109,9 +121,9 @@ the delta chain beneath it. If a single byte of any of that is wrong the hash
 does not match. It is the one assertion that cannot be satisfied by being
 self-consistently wrong.
 
-**It covers every object in every corpus:** 369 loose, and 3438 read out of
+**It covers every object in every corpus:** 383 loose, and 3438 read out of
 fifteen packs, 2019 of those through a delta chain and 2815 of them in eight
-sibling histories. It said "loose and packed" for a good while before any
+sibling histories, plus 126 under SHA-256, 59 of those through a delta chain. It said "loose and packed" for a good while before any
 pack code existed, which was the strongest claim in the file and the one
 that was not true; it covered 490 of 3184 five commits ago. The one thing
 still out of reach is a pack over two gigabytes, which this suite cannot
@@ -203,6 +215,16 @@ Ranked, strongest first, by how little of it we control.
    input it most wants is in section 10: eleven hand-built packs that lie
    about a length, and 300 fuzzed ones.
 
+11. The same oracles again over a corpus built with
+   `--object-format=sha256`, which is a separate entry because they are
+   reached differently: `git hash-object`, `index-pack`, `verify-pack` and
+   `fsck` have no `--object-format` flag and take the format from the
+   repository they run in, so each needs `--git-dir` pointed at a SHA-256
+   one. `show-index` is the exception and takes the flag, having no
+   repository to ask. 64 names, 126 objects swept loose and packed, both
+   delta encodings, 16 blobs written, a tree against `git mktree`, and a
+   pack of ours whose index `git index-pack -o` reproduces byte for byte.
+
 Item 3 was one of four oracles struck off this list for not existing, and
 items 5 and 6 are a second one arriving in pieces. What is missing from item
 6 is a pack over two gigabytes, which the suite cannot build. Repacking for
@@ -219,8 +241,14 @@ by hand.
   Writing REF_DELTA is a non-goal as well: it is read, and there is no
   reason to emit it when OFS_DELTA is shorter and git's own `gc` writes
   that.
-* SHA-256 repositories. `extensions.objectFormat = sha256` is refused.
-  Everything here assumes 20-byte names.
+* Reading `extensions.objectFormat` out of a repository config. SHA-256
+  repositories are read and written; which format a store is in has to be
+  given on the command line, because what gitobj is handed is an object
+  directory and not a repository. This bullet used to say SHA-256 was a
+  non-goal and that `extensions.objectFormat = sha256` was refused, which
+  was two claims and the second was never true: nothing read any config, so
+  a SHA-256 store was not refused, it was read as SHA-1 and reported as
+  holding no objects.
 * Reachability. No ref parsing, none of `rev-parse`'s revision syntax, no
   `--batch` protocol, no index/worktree. An object is addressed by its name
   or by four or more hex characters of it, which is the one part of
@@ -947,17 +975,66 @@ by hand.
       that needs one is over two gigabytes and this writer holds every
       object inflated at once. `make bigpack` builds such a pack with git
       and reads its index; it cannot be rebuilt with `gitobj pack`.
-- [ ] SHA-256 repositories
+- [x] SHA-256 repositories
       why: the format is otherwise identical and the work is mostly
       mechanical, but it needs a corpus built with
       `--object-format=sha256` to be worth anything, and it needs SHA-256
-      itself, which is not here.
-      This said 20 was hard-coded in nine places. It is on 29 lines now
-      counting only the unambiguous forms (`[20]`, `20 *`, `* 20`), since
-      everything the pack reader added names a hash length too, and the
-      index's two 20-byte checksums and the pack's trailer are the same
-      constant wearing a different hat. A count in a `why:` goes stale like
-      any other; re-grep it rather than quoting this.
+      itself, which was not here.
+      This said 20 was hard-coded in nine places, then 29, and told the
+      reader to re-grep rather than quote it. Re-grepped at the commit
+      before this one: the narrow forms (`[20]`, `20 *`, `* 20`) are on 33
+      lines, `40` on 19 and `41` on 30, union 81, of which two are not name
+      lengths (a SHA-1 round boundary and a shift in the delta search's
+      hash). 79, against a figure of nine.
+      files: gitobj.c (Sha256, k256, sha256_block/init/update/final, the
+      Hash wrapper over both, hsz/hexsz, HASH_MAX/HEX_MAX, Names with a
+      runtime stride, the --object-format flag, the other-format guard in
+      loose_names), t/run.sh section 15 plus the exit-status fix in section
+      2, README.md
+      route: the SHA-256 compression function, round constants and initial
+      hash value came from `../sha2`, which implements them against the NIST
+      CAVP vectors; its SHA-224/384/512, HMAC, PBKDF2 and HKDF did not,
+      since an object name uses none of them. Not linked against: one C11
+      file and no dependency beyond zlib is the house rule, and a clone with
+      no siblings has to build. Not rewritten: sha2 owns the vectors. What
+      did not travel is sha2's derivation of its constants from their
+      definitions, which it diffs on every run; here they are typed in and
+      git is what catches a wrong digit.
+      proves: three more bare repositories built with
+      `--object-format=sha256`, the same 63 objects loose, packed, and
+      packed again as REF_DELTA. 64 names against `hash-object` in a
+      SHA-256 repository, 126 objects swept against `cat-file -t`/`-s`/raw
+      bytes/`-p`, `ls` against `cat-file --batch-all-objects
+      --batch-check`, `verify` over both halves, abbreviated names against
+      `rev-parse --verify`, the index against `show-index
+      --object-format=sha256`, `packls` against `verify-pack -v` for both
+      encodings with 59 objects through a delta chain, 16 blobs written and
+      read back with `fsck --strict` clean, a five-entry tree against `git
+      mktree`, the pack unpacked loose and fsck'd, and a pack of ours whose
+      index `git index-pack -o` rebuilds byte-identically: 63 objects, 58
+      OFS_DELTA entries, chain ten deep. 20489 assertions before, 21139
+      after; 6738 to 7388 cloned alone.
+      found: fifteen planted defects, fifteen red, no survivors. The flag
+      made a no-op fails 638, one wrong digit in `k256[0]` 366, one wrong
+      word of the IV 366, padding to 55 bytes 370, a left rotate 366,
+      `w[i-6]` for `w[i-7]` 366, the name list stride fixed at 41 525,
+      `hexify` stopping at 20 bytes 120, the index name stride back to 20
+      276, `IDX_ENT` back to 28 276, the pack trailer back to 20 3, the
+      REF_DELTA base name back to 20 4, the tree entry stride back to 20 3,
+      mktree writing 20 bytes 2, the other-format guard removed 2.
+      found: in the harness, twice, from the one mutant that survived. The
+      tree entry stride was unobservable because the SHA-256 corpus had a
+      tree of ONE entry, where a wrong stride prints that entry correctly
+      and then dies on the end of the object. And the per-object sweep
+      compared stdout alone, with `2>/dev/null` and no look at the exit
+      status, so dying after correct output scored as agreement. Both are
+      fixed, in section 15 and in section 2's 1498-object sweep, which has
+      been that way since it was written.
+      found: a SHA-256 store read as SHA-1 reported `0 objects` and exited
+      0, because a 62-character filename is not 38 characters and was
+      skipped as a stray file. It refuses now and names the flag. The index
+      needed no such guard: its own checksum and the size arithmetic above
+      it refuse the wrong format either way round.
 - [ ] a 64-bit offset in an index we wrote
       why: the only part of `gitobj pack` nothing exercises. The escape is
       written, and the writer's census says 0 of N through the table on

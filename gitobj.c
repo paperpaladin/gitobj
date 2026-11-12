@@ -985,6 +985,150 @@ static void sha1_final(Sha1 *s, uint8_t out[20]) {
 	}
 }
 
+/* ------------------------------------------------------------- SHA-256 */
+
+/* FIPS 180-4 section 6.2. The SHA-256 half of `../sha2` travelled here
+ * rather than being written a second time, which is the arrangement
+ * `../inflate`'s DEFLATE code already has: sha2 owns the NIST CAVP vectors
+ * it is checked against, and its SHA-224/384/512, HMAC, PBKDF2 and HKDF are
+ * not things an object name needs.
+ *
+ * What did not travel is sha2's derivation of the constants. Its
+ * tools/genk.py computes k256 and the initial hash value from the cube and
+ * square roots they are defined as, and diffs all of them on every test run;
+ * here they are typed in. git is what catches a wrong digit instead: one
+ * wrong bit below moves every object name, and section 1 of t/run.sh
+ * compares ours against `git hash-object --object-format=sha256` for every
+ * payload shape it has. */
+typedef struct {
+	uint32_t h[8];
+	uint64_t bits;
+	uint8_t blk[64];
+	size_t n;
+} Sha256;
+
+static const uint32_t k256[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+	0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+	0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+	0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+	0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+static uint32_t ror(uint32_t v, int s) { return v >> s | v << (32 - s); }
+
+static void sha256_block(Sha256 *s, const uint8_t *p) {
+	uint32_t w[64];
+	for (int i = 0; i < 16; i++)
+		w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 |
+		       (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+	for (int i = 16; i < 64; i++) {
+		uint32_t x = w[i - 15], y = w[i - 2];
+		uint32_t s0 = ror(x, 7) ^ ror(x, 18) ^ x >> 3;
+		uint32_t s1 = ror(y, 17) ^ ror(y, 19) ^ y >> 10;
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+	uint32_t a = s->h[0], b = s->h[1], c = s->h[2], d = s->h[3];
+	uint32_t e = s->h[4], f = s->h[5], g = s->h[6], hh = s->h[7];
+	for (int i = 0; i < 64; i++) {
+		uint32_t s1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25);
+		uint32_t t1 = hh + s1 + ((e & f) ^ (~e & g)) + k256[i] + w[i];
+		uint32_t s0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22);
+		uint32_t t2 = s0 + ((a & b) ^ (a & c) ^ (b & c));
+		hh = g; g = f; f = e; e = d + t1;
+		d = c; c = b; b = a; a = t1 + t2;
+	}
+	s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+	s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += hh;
+}
+
+static void sha256_init(Sha256 *s) {
+	s->h[0] = 0x6a09e667; s->h[1] = 0xbb67ae85;
+	s->h[2] = 0x3c6ef372; s->h[3] = 0xa54ff53a;
+	s->h[4] = 0x510e527f; s->h[5] = 0x9b05688c;
+	s->h[6] = 0x1f83d9ab; s->h[7] = 0x5be0cd19;
+	s->bits = 0;
+	s->n = 0;
+}
+
+static void sha256_update(Sha256 *s, const void *data, size_t n) {
+	const uint8_t *p = data;
+	s->bits += (uint64_t)n * 8;
+	while (n) {
+		size_t k = 64 - s->n;
+		if (k > n) k = n;
+		memcpy(s->blk + s->n, p, k);
+		s->n += k;
+		p += k;
+		n -= k;
+		if (s->n == 64) { sha256_block(s, s->blk); s->n = 0; }
+	}
+}
+
+static void sha256_final(Sha256 *s, uint8_t out[32]) {
+	uint64_t bits = s->bits;
+	uint8_t pad = 0x80;
+	sha256_update(s, &pad, 1);
+	pad = 0;
+	while (s->n != 56) sha256_update(s, &pad, 1);
+	uint8_t len[8];
+	for (int i = 0; i < 8; i++) len[i] = (uint8_t)(bits >> (56 - 8 * i));
+	sha256_update(s, len, 8);
+	for (int i = 0; i < 8; i++) {
+		out[4 * i] = (uint8_t)(s->h[i] >> 24);
+		out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
+		out[4 * i + 2] = (uint8_t)(s->h[i] >> 8);
+		out[4 * i + 3] = (uint8_t)s->h[i];
+	}
+}
+
+/* -------------------------------------------------------- object format */
+
+/* git has two object formats and they differ in the hash and in nothing
+ * else. The loose header, the tree entry, the pack entry header, the index
+ * layout and every checksum in both files are the same shapes with a
+ * different number of bytes in them, so what follows is parameterised on one
+ * length rather than written twice.
+ *
+ * git reads the choice out of extensions.objectFormat in the repository
+ * config. gitobj is handed an object directory, which need not have a
+ * repository around it at all (t/run.sh builds several that do not), so it
+ * is told instead: --object-format=sha256 ahead of the subcommand.
+ *
+ * HASH_MAX and HEX_MAX size the small fixed buffers a name passes through.
+ * Under SHA-1 those are 12 and 24 bytes longer than what sits in them, which
+ * is the shape that turns ASan off, and the README says so rather than
+ * pretending otherwise. The arrays that are sized from a FILE -- the index's
+ * name table, the list of every name in a store -- have a runtime stride for
+ * exactly that reason. */
+#define HASH_MAX 32
+#define HEX_MAX 64
+static size_t hsz = 20;
+#define hexsz (2 * hsz)
+
+typedef struct { Sha1 a; Sha256 b; } Hash;
+
+static void hash_init(Hash *h) {
+	if (hsz == 20) sha1_init(&h->a); else sha256_init(&h->b);
+}
+static void hash_update(Hash *h, const void *p, size_t n) {
+	if (hsz == 20) sha1_update(&h->a, p, n); else sha256_update(&h->b, p, n);
+}
+static void hash_final(Hash *h, uint8_t *out) {
+	if (hsz == 20) sha1_final(&h->a, out); else sha256_final(&h->b, out);
+}
+
 /* --------------------------------------------------------------- hex */
 
 static const char hexd[] = "0123456789abcdef";
@@ -996,23 +1140,23 @@ static int unhex1(int c) {
 	return -1;
 }
 
-/* out must hold 41 bytes. */
-static void hexify(const uint8_t id[20], char *out) {
-	for (int i = 0; i < 20; i++) {
+/* out must hold hexsz + 1 bytes. */
+static void hexify(const uint8_t *id, char *out) {
+	for (size_t i = 0; i < hsz; i++) {
 		out[2 * i] = hexd[id[i] >> 4];
 		out[2 * i + 1] = hexd[id[i] & 15];
 	}
-	out[40] = 0;
+	out[hexsz] = 0;
 }
 
-/* 40 hex chars to 20 bytes. Returns 0 on success. */
-static int unhexify(const char *s, uint8_t id[20]) {
-	for (int i = 0; i < 20; i++) {
+/* hexsz hex chars to hsz bytes. Returns 0 on success. */
+static int unhexify(const char *s, uint8_t *id) {
+	for (size_t i = 0; i < hsz; i++) {
 		int a = unhex1((unsigned char)s[2 * i]), b = unhex1((unsigned char)s[2 * i + 1]);
 		if (a < 0 || b < 0) return -1;
 		id[i] = (uint8_t)(a << 4 | b);
 	}
-	return s[40] ? -1 : 0;
+	return s[hexsz] ? -1 : 0;
 }
 
 /* ------------------------------------------------------------ object types */
@@ -1040,9 +1184,9 @@ static int tcode(const char *s) {
 	return T_NONE;
 }
 
-/* The name of an object is SHA-1 over the loose-object header followed by the
- * payload -- the header is part of the hash even for packed objects, where it
- * is never stored. */
+/* The name of an object is the hash over the loose-object header followed by
+ * the payload -- the header is part of the hash even for packed objects,
+ * where it is never stored. */
 /* "<type> <len>", with the NUL counted in the returned length. One function
  * because the writer must emit exactly the bytes the name is hashed over: two
  * copies of this would be two chances to disagree, and the disagreement would
@@ -1052,14 +1196,14 @@ static size_t objhdr(char buf[64], int type, size_t n) {
 	return (size_t)k + 1;
 }
 
-static void objid(int type, const uint8_t *p, size_t n, uint8_t id[20]) {
+static void objid(int type, const uint8_t *p, size_t n, uint8_t *id) {
 	char hdr[64];
 	size_t k = objhdr(hdr, type, n);
-	Sha1 s;
-	sha1_init(&s);
-	sha1_update(&s, hdr, k);
-	sha1_update(&s, p, n);
-	sha1_final(&s, id);
+	Hash s;
+	hash_init(&s);
+	hash_update(&s, hdr, k);
+	hash_update(&s, p, n);
+	hash_final(&s, id);
 }
 
 /* ------------------------------------------------------------------- io */
@@ -1207,7 +1351,7 @@ static void loose_write(const char *objdir, const char *hex, int type,
 
 /* A tree is a packed sequence of
  *
- *     <mode, octal ASCII, no leading zero> SP <name> NUL <20 raw bytes>
+ *     <mode, octal ASCII, no leading zero> SP <name> NUL <hsz raw bytes>
  *
  * and nothing else: no count, no terminator, no padding. The mode is where
  * the surprises are. It is octal but written without the leading zero, so a
@@ -1236,11 +1380,11 @@ static const char *tree_next(const uint8_t *p, size_t n, size_t *off, Tent *e) {
 	if (i >= n) return "tree entry name is not NUL-terminated";
 	if (i == nm) return "tree entry has an empty name";
 	if (memchr(p + nm, '/', i - nm)) return "tree entry name contains a slash";
-	if (n - i - 1 < 20) return "tree entry is missing its object name";
+	if (n - i - 1 < hsz) return "tree entry is missing its object name";
 	e->mode = mode;
 	e->name = (const char *)p + nm;
 	e->id = p + i + 1;
-	*off = i + 1 + 20;
+	*off = i + 1 + hsz;
 	return NULL;
 }
 
@@ -1294,7 +1438,7 @@ static void tree_print(const uint8_t *p, size_t n) {
 		Tent e;
 		const char *err = tree_next(p, n, &off, &e);
 		if (err) die(err);
-		char hex[41];
+		char hex[HEX_MAX + 1];
 		hexify(e.id, hex);
 		printf("%06o %s %s\t", e.mode, tree_entry_type(e.mode), hex);
 		print_quoted_name(e.name, strlen(e.name));
@@ -1306,14 +1450,14 @@ static void tree_print(const uint8_t *p, size_t n) {
 
 /* `git mktree` format, one entry per line:
  *
- *     <mode> SP <type> SP <40 hex> TAB <name>
+ *     <mode> SP <type> SP <hexsz hex> TAB <name>
  *
  * which is exactly what `git ls-tree` and our own `cat` of a tree print, so
  * a tree can be read out of one repository and rebuilt in another. The name
  * is C-quoted when it needs to be, so this needs the inverse of
  * print_quoted_name as well as the sort rule.
  */
-typedef struct { unsigned mode; uint8_t id[20]; char *name; size_t nlen; } Ment;
+typedef struct { unsigned mode; uint8_t id[HASH_MAX]; char *name; size_t nlen; } Ment;
 
 /* git's base_name_compare. Entries are sorted as if every directory name
  * carried a trailing slash, so "a/" falls between "a.c" and "a0" rather than
@@ -1412,13 +1556,13 @@ static const char *parse_mkline(const char *p, size_t n, Ment *e) {
 	if (i - t0 != strlen(want) || memcmp(p + t0, want, i - t0))
 		return "mktree input: type does not match the mode";
 	i++;
-	if (n - i < 41 || p[i + 40] != '\t')
-		return "mktree input: object name is not 40 characters followed by a tab";
-	char hex[41];
-	memcpy(hex, p + i, 40);
-	hex[40] = 0;
+	if (n - i < hexsz + 1 || p[i + hexsz] != '\t')
+		return "mktree input: object name is not the right length followed by a tab";
+	char hex[HEX_MAX + 1];
+	memcpy(hex, p + i, hexsz);
+	hex[hexsz] = 0;
 	if (unhexify(hex, e->id)) return "mktree input: object name is not hex";
-	i += 41;
+	i += hexsz + 1;
 	e->name = unquote_name(p + i, n - i, &e->nlen);
 	if (!e->name) return "mktree input: name is not validly quoted";
 	if (!e->nlen) return "mktree input: entry has an empty name";
@@ -1440,7 +1584,7 @@ static void tree_build(Ment *v, size_t n, Buf *out) {
 		int k = snprintf(m, sizeof m, "%o ", v[i].mode);
 		bwrite(out, m, (size_t)k);
 		bwrite(out, v[i].name, v[i].nlen + 1);  /* the NUL is part of the entry */
-		bwrite(out, v[i].id, 20);
+		bwrite(out, v[i].id, hsz);
 	}
 }
 
@@ -1522,13 +1666,13 @@ static int hdr_print(const uint8_t *p, size_t n, const char *key) {
  *     uint32 2               version
  *     uint32 fanout[256]     CUMULATIVE: fanout[i] is how many names have a
  *                            first byte <= i, so fanout[255] is the count
- *     uint8  name[n][20]     sorted ascending
+ *     uint8  name[n][hsz]    sorted ascending
  *     uint32 crc[n]          CRC-32 of the object's bytes AS PACKED
  *     uint32 off[n]          pack offset, or, with the top bit set, an index
  *                            into the table below
  *     uint64 off64[m]        offsets at or above 2^31
- *     uint8  packsum[20]     the .pack's own trailing checksum
- *     uint8  idxsum[20]      SHA-1 of everything above
+ *     uint8  packsum[hsz]    the .pack's own trailing checksum
+ *     uint8  idxsum[hsz]     the hash of everything above
  *
  * Three of those are cross-checks rather than data, and they are the reason
  * the format is worth reading carefully: the fanout has to agree with the
@@ -1537,8 +1681,8 @@ static int hdr_print(const uint8_t *p, size_t n, const char *key) {
  */
 
 #define IDX_HDR 1032             /* magic, version, 256 fanout entries */
-#define IDX_TRAIL 40             /* the two checksums */
-#define IDX_ENT 28               /* name + crc + 32-bit offset, per object */
+#define IDX_TRAIL (2 * hsz)      /* the two checksums */
+#define IDX_ENT (hsz + 8)        /* name + crc + 32-bit offset, per object */
 
 typedef struct {
 	Buf raw;
@@ -1617,19 +1761,19 @@ static void idx_open(const char *path, Idx *x) {
 		dieval("more 64-bit offsets than objects that could need one", x->nbig);
 
 	x->names = p + IDX_HDR;
-	x->crcs = x->names + 20 * x->n;
+	x->crcs = x->names + hsz * x->n;
 	x->off32 = x->crcs + 4 * x->n;
 	x->off64 = x->off32 + 4 * x->n;
 
-	uint8_t sum[20];
-	Sha1 s;
-	sha1_init(&s);
-	sha1_update(&s, p, n - 20);
-	sha1_final(&s, sum);
-	if (memcmp(sum, p + n - 20, 20)) dieat("pack index checksum mismatch", n - 20);
+	uint8_t sum[HASH_MAX];
+	Hash s;
+	hash_init(&s);
+	hash_update(&s, p, n - hsz);
+	hash_final(&s, sum);
+	if (memcmp(sum, p + n - hsz, hsz)) dieat("pack index checksum mismatch", n - hsz);
 
 	for (size_t i = 1; i < x->n; i++)
-		if (memcmp(x->names + 20 * i, x->names + 20 * (i - 1), 20) <= 0)
+		if (memcmp(x->names + hsz * i, x->names + hsz * (i - 1), hsz) <= 0)
 			dieat("object names are not in increasing order", i);
 	/* The fanout is checked against the names rather than merely for being
 	 * monotonic: an index whose fanout is internally tidy and disagrees
@@ -1639,7 +1783,7 @@ static void idx_open(const char *path, Idx *x) {
 	for (size_t b = 0; b < 256; b++) {
 		size_t end = be32(x->fan + 4 * b);
 		for (; at < end; at++)
-			if (x->names[20 * at] != (uint8_t)b)
+			if (x->names[hsz * at] != (uint8_t)b)
 				dieat("fanout bucket disagrees with the name it indexes", at);
 	}
 }
@@ -1796,18 +1940,18 @@ static void pack_open(const char *idxpath, Pack *p) {
 		die("pack path too long");
 	readall(pp, &p->pk);
 	bexact(&p->pk);
-	/* 12 bytes of header, 20 of trailing checksum, and at least one byte
+	/* 12 bytes of header, hsz of trailing checksum, and at least one byte
 	 * between them for the smallest possible object. */
-	if (p->pk.n < PACK_HDR + 21)
+	if (p->pk.n < PACK_HDR + hsz + 1)
 		dieval("pack shorter than a header and a trailer", p->pk.n);
 	if (memcmp(p->pk.p, "PACK", 4)) die2("not a packfile", pp);
 	if (be32(p->pk.p + 4) != 2)
 		dieval("unsupported pack version", be32(p->pk.p + 4));
 	if (be32(p->pk.p + 8) != p->x.n)
 		dieval("pack object count disagrees with the index", be32(p->pk.p + 8));
-	if (memcmp(p->x.raw.p + p->x.raw.n - 40, p->pk.p + p->pk.n - 20, 20))
+	if (memcmp(p->x.raw.p + p->x.raw.n - IDX_TRAIL, p->pk.p + p->pk.n - hsz, hsz))
 		dieat("the pack checksum in the index is not the trailer the pack carries",
-		      p->x.raw.n - 40);
+		      p->x.raw.n - IDX_TRAIL);
 
 	p->ord = malloc(p->x.n ? p->x.n * sizeof *p->ord : 1);
 	if (!p->ord) die("out of memory");
@@ -1817,7 +1961,7 @@ static void pack_open(const char *idxpath, Pack *p) {
 	}
 	if (p->x.n) qsort(p->ord, p->x.n, sizeof *p->ord, pofscmp);
 	for (size_t k = 0; k < p->x.n; k++) {
-		if (p->ord[k].off < PACK_HDR || p->ord[k].off >= p->pk.n - 20)
+		if (p->ord[k].off < PACK_HDR || p->ord[k].off >= p->pk.n - hsz)
 			dieat("index offset is outside the pack", p->ord[k].i);
 		if (k && p->ord[k].off == p->ord[k - 1].off)
 			dieat("two objects share a pack offset", p->ord[k].i);
@@ -1852,7 +1996,7 @@ static size_t pack_ord(const Pack *p, uint64_t off) {
  * `verify-pack -v`'s size-in-pack column. */
 static uint64_t pack_extent(const Pack *p, size_t k) {
 	uint64_t beg = p->ord[k].off;
-	uint64_t end = k + 1 < p->x.n ? p->ord[k + 1].off : p->pk.n - 20;
+	uint64_t end = k + 1 < p->x.n ? p->ord[k + 1].off : p->pk.n - hsz;
 	return end - beg;
 }
 
@@ -1952,12 +2096,12 @@ static void dbase_put(Pack *p, uint64_t off, const Obj *o, const Ent *ent) {
  * whose first byte matches, so the search starts inside one bucket of 256
  * rather than over the whole list. A REF_DELTA names its base by hash and
  * this is the lookup an OFS_DELTA does not need. */
-static int idx_find(const Idx *x, const uint8_t id[20], size_t *out) {
+static int idx_find(const Idx *x, const uint8_t *id, size_t *out) {
 	size_t lo = id[0] ? be32(x->fan + 4 * (id[0] - 1)) : 0;
 	size_t hi = be32(x->fan + 4 * id[0]);
 	while (lo < hi) {
 		size_t mid = lo + (hi - lo) / 2;
-		int c = memcmp(x->names + 20 * mid, id, 20);
+		int c = memcmp(x->names + hsz * mid, id, hsz);
 		if (c < 0) lo = mid + 1;
 		else if (c > 0) hi = mid;
 		else { *out = mid; return 1; }
@@ -2096,7 +2240,7 @@ static const char *pack_resolve(Pack *p, uint64_t off, Obj *out, Ent *me,
 	const uint8_t *q = p->pk.p;
 	/* The trailer is not entry data, so it is not part of what a varint or
 	 * a zlib stream is allowed to read into. */
-	size_t n = p->pk.n - 20;
+	size_t n = p->pk.n - hsz;
 	if (depth > DELTA_MAX_DEPTH)
 		return "delta chain is deeper than gitobj will follow";
 	if (off < PACK_HDR || off >= n) return "pack offset is outside the pack";
@@ -2124,13 +2268,13 @@ static const char *pack_resolve(Pack *p, uint64_t off, Obj *out, Ent *me,
 		 * this entry or after it. A base that is not in this pack at all
 		 * is a thin pack, which git only ever sends down a wire and never
 		 * stores, so it is refused rather than searched for elsewhere. */
-		if (n - at < 20)
+		if (n - at < hsz)
 			return "REF_DELTA base name runs past the end of the pack";
 		size_t bi;
 		if (!idx_find(&p->x, q + at, &bi))
 			return "REF_DELTA base is not an object this pack holds";
 		boff = idx_offset(&p->x, bi);
-		at += 20;
+		at += hsz;
 		p->nref++;
 	} else if (t < T_COMMIT || t > T_TAG) {
 		return "pack entry has a type number git does not use";
@@ -2179,16 +2323,26 @@ static const char *pack_resolve(Pack *p, uint64_t off, Obj *out, Ent *me,
 
 /* ------------------------------------------------- enumerating the store */
 
-typedef struct { char (*v)[41]; size_t n, cap; } Names;
+/* One flat block of names, each hexsz + 1 bytes, addressed through nat().
+ * Not `char (*v)[HEX_MAX + 1]`: under SHA-1 that leaves 24 unused bytes per
+ * name inside one allocation, which is how a buffer bigger than its data
+ * turns ASan off, and this repository already has that shape recorded
+ * against its index buffers. The stride is a runtime value so the
+ * allocation holds the names and nothing else. */
+typedef struct { char *v; size_t n, cap; } Names;
+
+#define NSTRIDE (hexsz + 1)
+
+static char *nat(const Names *s, size_t i) { return s->v + i * NSTRIDE; }
 
 static void nadd(Names *s, const char *hex) {
 	if (s->n == s->cap) {
 		s->cap = s->cap ? s->cap * 2 : 256;
-		char (*q)[41] = realloc(s->v, s->cap * 41);
+		char *q = realloc(s->v, s->cap * NSTRIDE);
 		if (!q) die("out of memory");
 		s->v = q;
 	}
-	memcpy(s->v[s->n++], hex, 41);
+	memcpy(nat(s, s->n++), hex, NSTRIDE);
 }
 
 static int ishex(const char *s, size_t n) {
@@ -2198,8 +2352,8 @@ static int ishex(const char *s, size_t n) {
 
 /* Every loose object under objdir, by name. The two-hex-digit fan-out
  * directory is part of the name, which is why both halves are checked: a
- * stray file in objects/ab/ that is not 38 hex characters is not an object
- * and must not be reported as a broken one. */
+ * stray file in objects/ab/ that is not hexsz - 2 hex characters is not an
+ * object and must not be reported as a broken one. */
 static void loose_names(const char *objdir, Names *out) {
 	DIR *d = opendir(objdir);
 	if (!d) die2("cannot open object directory", objdir);
@@ -2213,10 +2367,24 @@ static void loose_names(const char *objdir, Names *out) {
 		if (!d2) continue;
 		struct dirent *f;
 		while ((f = readdir(d2))) {
-			if (strlen(f->d_name) != 38 || !ishex(f->d_name, 38)) continue;
-			char hex[41];
+			/* A hex name of the OTHER format's length is not a
+			 * stray file, it is an object gitobj has been told the
+			 * wrong format for, and skipping it silently is how a
+			 * store of 600 objects reports 0 and exits 0. The one
+			 * thing this must not do is guess: the two formats
+			 * cannot be mixed in one store, so the answer is to
+			 * say which flag was wanted. */
+			if (strlen(f->d_name) == (hsz == 20 ? 62u : 38u) &&
+			    ishex(f->d_name, strlen(f->d_name)))
+				die2(hsz == 20
+				     ? "this object store is SHA-256: pass --object-format=sha256"
+				     : "this object store is SHA-1: pass --object-format=sha1",
+				     objdir);
+			if (strlen(f->d_name) != hexsz - 2 ||
+			    !ishex(f->d_name, hexsz - 2)) continue;
+			char hex[HEX_MAX + 1];
 			memcpy(hex, e->d_name, 2);
-			memcpy(hex + 2, f->d_name, 39);
+			memcpy(hex + 2, f->d_name, hexsz - 1);
 			nadd(out, hex);
 		}
 		closedir(d2);
@@ -2357,8 +2525,8 @@ static void odb_close(Odb *o) {
  * pruned. The two copies are the same bytes or one of them is corrupt, and
  * `verify` is what says which. */
 static int obj_get(Odb *o, const char *hex, Obj *out) {
-	uint8_t want[20];
-	if (unhexify(hex, want)) die2("not a 40-character object name", hex);
+	uint8_t want[HASH_MAX];
+	if (unhexify(hex, want)) die2("not a full-length object name", hex);
 	for (size_t i = 0; i < o->dirs.n; i++)
 		if (loose_read(o->dirs.v[i], hex, out)) return 1;
 	for (size_t i = 0; i < o->packs.n; i++) {
@@ -2380,18 +2548,18 @@ static void odb_names(Odb *o, Names *out) {
 	/* Every directory in the list exists: alt_scan only adds an alternate
 	 * it could open, and the primary is the caller's own argument. */
 	for (size_t i = 0; i < o->dirs.n; i++) loose_names(o->dirs.v[i], out);
-	char hex[41];
+	char hex[HEX_MAX + 1];
 	for (size_t i = 0; i < o->packs.n; i++)
 		for (size_t k = 0; k < o->packs.v[i].x.n; k++) {
-			hexify(o->packs.v[i].x.names + 20 * k, hex);
+			hexify(o->packs.v[i].x.names + hsz * k, hex);
 			nadd(out, hex);
 		}
 	if (!out->n) return;
-	qsort(out->v, out->n, 41, cmpname);
+	qsort(out->v, out->n, NSTRIDE, cmpname);
 	size_t w = 1;
 	for (size_t i = 1; i < out->n; i++)
-		if (strcmp(out->v[i], out->v[w - 1]))
-			memcpy(out->v[w++], out->v[i], 41);
+		if (strcmp(nat(out, i), nat(out, w - 1)))
+			memcpy(nat(out, w++), nat(out, i), NSTRIDE);
 	out->n = w;
 }
 
@@ -2408,14 +2576,14 @@ static void odb_names(Odb *o, Names *out) {
  * has collected anyway. The fanout would turn it into a binary search per
  * pack, and the cost here is not the scan: a command that wants one object
  * already opens every index and every pack in the store to find it. */
-static int odb_resolve(Odb *o, const char *pre, char full[41]) {
+static int odb_resolve(Odb *o, const char *pre, char full[HEX_MAX + 1]) {
 	size_t pn = strlen(pre);
 	Names ns = {0};
 	odb_names(o, &ns);
 	int n = 0;
 	for (size_t i = 0; i < ns.n && n < 2; i++)
-		if (!strncmp(ns.v[i], pre, pn)) {
-			memcpy(full, ns.v[i], 41);
+		if (!strncmp(nat(&ns, i), pre, pn)) {
+			memcpy(full, nat(&ns, i), NSTRIDE);
 			n++;
 		}
 	free(ns.v);
@@ -2426,29 +2594,29 @@ static int odb_resolve(Odb *o, const char *pre, char full[41]) {
  * characters is git's own minimum, and an odd number of them is fine. */
 static void name_check(const char *hex) {
 	size_t n = strlen(hex);
-	if (n == 40) {
-		uint8_t id[20];
+	if (n == hexsz) {
+		uint8_t id[HASH_MAX];
 		if (unhexify(hex, id)) die2("not an object name", hex);
 		return;
 	}
-	if (n < 4 || n > 40 || !ishex(hex, n))
+	if (n < 4 || n > hexsz || !ishex(hex, n))
 		die2("not an object name, nor 4 or more hex characters of one", hex);
 }
 
 /* Resolve, and die rather than return a second answer. */
-static void name_resolve(Odb *o, const char *hex, char full[41]) {
+static void name_resolve(Odb *o, const char *hex, char full[HEX_MAX + 1]) {
 	int k = odb_resolve(o, hex, full);
 	if (!k) die2("object not found", hex);
 	if (k > 1) die2("short object name is ambiguous", hex);
 }
 
 /* The full name of whatever the caller named, which may be a prefix. A
- * 40-character name is taken as itself, because the exact lookup is a
+ * full-length name is taken as itself, because the exact lookup is a
  * binary search where resolving a prefix is a walk over the store. */
-static void obj_full(Odb *o, const char *hex, char full[41]) {
+static void obj_full(Odb *o, const char *hex, char full[HEX_MAX + 1]) {
 	name_check(hex);
-	if (strlen(hex) == 40) {
-		memcpy(full, hex, 41);
+	if (strlen(hex) == hexsz) {
+		memcpy(full, hex, NSTRIDE);
 		return;
 	}
 	name_resolve(o, hex, full);
@@ -2460,7 +2628,7 @@ static void obj_full(Odb *o, const char *hex, char full[41]) {
 static void obj_read(const char *objdir, const char *hex, Obj *out) {
 	Odb o;
 	odb_open(objdir, &o);
-	char full[41];
+	char full[HEX_MAX + 1];
 	obj_full(&o, hex, full);
 	int got = obj_get(&o, full, out);
 	odb_close(&o);
@@ -2679,8 +2847,8 @@ static void delta_make(const uint8_t *b, size_t bn,
  * 2.5GB pack), and closing it means streaming the objects twice: once for
  * the delta search and once to write. */
 typedef struct {
-	char hex[41];
-	uint8_t id[20];
+	char hex[HEX_MAX + 1];
+	uint8_t id[HASH_MAX];
 	int type;
 	Buf data;
 	uint64_t off;     /* where this entry starts in the pack */
@@ -2698,11 +2866,11 @@ static int pentcmp(const void *va, const void *vb) {
 	const Pent *a = va, *b = vb;
 	if (a->type != b->type) return a->type < b->type ? -1 : 1;
 	if (a->data.n != b->data.n) return a->data.n > b->data.n ? -1 : 1;
-	return memcmp(a->id, b->id, 20);
+	return memcmp(a->id, b->id, hsz);
 }
 
 static int pidcmp(const void *va, const void *vb) {
-	return memcmp(((const Pent *)va)->id, ((const Pent *)vb)->id, 20);
+	return memcmp(((const Pent *)va)->id, ((const Pent *)vb)->id, hsz);
 }
 
 static void filewrite(const char *path, const void *p, size_t n) {
@@ -2719,7 +2887,7 @@ static void filewrite(const char *path, const void *p, size_t n) {
 /* Write <base>.pack and <base>.idx holding exactly these objects. Returns
  * the pack's trailing checksum in id. */
 static void pack_write(Pent *v, size_t n, int window, int maxdepth,
-                       const char *base, uint8_t id[20]) {
+                       const char *base, uint8_t *id) {
 	wr_copy = wr_ins = wr_copy64k = wr_offw = 0;
 	qsort(v, n, sizeof *v, pentcmp);
 
@@ -2750,7 +2918,9 @@ static void pack_write(Pent *v, size_t n, int window, int maxdepth,
 			/* Worth it only if the delta is smaller than the object by more
 			 * than the entry's own overhead, and only compared against the
 			 * object: comparing two compressed sizes would mean deflating
-			 * every candidate. */
+			 * every candidate. The 20 is that overhead in bytes and not a
+			 * hash length, which is worth saying now that every other one
+			 * in this file is. */
 			if (d.n + 20 < v[i].data.n && (!best.n || d.n < best.n)) {
 				bfree(&best);
 				best = d;
@@ -2782,11 +2952,11 @@ static void pack_write(Pent *v, size_t n, int window, int maxdepth,
 		v[i].crc = crc32z(pk.p + v[i].off, pk.n - v[i].off);
 	}
 
-	Sha1 s;
-	sha1_init(&s);
-	sha1_update(&s, pk.p, pk.n);
-	sha1_final(&s, id);
-	bwrite(&pk, id, 20);
+	Hash s;
+	hash_init(&s);
+	hash_update(&s, pk.p, pk.n);
+	hash_final(&s, id);
+	bwrite(&pk, id, hsz);
 
 	/* The index is in name order, which is a different order from the
 	 * pack's, so the offsets it carries are not sorted. */
@@ -2810,7 +2980,7 @@ static void pack_write(Pent *v, size_t n, int window, int maxdepth,
 		                 (uint8_t)(at >> 8), (uint8_t)at};
 		bwrite(&ix, b4, 4);
 	}
-	for (size_t i = 0; i < n; i++) bwrite(&ix, byid[i].id, 20);
+	for (size_t i = 0; i < n; i++) bwrite(&ix, byid[i].id, hsz);
 	for (size_t i = 0; i < n; i++) {
 		uint32_t c = byid[i].crc;
 		uint8_t b4[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16),
@@ -2833,12 +3003,12 @@ static void pack_write(Pent *v, size_t n, int window, int maxdepth,
 		for (int k = 0; k < 8; k++) b8[k] = (uint8_t)(o >> (8 * (7 - k)));
 		bwrite(&ix, b8, 8);
 	}
-	bwrite(&ix, id, 20);
-	uint8_t ixid[20];
-	sha1_init(&s);
-	sha1_update(&s, ix.p, ix.n);
-	sha1_final(&s, ixid);
-	bwrite(&ix, ixid, 20);
+	bwrite(&ix, id, hsz);
+	uint8_t ixid[HASH_MAX];
+	hash_init(&s);
+	hash_update(&s, ix.p, ix.n);
+	hash_final(&s, ixid);
+	bwrite(&ix, ixid, hsz);
 
 	char path[4096];
 	if ((size_t)snprintf(path, sizeof path, "%s.pack", base) >= sizeof path)
@@ -2866,7 +3036,8 @@ static void pack_write(Pent *v, size_t n, int window, int maxdepth,
 /* ------------------------------------------------------------------ main */
 
 static int usage(void) {
-	fputs("usage: gitobj hash <type> [file]\n"
+	fputs("usage: gitobj [--object-format=sha1|sha256] <command> ...\n"
+	      "       gitobj hash <type> [file]\n"
 	      "       gitobj write <objdir> <type> [file]\n"
 	      "       gitobj mktree <objdir>\n"
 	      "       gitobj cat|raw|type|size <objdir> <sha>\n"
@@ -2884,6 +3055,21 @@ static int usage(void) {
 }
 
 int main(int argc, char **argv) {
+	/* The object format, spelled the way git spells it, ahead of the
+	 * subcommand. It has to come first because every argument after it is
+	 * positional, and it is a flag rather than something read out of a
+	 * config file because what gitobj is given is an object directory and
+	 * not a repository. */
+	if (argc >= 2 && !strncmp(argv[1], "--object-format=", 16)) {
+		const char *f = argv[1] + 16;
+		if (!strcmp(f, "sha256")) hsz = 32;
+		else if (strcmp(f, "sha1")) {
+			fprintf(stderr, "gitobj: unknown object format: %s\n", f);
+			return 2;
+		}
+		argv++;
+		argc--;
+	}
 	if (argc < 2) return usage();
 	const char *cmd = argv[1];
 	fixinit();
@@ -2893,8 +3079,8 @@ int main(int argc, char **argv) {
 		if (!t) die2("unknown object type", argv[2]);
 		Buf in = {0};
 		readall(argc >= 4 ? argv[3] : NULL, &in);
-		uint8_t id[20];
-		char hex[41];
+		uint8_t id[HASH_MAX];
+		char hex[HEX_MAX + 1];
 		objid(t, in.p, in.n, id);
 		hexify(id, hex);
 		printf("%s\n", hex);
@@ -2907,8 +3093,8 @@ int main(int argc, char **argv) {
 		if (!t) die2("unknown object type", argv[3]);
 		Buf in = {0};
 		readall(argc == 5 ? argv[4] : NULL, &in);
-		uint8_t id[20];
-		char hex[41];
+		uint8_t id[HASH_MAX];
+		char hex[HEX_MAX + 1];
 		objid(t, in.p, in.n, id);
 		hexify(id, hex);
 		loose_write(argv[2], hex, t, in.p, in.n);
@@ -2943,8 +3129,8 @@ int main(int argc, char **argv) {
 		}
 		Buf tree = {0};
 		tree_build(v, nv, &tree);
-		uint8_t id[20];
-		char hex[41];
+		uint8_t id[HASH_MAX];
+		char hex[HEX_MAX + 1];
 		objid(T_TREE, tree.p, tree.n, id);
 		hexify(id, hex);
 		loose_write(argv[2], hex, T_TREE, tree.p, tree.n);
@@ -2975,9 +3161,9 @@ int main(int argc, char **argv) {
 		name_check(argv[3]);
 		Odb o;
 		odb_open(argv[2], &o);
-		char full[41];
+		char full[HEX_MAX + 1];
 		/* Not the fast path even for a full name: `name` is asked whether
-		 * the object is THERE, and a 40-character name that is not in the
+		 * the object is THERE, and a full-length name that is not in the
 		 * store has to be refused rather than echoed back. */
 		name_resolve(&o, argv[3], full);
 		odb_close(&o);
@@ -3015,10 +3201,10 @@ int main(int argc, char **argv) {
 	if (!strcmp(cmd, "idx") && argc == 3) {
 		Idx x;
 		idx_open(argv[2], &x);
-		char hex[41];
+		char hex[HEX_MAX + 1];
 		for (size_t i = 0; i < x.n; i++) {
 			uint64_t off = idx_offset(&x, i);
-			hexify(x.names + 20 * i, hex);
+			hexify(x.names + hsz * i, hex);
 			printf("%llu %s (%08x)\n", (unsigned long long)off, hex,
 			       (unsigned)be32(x.crcs + 4 * i));
 		}
@@ -3032,13 +3218,13 @@ int main(int argc, char **argv) {
 		Pack p;
 		pack_open(argv[2], &p);
 		size_t bad = 0;
-		char hex[41];
+		char hex[HEX_MAX + 1];
 		for (size_t k = 0; k < p.x.n; k++) {
 			uint64_t beg = p.ord[k].off;
 			uint32_t got = crc32z(p.pk.p + beg, (size_t)pack_extent(&p, k));
 			uint32_t want = be32(p.x.crcs + 4 * p.ord[k].i);
 			if (got != want) {
-				hexify(p.x.names + 20 * p.ord[k].i, hex);
+				hexify(p.x.names + hsz * p.ord[k].i, hex);
 				printf("CRC MISMATCH %s at %llu: %08x, index says %08x\n",
 				       hex, (unsigned long long)beg, (unsigned)got,
 				       (unsigned)want);
@@ -3064,18 +3250,18 @@ int main(int argc, char **argv) {
 	if (!strcmp(cmd, "packls") && argc == 3) {
 		Pack p;
 		pack_open(argv[2], &p);
-		char hex[41], bhex[41];
+		char hex[HEX_MAX + 1], bhex[HEX_MAX + 1];
 		for (size_t k = 0; k < p.x.n; k++) {
 			Obj o = {0, {0}};
 			Ent ent = {0, 0, 0, 0};
 			const char *e = pack_at(&p, p.ord[k].off, &o, &ent, 0);
 			if (e) dieat(e, (size_t)p.ord[k].off);
-			hexify(p.x.names + 20 * p.ord[k].i, hex);
+			hexify(p.x.names + hsz * p.ord[k].i, hex);
 			printf("%s %-6s %zu %llu %llu", hex, tname(ent.type), ent.declared,
 			       (unsigned long long)pack_extent(&p, k),
 			       (unsigned long long)p.ord[k].off);
 			if (ent.chain) {
-				hexify(p.x.names + 20 * p.ord[pack_ord(&p, ent.base)].i, bhex);
+				hexify(p.x.names + hsz * p.ord[pack_ord(&p, ent.base)].i, bhex);
 				printf(" %u %s", ent.chain, bhex);
 			}
 			putchar('\n');
@@ -3113,7 +3299,7 @@ int main(int argc, char **argv) {
 			while (len && (in.p[at + len - 1] == '\r' || in.p[at + len - 1] == ' '))
 				len--;
 			if (len) {
-				char want[64];
+				char want[HEX_MAX + 1];
 				if (len >= sizeof want) die("object name is too long");
 				memcpy(want, in.p + at, len);
 				want[len] = 0;
@@ -3144,10 +3330,10 @@ int main(int argc, char **argv) {
 		if (!n) die("nothing to pack");
 		qsort(v, n, sizeof *v, pidcmp);
 		for (size_t i = 1; i < n; i++)
-			if (!memcmp(v[i - 1].id, v[i].id, 20))
+			if (!memcmp(v[i - 1].id, v[i].id, hsz))
 				die2("named twice", v[i].hex);
-		uint8_t id[20];
-		char hex[41];
+		uint8_t id[HASH_MAX];
+		char hex[HEX_MAX + 1];
 		pack_write(v, n, (int)window, 10, argv[3], id);
 		hexify(id, hex);
 		printf("%s\n", hex);
@@ -3169,15 +3355,15 @@ int main(int argc, char **argv) {
 		Pack p;
 		pack_open(argv[2], &p);
 		size_t bad = 0, n = 0;
-		char hex[41], want[41];
+		char hex[HEX_MAX + 1], want[HEX_MAX + 1];
 		for (size_t k = 0; k < p.x.n; k++) {
 			Obj o = {0, {0}};
 			const char *e = pack_at(&p, p.ord[k].off, &o, NULL, 0);
 			if (e) dieat(e, (size_t)p.ord[k].off);
-			uint8_t id[20];
+			uint8_t id[HASH_MAX];
 			objid(o.type, o.data.p, o.data.n, id);
 			hexify(id, hex);
-			hexify(p.x.names + 20 * p.ord[k].i, want);
+			hexify(p.x.names + hsz * p.ord[k].i, want);
 			if (strcmp(hex, want)) {
 				printf("MISMATCH %s hashes to %s\n", want, hex);
 				bad++;
@@ -3194,21 +3380,21 @@ int main(int argc, char **argv) {
 	}
 
 	/* The hard invariant, over packed objects: the name git filed an object
-	 * under has to be the SHA-1 of what came out of the pack. Nothing of
+	 * under has to be the hash of what came out of the pack. Nothing of
 	 * ours is on the other side of that comparison. */
 	if (!strcmp(cmd, "packverify") && argc == 3) {
 		Pack p;
 		pack_open(argv[2], &p);
 		size_t bad = 0;
-		char hex[41], want[41];
+		char hex[HEX_MAX + 1], want[HEX_MAX + 1];
 		for (size_t k = 0; k < p.x.n; k++) {
 			Obj o = {0, {0}};
 			const char *e = pack_at(&p, p.ord[k].off, &o, NULL, 0);
 			if (e) dieat(e, (size_t)p.ord[k].off);
-			uint8_t id[20];
+			uint8_t id[HASH_MAX];
 			objid(o.type, o.data.p, o.data.n, id);
 			hexify(id, hex);
-			hexify(p.x.names + 20 * p.ord[k].i, want);
+			hexify(p.x.names + hsz * p.ord[k].i, want);
 			if (strcmp(hex, want)) {
 				printf("MISMATCH %s hashes to %s\n", want, hex);
 				bad++;
@@ -3230,25 +3416,25 @@ int main(int argc, char **argv) {
 		size_t bad = 0, nloose = 0;
 		for (size_t i = 0; i < ns.n; i++) {
 			Obj o = {0, {0}};
-			if (!obj_get(&db, ns.v[i], &o))
-				die2("object not found", ns.v[i]);
+			if (!obj_get(&db, nat(&ns, i), &o))
+				die2("object not found", nat(&ns, i));
 			for (size_t k = 0; k < db.dirs.n; k++)
-				if (loose_exists(db.dirs.v[k], ns.v[i])) { nloose++; break; }
+				if (loose_exists(db.dirs.v[k], nat(&ns, i))) { nloose++; break; }
 			if (vfy) {
-				/* The hard invariant. The name is a SHA-1 over the whole
+				/* The hard invariant. The name is a hash over the whole
 				 * serialisation, so this one comparison covers the zlib
-				 * stream, the header, the length field and (later) every
-				 * delta instruction underneath. */
-				uint8_t id[20];
-				char hex[41];
+				 * stream, the header, the length field and every delta
+				 * instruction underneath. */
+				uint8_t id[HASH_MAX];
+				char hex[HEX_MAX + 1];
 				objid(o.type, o.data.p, o.data.n, id);
 				hexify(id, hex);
-				if (strcmp(hex, ns.v[i])) {
-					printf("MISMATCH %s hashes to %s\n", ns.v[i], hex);
+				if (strcmp(hex, nat(&ns, i))) {
+					printf("MISMATCH %s hashes to %s\n", nat(&ns, i), hex);
 					bad++;
 				}
 			} else {
-				printf("%s %s %zu\n", ns.v[i], tname(o.type), o.data.n);
+				printf("%s %s %zu\n", nat(&ns, i), tname(o.type), o.data.n);
 			}
 			bfree(&o.data);
 		}

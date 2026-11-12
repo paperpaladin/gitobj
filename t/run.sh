@@ -275,12 +275,20 @@ for r in $HAVE_SMALL; do
 		nobj=$((nobj+1))
 		eq "type $r/$sha" "$("$GITOBJ" type "$OD" "$sha")" "$gt"
 		eq "size $r/$sha" "$("$GITOBJ" size "$OD" "$sha")" "$gsz"
-		"$GITOBJ" raw "$OD" "$sha" > "$TMP/ours" 2>/dev/null
+		# The exit status is part of the comparison. It was not, and a
+		# mutation found that: a tree walker whose entry stride is wrong
+		# prints the first entry correctly, dies on the second with a
+		# message on stderr, and leaves stdout byte-identical to git's for
+		# a tree of one entry. 2>/dev/null discards the message and the
+		# status was never looked at, so the mutant survived.
 		$GIT --git-dir="$G" cat-file "$gt" "$sha" > "$TMP/theirs"
-		assert "raw $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
-		"$GITOBJ" cat "$OD" "$sha" > "$TMP/ours" 2>/dev/null
+		if "$GITOBJ" raw "$OD" "$sha" > "$TMP/ours" 2>/dev/null &&
+		   cmp -s "$TMP/ours" "$TMP/theirs"; then ok
+		else no "raw $r/$sha"; fi
 		$GIT --git-dir="$G" cat-file -p "$sha" > "$TMP/theirs"
-		assert "cat -p $r/$sha" cmp -s "$TMP/ours" "$TMP/theirs"
+		if "$GITOBJ" cat "$OD" "$sha" > "$TMP/ours" 2>/dev/null &&
+		   cmp -s "$TMP/ours" "$TMP/theirs"; then ok
+		else no "cat -p $r/$sha"; fi
 	done < "$TMP/corpus-all.$r"
 	[ "$n" -gt 0 ] && swept_from="$swept_from $r($n, $nl loose)"
 done
@@ -2953,6 +2961,322 @@ refute "pack refuses a negative window" \
 	sh -c "'$GITOBJ' pack '$DREPO/objects' '$PW/bw' -1 < '$TMP/packs/din'"
 eq "pack with the wrong number of arguments is a usage error" \
 	"$("$GITOBJ" pack "$DREPO/objects" "$PW/bw" > /dev/null 2>&1; echo $?)" 2
+# =====================================================================
+# 15. SHA-256 repositories
+# =====================================================================
+# git's two object formats differ in the hash and in nothing else: the loose
+# header, the tree entry, the pack entry header, the index layout and every
+# checksum are the same shapes with 32 bytes of name in them instead of 20.
+# So this section is the oracles above run a second time over a corpus built
+# with `--object-format=sha256`, rather than a check that one new function
+# computes the right digest.
+#
+# It needs a SHA-256 scratch repository of its own. `git index-pack`,
+# `verify-pack` and `show-index` take the format from the repository they are
+# run in, so asking the SHA-1 scratch above about a SHA-256 pack is not the
+# question this section means to ask.
+#
+# gitobj is told the format with a flag. git reads extensions.objectFormat
+# out of the config beside an object directory; gitobj is handed the object
+# directory itself, which here is often not inside a repository at all.
+s6() { "$GITOBJ" --object-format=sha256 "$@"; }
+
+S6=$TMP/s256
+mkdir -p "$S6/mk"
+S6OK=1
+$GIT init -q --bare --object-format=sha256 "$S6/scratch" 2> "$S6/init.err" || S6OK=
+if [ -z "$S6OK" ]; then
+	printf 'SKIP section 15: this git will not create a SHA-256 repository: %s\n' \
+		"$(head -1 "$S6/init.err")" >&2
+fi
+S6G="$GIT --git-dir=$S6/scratch"
+s6_names=0
+s6_objs=0
+s6_packed=0
+s6_delta=0
+s6_ref=0
+s6_written=0
+
+if [ -n "$S6OK" ]; then
+# Names first, against git's own hash-object inside a SHA-256 repository.
+# `git hash-object` has no --object-format of its own: the format comes from
+# the repository, which is why this runs with --git-dir rather than outside
+# one. Every payload shape section 1 uses, including the lengths either side
+# of the 56-byte padding boundary, which SHA-256 shares with SHA-1.
+for f in "$TMP"/fix/*; do
+	for t in blob commit tree tag; do
+		s6_names=$((s6_names + 1))
+		eq "sha256 hash $t $(basename "$f")" \
+			"$(s6 hash "$t" "$f")" \
+			"$($S6G hash-object -t "$t" --literally "$f")"
+	done
+done
+eq "sha256 hash via stdin" \
+	"$(s6 hash blob < "$TMP/fix/hello")" \
+	"$($S6G hash-object -t blob --stdin < "$TMP/fix/hello")"
+# A name of the wrong length for the format in force is not an object name.
+refute "a 40-character name is refused in a SHA-256 store" \
+	s6 type "$S6/scratch/objects" 0000000000000000000000000000000000000000
+# Exit 2, not 1: the contract is "1 refused or not found, 2 the command line
+# was wrong", and an object format gitobj does not have is the second.
+eq "an unknown object format is a usage error rather than a default" \
+	"$("$GITOBJ" --object-format=sha384 hash blob < /dev/null > /dev/null 2>&1; echo $?)" 2
+
+# The corpus. One shared prefix across sixty blobs so that `pack-objects`
+# has deltas to find: a SHA-256 corpus with no delta in it would pass every
+# assertion below while the delta reader never ran, which is the oldest
+# recorded mistake in this suite. Deterministic content for the same reason
+# the SHA-1 corpus has fixed dates -- a corpus that moves every run is one a
+# failure cannot be reproduced from.
+seq 1 2000 | tr '\n' ' ' > "$S6/mk/base"
+: > "$S6/mk/paths"
+i=0
+while [ "$i" -lt 60 ]; do
+	{ cat "$S6/mk/base"; printf 'tail %d\n' "$i"; } > "$S6/mk/b$i"
+	echo "$S6/mk/b$i" >> "$S6/mk/paths"
+	i=$((i+1))
+done
+L6=$S6/loose
+$GIT init -q --bare --object-format=sha256 "$L6"
+$GIT --git-dir="$L6" hash-object -w --stdin-paths < "$S6/mk/paths" > "$S6/mk/shas"
+# FIVE entries, not one. A tree of one entry cannot see a wrong entry
+# stride: the first entry still prints correctly and what follows is the
+# end of the object. That was a surviving mutation until this fixture
+# existed, and the modes differ so the mode formatting is in it too.
+{
+	i=0
+	while [ "$i" -lt 5 ]; do
+		case $i in
+		3) m=100755 ;;
+		4) m=120000 ;;
+		*) m=100644 ;;
+		esac
+		printf '%s blob %s\te%d\n' "$m" \
+			"$(sed -n "$((i+1))p" "$S6/mk/shas")" "$i"
+		i=$((i+1))
+	done
+} > "$S6/mk/tree.in"
+t6=$($GIT --git-dir="$L6" mktree < "$S6/mk/tree.in")
+c6=$(GIT_AUTHOR_NAME=corpus GIT_AUTHOR_EMAIL=corpus@invalid \
+	GIT_COMMITTER_NAME=corpus GIT_COMMITTER_EMAIL=corpus@invalid \
+	GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' \
+	GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
+	$GIT --git-dir="$L6" commit-tree "$t6" -m 'sha256 corpus commit')
+printf 'object %s\ntype commit\ntag s256\ntagger corpus <corpus@invalid> 978307200 +0000\n\nannotated\n' \
+	"$c6" | $GIT --git-dir="$L6" mktag > /dev/null
+assert "the sha256 corpus has all four object types" \
+	test "$($GIT --git-dir="$L6" cat-file --batch-all-objects --batch-check |
+		awk '{print $2}' | sort -u | tr '\n' ' ')" = "blob commit tag tree "
+
+# The same objects in a pack, and again as REF_DELTA, which under SHA-256 is
+# a 32-byte base name in the entry rather than a 20-byte one. Nothing in
+# git's output distinguishes the two encodings, so the reader's own census
+# is what says which was read.
+$GIT --git-dir="$L6" cat-file --batch-all-objects --batch-check |
+	awk '{print $1}' > "$S6/mk/all"
+P6=$S6/packed
+$GIT init -q --bare --object-format=sha256 "$P6"
+$GIT --git-dir="$L6" pack-objects --non-empty --delta-base-offset \
+	--threads=1 --window=10 "$P6/objects/pack/pack" \
+	< "$S6/mk/all" > /dev/null
+mkdir -p "$S6/refpack"
+$GIT --git-dir="$L6" pack-objects --non-empty --no-delta-base-offset \
+	--threads=1 --window=10 "$S6/refpack/pack" \
+	< "$S6/mk/all" > /dev/null
+IDX6=$(ls "$P6/objects/pack/"*.idx)
+RIDX6=$(ls "$S6/refpack/"*.idx)
+assert "the sha256 corpus is packed" test -n "$IDX6"
+
+# Per object, loose and packed, against cat-file. git enumerates the set.
+for r in loose packed; do
+	case $r in loose) G=$L6 ;; packed) G=$P6 ;; esac
+	$GIT --git-dir="$G" cat-file --batch-all-objects --batch-check |
+		sort > "$S6/all.$r"
+	while read -r sha gt gsz; do
+		s6_objs=$((s6_objs + 1))
+		[ "$r" = packed ] && s6_packed=$((s6_packed + 1))
+		eq "sha256 type $r/$sha" "$(s6 type "$G/objects" "$sha")" "$gt"
+		eq "sha256 size $r/$sha" "$(s6 size "$G/objects" "$sha")" "$gsz"
+		$GIT --git-dir="$G" cat-file "$gt" "$sha" > "$S6/theirs"
+		if s6 raw "$G/objects" "$sha" > "$S6/ours" 2>/dev/null &&
+		   cmp -s "$S6/ours" "$S6/theirs"; then ok
+		else no "sha256 raw $r/$sha"; fi
+		$GIT --git-dir="$G" cat-file -p "$sha" > "$S6/theirs"
+		if s6 cat "$G/objects" "$sha" > "$S6/ours" 2>/dev/null &&
+		   cmp -s "$S6/ours" "$S6/theirs"; then ok
+		else no "sha256 cat -p $r/$sha"; fi
+	done < "$S6/all.$r"
+	# The hard invariant, over 32-byte names this time: git chose the
+	# filename and the index entry, we recompute the hash.
+	eq "sha256 verify $r" \
+		"$(s6 verify "$G/objects" 2>/dev/null | tail -1)" \
+		"$(wc -l < "$S6/all.$r" | tr -d ' ') objects, 0 mismatched"
+	eq "sha256 ls $r against cat-file --batch-check" \
+		"$(s6 ls "$G/objects" 2>/dev/null | sort | cksum)" \
+		"$(awk '{print $1, $2, $3}' "$S6/all.$r" | sort | cksum)"
+done
+
+# A store of one format read as the other. This was a quiet wrong answer
+# before loose_names grew its guard: sixty-three objects, "0 objects",
+# exit 0, because a 62-character name is not 38 characters and was skipped
+# as a stray file.
+refute "a SHA-256 store read as SHA-1 is refused, not reported empty" \
+	"$GITOBJ" ls "$L6/objects"
+refute "and a SHA-1 store read as SHA-256 is refused too" \
+	s6 ls "$SCRATCH/.git/objects"
+# The index is self-checking either way round, since its own checksum is
+# over everything above it and both its length and its position move.
+refute "a SHA-256 index read as SHA-1 is refused" "$GITOBJ" idx "$IDX6"
+refute "and a SHA-1 index read as SHA-256 is refused" s6 idx "$SELFIDX"
+
+# The index, against the only tool that reads one and nothing else.
+eq "sha256 idx against git show-index" \
+	"$(s6 idx "$IDX6" 2>/dev/null | cksum)" \
+	"$($S6G show-index --object-format=sha256 < "$IDX6" | cksum)"
+eq "sha256 idxcrc finds no bad crc" \
+	"$(s6 idxcrc "$IDX6" 2>/dev/null | tail -1)" \
+	"$(wc -l < "$S6/mk/all" | tr -d ' ') objects, 0 bad crcs"
+
+# The pack walk, column for column against verify-pack -v, for both delta
+# encodings. The census on stderr is what says the delta path ran.
+for k in ofs ref; do
+	case $k in ofs) X=$IDX6 ;; ref) X=$RIDX6 ;; esac
+	s6 packls "$X" > "$S6/pls.$k" 2> "$S6/census.$k"
+	$S6G verify-pack -v "$X" |
+		grep -E '^[0-9a-f]{64} ' > "$S6/vpv.$k"
+	assert "sha256 packls $k against verify-pack -v" \
+		cmp -s "$S6/pls.$k" "$S6/vpv.$k"
+	eq "sha256 packverify $k finds no mismatch" \
+		"$(s6 packverify "$X" 2>/dev/null | tail -1)" \
+		"$(wc -l < "$S6/mk/all" | tr -d ' ') objects, 0 mismatched"
+	nd=$(sed -n 's/.*, \([0-9]*\) through a delta chain.*/\1/p' "$S6/census.$k")
+	no_=$(sed -n 's/.*chain [0-9]*, \([0-9]*\) ofs-delta.*/\1/p' "$S6/census.$k")
+	nr=$(sed -n 's/.*ofs-delta and \([0-9]*\) ref-delta.*/\1/p' "$S6/census.$k")
+	if [ "${nd:-0}" -ge 20 ]; then ok
+	else no "sha256 $k pack: only ${nd:-0} objects came through a delta chain"; fi
+	case $k in
+	ofs) s6_delta=${nd:-0}
+	     if [ "${no_:-0}" -gt 0 ] && [ "${nr:-0}" -eq 0 ]; then ok
+	     else no "sha256 ofs pack: ${no_:-0} ofs and ${nr:-0} ref links"; fi ;;
+	ref) s6_ref=${nr:-0}
+	     if [ "${nr:-0}" -gt 0 ] && [ "${no_:-0}" -eq 0 ]; then ok
+	     else no "sha256 ref pack: ${no_:-0} ofs and ${nr:-0} ref links"; fi ;;
+	esac
+done
+
+# Abbreviated names, resolved over the store and checked against the same
+# lookup on git's side.
+nab=0
+while read -r sha _; do
+	nab=$((nab + 1))
+	[ "$((nab % 7))" -eq 0 ] || continue
+	eq "sha256 name ${sha:0:9}" \
+		"$(s6 name "$P6/objects" "${sha:0:9}")" \
+		"$($GIT --git-dir="$P6" rev-parse --verify "${sha:0:9}")"
+done < "$S6/all.packed"
+
+# Writing. git inflates our zlib stream, re-hashes it and parses what comes
+# out, which is every read oracle above run backwards with git on the far
+# side of the serialiser.
+W6=$S6/written
+$GIT init -q --bare --object-format=sha256 "$W6"
+rm -rf "$W6/objects"/??
+for f in "$TMP"/fix/*; do
+	got=$(s6 write "$W6/objects" blob "$f")
+	s6_written=$((s6_written + 1))
+	eq "sha256 write $(basename "$f")" "$got" \
+		"$($S6G hash-object -t blob "$f")"
+	$GIT --git-dir="$W6" cat-file blob "$got" > "$S6/back" 2>/dev/null
+	assert "sha256 git reads back $(basename "$f")" cmp -s "$S6/back" "$f"
+done
+$GIT --git-dir="$W6" fsck --strict > "$S6/fsck" 2>&1
+assert "sha256 git fsck --strict is clean over what we wrote" sh -c \
+	"! grep -Eiv '^(notice|dangling)' '$S6/fsck' | grep -q ."
+
+# mktree, which is where the 32-byte name in a tree entry is written rather
+# than read. `git mktree` sorts its own input, so the two can be handed the
+# same unsorted lines and must produce the same name.
+s6 cat "$L6/objects" "$t6" > "$S6/tree.ls"
+# `git mktree` looks its entries up, so the blob the entry names has to be
+# in the repository it runs in. `gitobj mktree` does not, which is in the
+# contract and is why git is the oracle for a missing entry and not us.
+i=0
+while [ "$i" -lt 5 ]; do
+	$GIT --git-dir="$W6" hash-object -w "$S6/mk/b$i" > /dev/null
+	i=$((i+1))
+done
+eq "sha256 mktree agrees with git mktree" \
+	"$(s6 mktree "$W6/objects" < "$S6/tree.ls")" \
+	"$($GIT --git-dir="$W6" mktree < "$S6/tree.ls")"
+eq "and with the name git gave the tree in the first place" \
+	"$(s6 mktree "$W6/objects" < "$S6/tree.ls")" "$t6"
+
+# unpack: a SHA-256 pack read out into loose objects, re-hashed on the way.
+U6=$S6/unpacked
+mkdir -p "$U6/objects"
+eq "sha256 unpack writes every object and mismatches none" \
+	"$(s6 unpack "$IDX6" "$U6/objects" 2>/dev/null | tail -1)" \
+	"$(wc -l < "$S6/mk/all" | tr -d ' ') objects written, 0 mismatched"
+$GIT init -q --bare --object-format=sha256 "$S6/unrepo"
+rm -rf "$S6/unrepo/objects"
+cp -r "$U6/objects" "$S6/unrepo/objects"
+$GIT --git-dir="$S6/unrepo" fsck --strict > "$S6/unfsck" 2>&1
+assert "sha256 git fsck --strict is clean over the unpacked store" sh -c \
+	"! grep -Eiv '^(notice|dangling)' '$S6/unfsck' | grep -q ."
+eq "and git finds the same objects in it" \
+	"$($GIT --git-dir="$S6/unrepo" cat-file --batch-all-objects \
+		--batch-check | wc -l | tr -d ' ')" \
+	"$(wc -l < "$S6/mk/all" | tr -d ' ')"
+
+# Writing a pack, and the sharpest of the write oracles: git builds an index
+# from our SHA-256 pack with no sight of ours and the two files must be the
+# same bytes.
+PK6=$S6/ourpack
+mkdir -p "$PK6"
+sha6=$(s6 pack "$L6/objects" "$PK6/ours" 10 < "$S6/mk/all" 2> "$PK6/census")
+eq "sha256 pack prints a 64-character checksum" \
+	"$(printf '%s\n' "$sha6" | grep -c '^[0-9a-f]\{64\}$')" 1
+eq "git's name for our sha256 pack is the checksum we printed" \
+	"$($S6G index-pack -o "$PK6/git.idx" "$PK6/ours.pack")" "$sha6"
+assert "git's index of our sha256 pack is byte-identical to ours" \
+	cmp -s "$PK6/git.idx" "$PK6/ours.idx"
+assert "git verify-pack accepts our sha256 pack" \
+	$S6G verify-pack "$PK6/ours.idx"
+nd6=$(sed -n 's/.*, \([0-9]*\) as ofs-delta.*/\1/p' "$PK6/census")
+gd6=$($S6G verify-pack -v "$PK6/ours.idx" |
+	awk '$1 ~ /^[0-9a-f]{64}$/ && NF >= 7' | grep -c .)
+eq "our sha256 delta count is what git counts in the file" "$nd6" "$gd6"
+if [ "${nd6:-0}" -ge 20 ]; then ok
+else no "our sha256 pack holds only ${nd6:-0} delta entries"; fi
+$GIT init -q --bare --object-format=sha256 "$PK6/repo"
+cpw "$PK6/ours.pack" "$PK6/repo/objects/pack/pack-$sha6.pack"
+cpw "$PK6/ours.idx" "$PK6/repo/objects/pack/pack-$sha6.idx"
+$GIT --git-dir="$PK6/repo" fsck --strict > "$PK6/fsck" 2>&1
+assert "git fsck --strict is clean over a repo holding only our sha256 pack" \
+	sh -c "! grep -Eiv '^(notice|dangling)' '$PK6/fsck' | grep -q ."
+eq "and git finds every object in it" \
+	"$($GIT --git-dir="$PK6/repo" cat-file --batch-all-objects \
+		--batch-check | wc -l | tr -d ' ')" \
+	"$(wc -l < "$S6/mk/all" | tr -d ' ')"
+s6 pack "$L6/objects" "$PK6/again" 10 < "$S6/mk/all" > /dev/null 2>&1
+assert "the sha256 delta search is deterministic" \
+	cmp -s "$PK6/ours.pack" "$PK6/again.pack"
+fi
+
+printf 'sha256: %d names, %d objects swept (%d packed), %d through a delta chain, %d ref-delta links, %d written\n' \
+	"$s6_names" "$s6_objs" "$s6_packed" "$s6_delta" "$s6_ref" "$s6_written"
+# Floors, so a corpus that quietly stopped being built cannot leave this
+# section green with nothing in it. The whole of section 15 is skipped only
+# when git itself refuses to make a SHA-256 repository, and that prints.
+if [ -n "$S6OK" ]; then
+	[ "$s6_objs" -ge 120 ] && ok ||
+		no "only $s6_objs objects swept under sha256"
+	[ "$s6_packed" -ge 60 ] && ok ||
+		no "only $s6_packed sha256 objects came out of a pack"
+	[ "$s6_delta" -ge 20 ] && ok ||
+		no "only $s6_delta sha256 objects came through a delta chain"
+fi
+
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
