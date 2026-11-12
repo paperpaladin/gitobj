@@ -1061,9 +1061,10 @@ and git has not written one since 2007.
 Not fast. Every object is inflated from scratch, a delta is re-applied for
 every object on its chain whose base has fallen out of the cache, and a
 command that wants one object opens every pack in the store. `make test`
-takes 57 seconds, where it took 10 before it read any packs; most of that is
-processes rather than work, at six of them per object over the 1498 the
-per-object sweep covers. Writing is not the slow part: 538 objects of
+takes 53 seconds, where it took 10 before it read any packs, and `make
+test-asan` 3m5s; most of that is processes rather than work, at six of them
+per object over the 1498 the per-object sweep covers and six more over the
+126 the SHA-256 one does. Writing is not the slow part: 538 objects of
 `../cc` pack in 4.1 seconds with a window of 10, in 42MB.
 
 ## Why this file exists
