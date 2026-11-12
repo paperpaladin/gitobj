@@ -2732,6 +2732,227 @@ assert "git verify-pack refuses it too" sh -c \
 refute "packverify refuses it as well" \
 	"$GITOBJ" packverify "$PG/wrongname/pack-w.idx"
 
+
+# =====================================================================
+# 14. writing a pack: git's own index of our pack, byte for byte
+# =====================================================================
+# Reading a pack has one oracle and writing one has two, the second being
+# the sharper. `git index-pack -o` builds an index FROM our pack with no
+# sight of the index we wrote beside it, and the two files have to be the
+# same bytes: the fanout, the name order, every CRC, every offset, the copy
+# of the pack checksum and the index's own. git computing all of that from
+# our pack is not a comparison we are on both sides of.
+#
+# `git index-pack` was checked first against a pack git wrote itself:
+# re-indexing one of `pack-objects`'s packs reproduces its `.idx` byte for
+# byte, so the comparison below is a test of our index and not a statement
+# about how reproducible git's indexer is.
+#
+# Then the pack goes into a bare repository whose only object source is that
+# pack, and git is asked for every object in it. `fsck --strict` inflates
+# every entry, walks every delta chain and re-hashes the result against the
+# name the index files it under, which is the hard invariant from git's side
+# of it.
+PW=$TMP/packwrite
+mkdir -p "$PW"
+PWN=0
+pw_objs=0
+pw_delta=0
+pw_depth=0
+
+# <label> <source bare repo> <names file> <count> <window> <least deltas>
+pack_vs_git() {
+	local label=$1 src=$2 names=$3 count=$4 win=$5 mind=$6
+	local d sha gd gm nd rc
+	PWN=$((PWN + 1))
+	d=$PW/w$PWN
+	mkdir -p "$d"
+	sha=$("$GITOBJ" pack "$src/objects" "$d/ours" "$win" < "$names" 2> "$d/census")
+	rc=$?
+	eq "$label: pack exits 0" "$rc" 0
+	pw_census=$d/census
+	assert "$label: both files were written" test -f "$d/ours.pack" -a -f "$d/ours.idx"
+	eq "$label: the checksum printed is forty hex characters" \
+		"$(printf '%s\n' "$sha" | grep -c '^[0-9a-f]\{40\}$')" 1
+	# The trailing checksum IS the pack's name, and index-pack prints what
+	# it computed over the file it read.
+	eq "$label: git's name for our pack is the checksum we printed" \
+		"$($GIT -C "$SCRATCH" index-pack -o "$d/git.idx" "$d/ours.pack")" "$sha"
+	assert "$label: git's index of our pack is byte-identical to ours" \
+		cmp -s "$d/git.idx" "$d/ours.idx"
+	assert "$label: git verify-pack accepts it" \
+		$GIT -C "$SCRATCH" verify-pack "$d/ours.idx"
+	# The reader's whole oracle, turned on our own output: verify-pack -v
+	# line for line, the reader's census against git's count of deltas and
+	# its deepest chain, and every object hashing back to its own name.
+	#
+	# The pls_* counters are saved and put back because the line that
+	# prints them is about the packs this suite READS, and it has already
+	# been printed by the time this section runs. Adding our own packs to
+	# a total nobody prints again would quietly make it mean something
+	# else; section 14 keeps its own.
+	local s1=$pls_objs s2=$pls_delta s3=$pls_depth s4=$pls_inf s5=$pls_hit s6=$pls_nocache
+	packls_vs_vpv "$label packls" "$d/ours.idx"
+	pw_objs=$((pw_objs + pls_objs - s1))
+	pw_delta=$((pw_delta + pls_delta - s2))
+	pls_objs=$s1; pls_delta=$s2; pls_depth=$s3
+	pls_inf=$s4; pls_hit=$s5; pls_nocache=$s6
+	# What the writer said it wrote, against what git reads back out of the
+	# file. A writer's own account of its output is not evidence. The depth
+	# comes from git's sixth column rather than from pls_depth, which is
+	# the running maximum over every pack this suite has read and would
+	# hand back 29 from a sibling repository for a pack of ours holding no
+	# delta at all.
+	gd=$($GIT -C "$SCRATCH" verify-pack -v "$d/ours.idx" |
+		awk '$1 ~ /^[0-9a-f]{40}$/ && NF >= 7' | grep -c .)
+	gm=$($GIT -C "$SCRATCH" verify-pack -v "$d/ours.idx" |
+		awk '$1 ~ /^[0-9a-f]{40}$/ && NF >= 7 {if ($6 > m) m = $6} END {print m + 0}')
+	[ "$gm" -gt "$pw_depth" ] && pw_depth=$gm
+	nd=$(sed -n 's/.*, \([0-9]*\) as ofs-delta.*/\1/p' "$d/census")
+	eq "$label: the writer's delta count is what git counts in the file" "$nd" "$gd"
+	eq "$label: and it packed every name it was given" \
+		"$(sed -n 's/^\([0-9]*\) objects.*/\1/p' "$d/census")" "$count"
+	if [ "$nd" -ge "$mind" ]; then ok
+	else no "$label: wrote $nd delta entries, wanted at least $mind"; fi
+	# A repository whose only object source is the pack we wrote.
+	rm -rf "$d/repo"
+	$GIT init -q --bare "$d/repo"
+	cpw "$d/ours.pack" "$d/repo/objects/pack/pack-$sha.pack"
+	cpw "$d/ours.idx" "$d/repo/objects/pack/pack-$sha.idx"
+	eq "$label: git finds every object in it" \
+		"$($GIT --git-dir="$d/repo" cat-file --batch-all-objects --batch-check |
+			wc -l | tr -d ' ')" "$count"
+	$GIT --git-dir="$d/repo" fsck --strict > "$d/fsck" 2>&1
+	assert "$label: git fsck --strict is clean over it" sh -c \
+		"! grep -Eiv '^(notice|dangling)' '$d/fsck' | grep -q ."
+	# Object for object against the repository the objects came out of, so a
+	# disagreement names the object rather than the pack.
+	$GIT --git-dir="$d/repo" cat-file --batch-all-objects --batch-check |
+		sort > "$d/ours.list"
+	local a nchk=0
+	while read -r a _; do
+		nchk=$((nchk + 1))
+		eq "$label cat-file -p $a" \
+			"$($GIT --git-dir="$d/repo" cat-file -p "$a" | cksum)" \
+			"$($GIT --git-dir="$src" cat-file -p "$a" | cksum)"
+	done < "$d/ours.list"
+	if [ "$nchk" -eq "$count" ]; then ok
+	else no "$label: compared $nchk of $count objects"; fi
+	# Deterministic, which is what makes any assertion above possible: git's
+	# own delta search is threaded and gave 76 delta entries one run and 75
+	# the next over the same objects, which is why every fixture here passes
+	# --threads=1. The bytes are compared, not a report about them.
+	"$GITOBJ" pack "$src/objects" "$d/again" "$win" < "$names" > /dev/null 2>&1
+	assert "$label: the same objects and window give the same pack bytes" \
+		cmp -s "$d/ours.pack" "$d/again.pack"
+	assert "$label: and the same index bytes" cmp -s "$d/ours.idx" "$d/again.idx"
+	# Pack order is computed from the objects, so the order the names
+	# arrived in is not part of the answer. Without this the determinism
+	# check above passes for a writer that simply echoes its input order,
+	# and the delta search would then depend on how the caller sorted.
+	sort -r "$names" | "$GITOBJ" pack "$src/objects" "$d/rev" "$win" \
+		> /dev/null 2>&1
+	assert "$label: the order the names arrived in does not change the pack" \
+		cmp -s "$d/ours.pack" "$d/rev.pack"
+}
+
+# A number out of the writer's census line.
+pw_num() { sed -n "s/$1/\1/p" "$pw_census"; }
+
+# The premise of the comparison, checked rather than asserted in prose: git
+# re-indexing a pack IT wrote reproduces that pack's own .idx byte for byte.
+# Without this, an index of ours that differed from git's would be an open
+# question between the two files, and the delta pack is the one to do it on
+# since the offsets and CRCs it carries are not the trivial ones.
+$GIT -C "$SCRATCH" index-pack -o "$PW/regen.idx" "${DIDX%.idx}.pack" > /dev/null
+assert "git re-indexing its own pack reproduces its index byte for byte" \
+	cmp -s "$PW/regen.idx" "$DIDX"
+
+# Window 0 first, where every object is stored whole: the entry header, the
+# index and the trailer with the delta encoder switched off entirely.
+pack_vs_git "pack whole" "$DREPO" "$TMP/packs/din" "$NDOBJ" 0 0
+eq "the window-0 pack holds no delta at all" \
+	"$(pw_num '.*, \([0-9]*\) as ofs-delta.*')" 0
+eq "and no copy or insert instruction was emitted for it" \
+	"$(pw_num '.*, \([0-9]*\) copy and.*')" 0
+whole_bytes=$(pw_num '.*, \([0-9]*\) pack bytes.*')
+
+# Then the same objects with a window, which is the delta encoder.
+pack_vs_git "pack delta" "$DREPO" "$TMP/packs/din" "$NDOBJ" 10 50
+delta_bytes=$(pw_num '.*, \([0-9]*\) pack bytes.*')
+wr_depth=$(pw_num '.*deepest chain \([0-9]*\).*')
+wr_copy=$(pw_num '.*, \([0-9]*\) copy and.*')
+wr_ins=$(pw_num '.*copy and \([0-9]*\) insert.*')
+wr_64k=$(pw_num '.*, \([0-9]*\) with the length left implicit.*')
+wr_offw=$(pw_num '.*widest copy offset \([0-9]*\) byte.*')
+# A third, not merely smaller. "Smaller" is satisfied by a search that
+# deltas whatever happens to sit next to it: packing in name order instead
+# of by type and descending size still finds 79 deltas here and still comes
+# out smaller than storing everything whole, at 97k against 52k, so the
+# weaker bound leaves the ordering untested. The figure is reproducible
+# because the corpus is fixed and this encoder is deterministic.
+if [ "$((delta_bytes * 3))" -lt "$whole_bytes" ]; then ok
+else no "the delta pack is $delta_bytes bytes against $whole_bytes stored whole, not under a third of it"; fi
+# A delta on a delta: a writer that only ever deltas against a whole object
+# produces chains of exactly one and never reaches the recursion in the
+# reader, or the depth limit here.
+if [ "$wr_depth" -ge 2 ] && [ "$wr_depth" -le 10 ]; then ok
+else no "the deepest chain we wrote is $wr_depth, outside 2..10"; fi
+# Which forms of the two instructions the encoder actually emitted. Three of
+# these four are reachable only over a base big enough to need them, and the
+# 0x10000 one is the implicit length that was a mutation nothing could kill
+# on the reading side until this corpus grew a 20,000-line file.
+if [ "$wr_copy" -gt 0 ]; then ok; else no "no copy instruction was emitted"; fi
+if [ "$wr_ins" -gt 0 ]; then ok; else no "no insert instruction was emitted"; fi
+if [ "$wr_64k" -gt 0 ]; then ok
+else no "no copy went out with its length left implicit, so the 0x10000 default was never used"; fi
+if [ "$wr_offw" -ge 3 ]; then ok
+else no "the widest copy offset we emitted is $wr_offw bytes, so a multi-byte offset never went out"; fi
+printf 'our delta encoder on the delta corpus: %d bytes against %d stored whole, %d bytes for git -- %d copy and %d insert instructions, %d of them with the length left implicit, widest offset %d bytes\n' \
+	"$delta_bytes" "$whole_bytes" "$(wc -c < "${DIDX%.idx}.pack" | tr -d ' ')" \
+	"$wr_copy" "$wr_ins" "$wr_64k" "$wr_offw"
+
+# The self corpus as well, whose objects are a few dozen bytes each: git
+# does not attempt a delta below 50 bytes and neither does this encoder once
+# the saving is smaller than the entry that would carry it, so this is the
+# other end of the decision rather than a second delta test.
+pack_vs_git "pack self" "$SELFREPO" "$TMP/packs/in" "$NSELF" 10 0
+
+# A pack of one object, which is where an off-by-one in the fanout or the
+# offset table has nowhere to hide behind a neighbour.
+printf '%s\n' "$($GIT --git-dir="$DREPO" cat-file --batch-all-objects \
+	--batch-check | awk '$2=="tag"{print $1}' | head -1)" > "$PW/one"
+pack_vs_git "pack one" "$DREPO" "$PW/one" 1 10 0
+
+printf 'our packs: %d objects against verify-pack -v, %d of them deltas, deepest chain %d\n' \
+	"$pw_objs" "$pw_delta" "$pw_depth"
+
+# Abbreviated names on the way in, since `name` resolves them everywhere
+# else and a writer that only took forty characters would be the odd one.
+head -1 "$TMP/packs/din" | cut -c1-8 > "$PW/abbrev"
+assert "pack takes an abbreviated name" sh -c \
+	"'$GITOBJ' pack '$DREPO/objects' '$PW/ab' 0 < '$PW/abbrev'"
+eq "and files it under its full name" \
+	"$($GIT -C "$SCRATCH" verify-pack -v "$PW/ab.idx" | awk 'NR==1{print $1}')" \
+	"$(head -1 "$TMP/packs/din")"
+
+# The refusals. Each is a caller whose list was not what it thought it was.
+refute "pack refuses an empty list" \
+	"$GITOBJ" pack "$DREPO/objects" "$PW/empty" 10 < /dev/null
+assert "and writes no pack for it" test ! -f "$PW/empty.pack"
+head -1 "$TMP/packs/din" > "$PW/dup"
+head -1 "$TMP/packs/din" >> "$PW/dup"
+refute "pack refuses a name listed twice" \
+	"$GITOBJ" pack "$DREPO/objects" "$PW/dup2" 10 < "$PW/dup"
+echo 1111111111111111111111111111111111111111 > "$PW/absent"
+refute "pack refuses a name the store does not hold" \
+	"$GITOBJ" pack "$DREPO/objects" "$PW/absent2" 10 < "$PW/absent"
+refute "pack refuses a window that is not a number" \
+	sh -c "'$GITOBJ' pack '$DREPO/objects' '$PW/bw' ten < '$TMP/packs/din'"
+refute "pack refuses a negative window" \
+	sh -c "'$GITOBJ' pack '$DREPO/objects' '$PW/bw' -1 < '$TMP/packs/din'"
+eq "pack with the wrong number of arguments is a usage error" \
+	"$("$GITOBJ" pack "$DREPO/objects" "$PW/bw" > /dev/null 2>&1; echo $?)" 2
 # =====================================================================
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -1,9 +1,9 @@
 # gitobj
 
 Reads git's object database, writes loose objects into it, builds trees, reads
-a packfile's v2 index, and reads the objects out of the pack through delta
-chains of either encoding and any depth: one C11 file, no libgit2, no
-shelling out to git.
+a packfile's v2 index, reads the objects out of the pack through delta chains
+of either encoding and any depth, and writes a packfile and its index with a
+delta search of its own: one C11 file, no libgit2, no shelling out to git.
 Both DEFLATE halves are vendored from the sibling `../inflate` rather than
 rewritten, which is where their oracle lives.
 
@@ -38,9 +38,11 @@ the delta corpus: 124 objects, 79 delta entries, deepest chain 15
 pack fuzz: 300 mutants, 299 refused for 13 distinct reasons, 1 still readable, all agreeing with git
 packls: 3438 objects against verify-pack -v, 2019 of them deltas, deepest chain 29
 base cache: 4260 inflations and 1615 hits, against 8791 inflations with no cache
-abbreviated names: 1498 of 7 characters resolved, 0 refused
+abbreviated names: 1505 of 7 characters resolved, 0 refused
 four-character prefixes: 32 resolved, 4 ambiguous
-19545 passed, 0 failed
+our delta encoder on the delta corpus: 56049 bytes against 201746 stored whole, 59854 bytes for git -- 1366 copy and 1793 insert instructions, 33 of them with the length left implicit, widest offset 3 bytes
+our packs: 372 objects against verify-pack -v, 117 of them deltas, deepest chain 10
+20443 passed, 0 failed
 ```
 
 `gitobj packls` prints what `git verify-pack -v` prints, padding included,
@@ -61,7 +63,7 @@ far under two gigabytes.
 
 ## Two numbers, and which one to quote
 
-Cloned on its own this suite reports **5884 passed**, against six bare
+Cloned on its own this suite reports **6737 passed**, against six bare
 repositories it builds itself. Four hold 120 blobs each through one
 `hash-object --stdin-paths`, plus a tree, a commit and an annotated tag from
 plumbing, at fixed dates so the object names do not move between runs. One of
@@ -80,13 +82,15 @@ makes it produce one. The sixth is 600 blobs whose only purpose is to hold
 two objects whose names share their first four characters, which is what the
 abbreviated-name lookup needs and what 123 objects do not provide.
 
-Inside the collection it reports more: 19545 above, because the sibling
+Inside the collection it reports more: 20443 above, because the sibling
 repositories are an additional corpus, and more of them is strictly better
 evidence. But that number moves every time anything is committed anywhere in
 the tree, since a commit creates loose objects. It is a real count of real
 comparisons and a useless figure to quote, so the collection's table quotes
-5884: the one a reader gets by cloning this repository and running `make
-test`.
+6737: the one a reader gets by cloning this repository and running `make
+test`. The run above was taken while another repository in the collection
+was being committed to, which is why its sibling figures are seven objects
+higher than the paragraphs below quote.
 
 The 134 objects that reach the 64-bit offset table are the same number in
 both runs, because they come from indexes the suite builds rather than from
@@ -668,6 +672,122 @@ assertions, a zlib header whose check bits do not divide by 31 fails 832,
 the Adler-32 written little-endian fails 558, and never setting BFINAL fails
 548.
 
+## Writing a pack, and the index git builds from it
+
+`gitobj pack <objdir> <outbase> <window>` takes object names on stdin, writes
+`<outbase>.pack` and `<outbase>.idx`, and prints the pack's trailing
+checksum, which is the name git would file it under. Everything the reader
+decodes is written here: the entry header varint, the OFS_DELTA distance with
+its minus-one continuation, the delta header's two sizes, the copy and insert
+instructions, the v2 index with its cumulative fanout and per-object CRC, and
+both checksums.
+
+The sharp oracle is `git index-pack -o`. It builds an index from our pack
+alone, and that file has to be byte-identical to the index we wrote beside
+it: the fanout, the name order, every CRC, every offset, the copy of the pack
+checksum and the index's own are then git's answer to the same question
+rather than a comparison we are on both sides of. git re-indexing one of its
+OWN packs reproduces that pack's `.idx` exactly, which is what makes this a
+test of our index rather than a statement about how reproducible git's
+indexer is.
+
+Around that: `git verify-pack` over the pair, `packls` against `git
+verify-pack -v` line for line over our own output, and the pack dropped into
+a bare repository holding nothing else, where `git fsck --strict` walks every
+chain and re-hashes every result against the name the index files it under
+and each object is compared with the store it came out of. Four packs go
+through all of it, the delta corpus at window 0 and at window 10, the self
+corpus, and one holding a single tag, where an off-by-one in the fanout has
+no neighbour to hide behind.
+
+The window is an argument rather than a default because 0 and 10 are two
+different claims. At 0 every object is stored whole and the entry header, the
+index and the trailer are on their own; above 0 the delta encoder is in it.
+A fixture built with the wrong one quietly tests the other, which is how the
+OFS_DELTA corpus here came to be REF_DELTA for a while.
+
+### The search has to be deterministic before anything can be said about it
+
+git's own is threaded and is not reproducible: two runs over the same objects
+gave 76 delta entries and then 75, which is why every fixture here passes
+`--threads=1`. Ours sorts the objects by type, then size descending, then
+name, compares each against up to `window` already-placed entries of the same
+type, and keeps the smallest delta if it is smaller than the object by more
+than the entry that would carry it. Chains are capped at 10. A base is only a
+candidate once it is placed, so its offset is known and smaller, and a chain
+in what we write cannot loop.
+
+Two runs give the same pack bytes. So does the same list of names in the
+opposite order, and that is a separate assertion rather than a repetition: a
+writer that echoed its input order would pass the first and fail the second.
+
+Matches come from an index of the base taken every 16 bytes and keyed on
+eight of them, extended backwards into the literal run so a copy need not
+start on a block boundary. The bucket walk stops after 64 candidates, so a
+base full of identical blocks gets a worse delta rather than a slower search;
+every candidate is verified by comparison, so the cap costs size and not
+correctness.
+
+On the delta corpus, 124 objects including three revisions of a 20,000-line
+file:
+
+```
+stored whole        201746 bytes
+window 10            56049
+git, window 10       59854
+```
+
+and on `../cc`'s 538 objects, 2857651 against git's 3298397. Neither is the
+delta search being cleverer than git's. It is the DEFLATE encoder vendored
+from `../inflate` doing the work `gzip -6` does where git packs at zlib level
+6, the same difference that makes a loose object 1059 bytes here against
+git's 2041.
+
+### The census, and the mutant it could not see
+
+The writer prints on stderr what it emitted: objects, how many went out as
+deltas, the deepest chain, the two file sizes, how many offsets took the
+64-bit escape, and the count of copy and insert instructions with how many
+copies left their length implicit and how wide the widest offset was. A delta
+search that found nothing writes a perfectly valid pack, and every assertion
+about our deltas would pass over it.
+
+The first version of that line was decoration. It counted copies of length
+0x10000 rather than copies emitted with no length byte at all, and those are
+the same thing only in a build that has not been mutated: the mutant that
+writes the three length bytes out in full survived an entire sweep with the
+census still reporting 33 of them. It is counted off the instruction byte
+now, and that mutant dies.
+
+Ten planted defects, nine red:
+
+```
+fanout counting names strictly below its bucket     412 assertions
+the index written in pack order, not name order     337
+the OFS_DELTA varint without its minus one          129   git cannot index it
+a delta header carrying the target size             129   git cannot index it
+the pack trailer over all but the last byte          33
+the CRC over the compressed bytes alone              12
+no delta depth limit                                  1   a chain of 39
+the implicit copy length written out in full          1
+packing in the order the names arrived                1
+```
+
+The last of those only after the assertion was tightened. "The delta pack is
+smaller than the whole pack" is satisfied by packing in name order, which
+still finds 79 deltas and still comes to 97k against 202k stored whole. Under
+a third is what the ordering has to earn, and 52k clears it.
+
+The survivor is extending a match backwards into the literal run. It is worth
+175 bytes of 51734 on the suite's own corpus, which nothing but a golden byte
+count could see, and 5.2 per cent on `../cc`'s 538 objects, which a
+standalone clone does not have. The fixture is what cannot see it.
+
+No offset here reaches the 64-bit escape. The census says 0 of N through the
+table on every run, because a pack that needs one is over two gigabytes and
+this writer holds every object inflated at once while it searches. That
+branch of the writer is unexercised and is the next item in `PLAN.md`.
+
 ## An index git itself wrote with a 64-bit offset
 
 Everything else about the 64-bit offset table is tested against indexes this
@@ -702,8 +822,8 @@ the target is for.
 
 The hard invariant, that every object read hashes back to its own name,
 covers every object in every corpus: 369 loose, and 3438 read out of fifteen
-packs, 2019 of those through a delta chain. It said 490 of 3184 seven commits
-ago. The one thing `make test` does not cover is a pack over two gigabytes,
+packs, 2019 of those through a delta chain, plus 372 out of four packs we
+wrote ourselves. It said 490 of 3184 eight commits ago. The one thing `make test` does not cover is a pack over two gigabytes,
 and `make bigpack` reads the INDEX of one; the objects of a pack that size
 are out of reach of a reader that loads whole files.
 
@@ -733,9 +853,10 @@ the table, and an index carrying offsets by hand. `make bigpack` is the one
 that builds a real one, and it is a separate target because it writes 5GB;
 its section above says what it produced and when.
 
-`.rev` files are ignored. `git pack-objects` writes one beside every pack it
-makes and nothing here looks at it, so the reverse mapping from offset to
-object is recomputed by sorting instead of read.
+`.rev` files are ignored in both directions. `git pack-objects` writes one
+beside every pack it makes and nothing here looks at it, so the reverse
+mapping from offset to object is recomputed by sorting instead of read, and
+`gitobj pack` does not write one.
 
 `gitobj mktree` is narrower than `git mktree` in three ways, all of them
 things git does by looking in the object store, which it does not do. It
@@ -752,12 +873,14 @@ empty entry name. The suite asserts both halves of that -- we refuse, and
 git's own fsck objects to what git produced -- because a refusal with no
 outside authority behind it is just an opinion.
 
-A tree is the only object gitobj constructs. There is no commit or tag
-builder and no packfile writing: no delta search, no `.idx` generation, and
-so no `git verify-pack` over output of our own, which is the one item of
-`PLAN.md`'s Milestone 1 that would close the loop on the delta encoders.
-Unpacking a pack into loose objects does work, and has its own section
-above.
+A tree is the only object gitobj constructs out of anything but bytes handed
+to it: there is no commit or tag builder. Packs are written now and have
+their own section above, with three things they cannot do. Every object goes
+into memory inflated before the search starts, so packing a repository larger
+than memory is out, and with it the 64-bit offset, which needs a pack over
+two gigabytes. REF_DELTA is read and never written, since OFS_DELTA is
+shorter and `git gc` writes that. There is no `--stdout`, no thin pack and no
+`.rev` file beside what we write.
 
 Those paragraphs used to be one line saying the whole thing was read-only,
 which it was until the writer landed. `PLAN.md` had listed `write` and
@@ -781,9 +904,10 @@ and git has not written one since 2007.
 Not fast. Every object is inflated from scratch, a delta is re-applied for
 every object on its chain whose base has fallen out of the cache, and a
 command that wants one object opens every pack in the store. `make test`
-takes 43 seconds, where it took 10 before it read any packs; most of that is
+takes 57 seconds, where it took 10 before it read any packs; most of that is
 processes rather than work, at six of them per object over the 1498 the
-per-object sweep covers.
+per-object sweep covers. Writing is not the slow part: 538 objects of
+`../cc` pack in 4.1 seconds with a window of 10, in 42MB.
 
 ## Why this file exists
 
@@ -791,7 +915,7 @@ The house convention here is that every repo has a `README.md` stating what
 does *not* work, and this repo did not have one. `gitobj.c`'s header comment
 pointed at it (`See README.md`), and so did a comment in `t/run.sh` pointing
 at a "section 9" that did not exist either: the file stopped at section 5.
-It stops at 13 now, and section 9 is the pack walk that comment was pointing
+It stops at 14 now, and section 9 is the pack walk that comment was pointing
 at, written eight commits after the pointer to it. Those two pointers and
 the `PLAN.md` prose were the only places the pack gap was acknowledged, and
 all three described it as finished.

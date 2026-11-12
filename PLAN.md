@@ -23,6 +23,7 @@ gitobj idxcrc <pack.idx>               every CRC against the pack beside it
 gitobj packls <pack.idx>               `git verify-pack -v` layout
 gitobj packverify <pack.idx>           hash every packed object against its name
 gitobj unpack <pack.idx> <objdir>      every object of a pack, written loose
+gitobj pack   <objdir> <out> <window>  names on stdin, write out.pack+out.idx
 ```
 
 Every `<sha>` above is a full 40-character name or four or more hex
@@ -31,9 +32,10 @@ matches two objects.
 
 `packls` is not `idx` under another name. Its columns are the pack entry's
 type, its inflated size and its size in the pack, and the first two come out
-of the pack rather than the index. It reads entries stored whole and stops at
-the first delta, so over a pack git chose the layout for it reports the first
-few dozen objects and then refuses. Nothing else is planned and absent from
+of the pack rather than the index. It reads the delta chains too, so over a
+pack git chose the layout for it prints every object; that sentence used to
+say it stopped at the first delta, which it did until the delta reader
+landed. Nothing else is planned and absent from
 this list, which it has been wrong about before: `write`, `mktree` and the
 three pack commands were all listed here as though they existed before any
 of them did.
@@ -90,11 +92,10 @@ an audit pointed out there was no pack code in `gitobj.c` at all. The index
 was the first part of it to exist and the walk over entries stored whole is
 the second:
 
-* writing anything but a loose object: no packfile writing, no
-  `unpack-objects`. This said `gitobj` was read-only, which it was until
-  `write` landed, and listed `mktree` among the missing until that landed
-  too. A tree is still the only object `gitobj` constructs: there is no
-  commit or tag builder.
+* a commit or tag builder. A tree is the only object `gitobj` constructs
+  out of anything but bytes handed to it. This bullet said "no packfile
+  writing, no `unpack-objects`" until both landed, and said `gitobj` was
+  read-only until `write` landed.
 
 Exit status: 0 success, 1 refused or not found, 2 the command line was wrong.
 
@@ -123,12 +124,18 @@ object count must agree with the file's own size. The first and the third
 are what a reader can check with no other file open.
 
 The other half of the invariant is that git accepts what we write, and it
-runs three ways now. `gitobj write` re-serialises a loose object, `gitobj
-mktree` builds a tree out of entry lines, and `gitobj unpack` reads a whole
-pack out into loose objects; `git fsck --strict` and `git cat-file -p` read
-all three back, and for the third the comparison is against `git
-unpack-objects`' own store over the same pack. It does not run for pack
-writing, which is still absent.
+runs four ways now. `gitobj write` re-serialises a loose object, `gitobj
+mktree` builds a tree out of entry lines, `gitobj unpack` reads a whole pack
+out into loose objects, and `gitobj pack` writes a packfile and its index;
+`git fsck --strict` and `git cat-file -p` read all four back, for the third
+against `git unpack-objects`' own store over the same pack, and for the
+fourth out of a repository holding nothing but the pack we wrote.
+
+Pack writing has an invariant of its own that is not a hash: `git index-pack
+-o` builds an index from our pack and it must be byte-identical to the index
+we wrote beside it. git re-indexing one of its own packs reproduces that
+pack's `.idx` exactly, so the comparison is about our index rather than
+about how reproducible git's indexer is.
 
 ## Oracle
 
@@ -182,7 +189,15 @@ Ranked, strongest first, by how little of it we control.
 8. `git unpack-objects` over the same pack `gitobj unpack` was given, so
    two loose stores can be compared whole, with `git fsck --strict` over
    ours re-hashing every object we wrote.
-9. ASan + UBSan over the whole suite (`make test-asan`), with both the index
+9. `git index-pack -o` over a pack `gitobj pack` wrote, which is the
+   sharpest of the write oracles: git builds an index from our pack with no
+   sight of ours, and the two files must be the same bytes, so the fanout,
+   the name order, every CRC, every offset and both checksums are git's
+   answer rather than a comparison we are on both sides of. With `git
+   verify-pack` over the pair, `git fsck --strict` over a repository holding
+   nothing but that pack, and `cat-file -p` per object against the store the
+   objects came out of.
+10. ASan + UBSan over the whole suite (`make test-asan`), with both the index
    and the pack trimmed to exactly the bytes read, since `readall()` doubles
    and a buffer bigger than its data turns the sanitizer off. The hostile
    input it most wants is in section 10: eleven hand-built packs that lie
@@ -198,8 +213,12 @@ by hand.
 
 ## Non-goals
 
-* Writing packfiles. No delta compression, no `.idx` generation, no
-  `pack-objects`. Reading them is the interesting half.
+* Thin packs, `--stdout`, and packing a repository larger than memory.
+  `gitobj pack` writes a pack and its index, with a delta search of its own,
+  and holds every object it is given inflated at once while it does it.
+  Writing REF_DELTA is a non-goal as well: it is read, and there is no
+  reason to emit it when OFS_DELTA is shorter and git's own `gc` writes
+  that.
 * SHA-256 repositories. `extensions.objectFormat = sha256` is refused.
   Everything here assumes 20-byte names.
 * Reachability. No ref parsing, none of `rev-parse`'s revision syntax, no
@@ -864,10 +883,70 @@ by hand.
       work rather than the result.
       found: git complains about an alternate it cannot use and carries on,
       which is an assertion here rather than a line of noise in the output.
-- [ ] write packfiles: delta search, `.idx` generation, `verify-pack` on our
+- [x] write packfiles: delta search, `.idx` generation, `verify-pack` on our
       own output
       why: the one direction of the format that is entirely unimplemented,
       and the only way to close the loop on the delta encoders.
+      files: gitobj.c (pwr_hdr, pwr_ofs, pwr_dsize, pwr_ins, pwr_copy,
+      delta_make, Pent, pentcmp, pidcmp, filewrite, pack_write, and the
+      `pack` command), t/run.sh section 14, README.md
+      proves: `git index-pack -o` builds an index from our pack and it is
+      byte-identical to the one we wrote beside it, which is the fanout, the
+      name order, every CRC, every offset, the copy of the pack checksum and
+      the index's own, all of them git's answer with no sight of ours. git
+      re-indexing one of its OWN packs reproduces that pack's `.idx` exactly,
+      which is what makes the comparison a test of our index rather than a
+      statement about git's indexer. Then `git verify-pack` over the pair,
+      the reader's whole `verify-pack -v` comparison turned on our own
+      output, `git fsck --strict` over a bare repository holding nothing but
+      our pack, and `cat-file -p` per object against the store the objects
+      came out of. Four packs: the delta corpus at window 0 and at window
+      10, the self corpus, and one holding a single tag.
+      19545 assertions before, 20443 after; 5884 to 6737 cloned alone.
+      found: the delta search had to be made deterministic before anything
+      could be asserted about it, which is the same reason every fixture
+      here passes `--threads=1` to `pack-objects`. Objects are ordered by
+      type, then size descending, then name; each is compared against up to
+      `window` already-placed entries of the same type and the smallest
+      delta kept. Two runs give the same pack bytes, and so does the same
+      list of names reversed, which is a separate assertion: a writer that
+      echoed its input order would pass the first and fail the second.
+      found: our pack of the delta corpus is 56049 bytes against git's
+      59854 and 201746 stored whole, and on `../cc`'s 538 objects 2857651
+      against git's 3298397. That is not the delta search being better. It
+      is the DEFLATE encoder vendored from `../inflate` doing the work
+      `gzip -6` does where git packs at zlib level 6, the same difference
+      that makes a loose object 1059 bytes here and 2041 from git.
+      found: the writer census is the vacuity guard and the first version of
+      it was decoration. It counted a copy instruction of length 0x10000
+      rather than one emitted with its length left IMPLICIT, so the mutant
+      that writes the three length bytes out in full survived a whole sweep
+      with the census still reporting 33 of them. Counted off the
+      instruction byte now, and that mutant dies.
+      found: ten planted defects, nine red. The fanout counting names
+      strictly below its bucket fails 412, the OFS_DELTA varint without its
+      minus one fails 129 (git cannot even index the file), a delta entry
+      header carrying the target size rather than the delta size fails 129,
+      the index written in pack order fails 337, the pack trailer taken over
+      all but the last byte fails 33, the CRC over the compressed bytes
+      alone fails 12, no depth limit fails 1 on a chain of 39, the implicit
+      copy length written out in full fails 1, and packing in the order the
+      names arrived fails 1.
+      found: that last one only after the assertion was tightened. "The
+      delta pack is smaller than the whole pack" is satisfied by packing in
+      name order, which still finds 79 deltas and still comes to 97k against
+      202k stored whole. Under a THIRD is what the ordering has to earn, and
+      52k against 202k clears it with room.
+      survivor: extending a match backwards into the literal run not yet
+      emitted. It is worth 175 bytes of 51734 on the suite's corpus, which
+      no bound that is not a golden number can see, and 5.2 per cent on
+      `../cc`'s 538 objects, which a standalone clone does not have. The
+      fixture is the thing that cannot see it rather than the suite.
+      found: no 64-bit offset is reachable. The escape at 2^31 is written
+      and the census reports 0 of N through it every run, because a pack
+      that needs one is over two gigabytes and this writer holds every
+      object inflated at once. `make bigpack` builds such a pack with git
+      and reads its index; it cannot be rebuilt with `gitobj pack`.
 - [ ] SHA-256 repositories
       why: the format is otherwise identical and the work is mostly
       mechanical, but it needs a corpus built with
@@ -879,3 +958,12 @@ by hand.
       index's two 20-byte checksums and the pack's trailer are the same
       constant wearing a different hat. A count in a `why:` goes stale like
       any other; re-grep it rather than quoting this.
+- [ ] a 64-bit offset in an index we wrote
+      why: the only part of `gitobj pack` nothing exercises. The escape is
+      written, and the writer's census says 0 of N through the table on
+      every run, which is the shape of a branch that is never taken. The
+      pack that would take it is over two gigabytes and `gitobj pack` holds
+      every object inflated at once, so this needs the writer to stream
+      before it needs a fixture. The reader's side of the same gap is
+      covered by indexes the suite rewrites and by `make bigpack`, and
+      neither of those helps here.

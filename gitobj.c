@@ -1,5 +1,5 @@
 /* gitobj. git's object database: reads loose objects and pack indexes,
- * writes loose objects, in one C11 file.
+ * writes loose objects and packfiles, in one C11 file.
  *
  * The four object types, a packfile's v2 index, and the objects behind it,
  * through delta chains of either encoding and any depth. NOT a pack over two
@@ -2468,6 +2468,401 @@ static void obj_read(const char *objdir, const char *hex, Obj *out) {
 }
 
 
+/* ================================================ writing a packfile ==
+ *
+ * The one direction of the format nothing here could do. Everything it
+ * needs is already in the file: zdeflate for the streams, SHA-1 for the
+ * trailer and the index's two checksums, crc32z for the per-object CRC the
+ * index carries, and the readers above to say what the bytes mean.
+ *
+ * git is the oracle twice over, and the second one is the sharper. `git
+ * verify-pack -v` reads the pack we wrote, and `git index-pack -o` builds
+ * an index FROM our pack which must come out byte-identical to the index we
+ * wrote beside it. Nothing of ours is on the other side of that comparison:
+ * the fanout, the name order, every CRC, every offset and both checksums
+ * are git's own answer to the same question.
+ */
+
+/* The entry header varint, the inverse of pack_entry_hdr(): type in bits
+ * 6-4 of the first byte, four bits of size under it, seven bits per byte
+ * after that, low group first. */
+static void pwr_hdr(Buf *b, int type, size_t n) {
+	unsigned c = (unsigned)(type << 4) | (unsigned)(n & 15);
+	n >>= 4;
+	while (n) {
+		bput(b, c | 0x80);
+		c = (unsigned)(n & 0x7f);
+		n >>= 7;
+	}
+	bput(b, c);
+}
+
+/* The OFS_DELTA distance, the inverse of pack_ofs_delta(). Each
+ * continuation subtracts one before shifting down, which is what makes the
+ * encoding the one the reader's `(v + 1) << 7` undoes. Written backwards
+ * into a scratch array because the groups go out most-significant first,
+ * which is the opposite of every other varint in the format. */
+static void pwr_ofs(Buf *b, uint64_t d) {
+	uint8_t g[10];
+	int i = 0;
+	g[i++] = (uint8_t)(d & 0x7f);
+	while (d >>= 7) {
+		d--;
+		g[i++] = (uint8_t)(0x80 | (d & 0x7f));
+	}
+	while (i) bput(b, g[--i]);
+}
+
+/* The plain 7-bit little-endian varint of the delta header's two sizes. */
+static void pwr_dsize(Buf *b, size_t v) {
+	while (v >= 0x80) {
+		bput(b, (unsigned)(0x80 | (v & 0x7f)));
+		v >>= 7;
+	}
+	bput(b, (unsigned)v);
+}
+
+/* Which forms the encoder actually emitted, counted because the alternative
+ * is assuming. A copy offset that never needs a third byte and a copy length
+ * that never hits the implicit 0x10000 are two lines of the encoder with
+ * nothing over them, and both are reachable only over a base big enough:
+ * that is the same hole the reader had, where taking the absent length as 0
+ * instead of 0x10000 was a mutation no fixture could kill until the corpus
+ * grew a 20,000-line file.
+ *
+ * Statics because one run writes one pack. pack_write() clears them. */
+static size_t wr_copy, wr_ins, wr_copy64k, wr_offw;
+
+/* A literal run. 127 bytes is the whole range of the insert instruction,
+ * the length being the instruction byte itself. */
+static void pwr_ins(Buf *o, const uint8_t *p, size_t n) {
+	while (n) {
+		size_t k = n > 127 ? 127 : n;
+		bput(o, (unsigned)k);
+		bwrite(o, p, k);
+		p += k;
+		n -= k;
+		wr_ins++;
+	}
+}
+
+/* A copy instruction, or several: the length field is three bytes, so a run
+ * longer than 0x10000 goes out in pieces. An absent byte reads as zero,
+ * which is why only the nonzero bytes are emitted, and a length of exactly
+ * 0x10000 goes out with NO length byte at all. That last is deliberate: it
+ * is the one implicit value the reader supplies, delta_apply()'s `if (!len)
+ * len = 0x10000`, and emitting it is what puts that line of the reader
+ * under our own encoder as well as under git's. */
+static void pwr_copy(Buf *o, size_t off, size_t len) {
+	while (len) {
+		size_t k = len > 0x10000 ? 0x10000 : len;
+		uint8_t by[7];
+		unsigned c = 0x80;
+		int nb = 0;
+		for (int i = 0; i < 4; i++) {
+			unsigned v = (unsigned)((off >> (8 * i)) & 0xff);
+			if (v) { c |= 1u << i; by[nb++] = (uint8_t)v; }
+		}
+		if (k != 0x10000)
+			for (int i = 0; i < 3; i++) {
+				unsigned v = (unsigned)((k >> (8 * i)) & 0xff);
+				if (v) { c |= 0x10u << i; by[nb++] = (uint8_t)v; }
+			}
+		bput(o, c);
+		bwrite(o, by, (size_t)nb);
+		wr_copy++;
+		/* Counted off the instruction byte rather than off k, which is the
+		 * difference between observing what went out and restating what we
+		 * meant to send. Counting `k == 0x10000` instead leaves the census
+		 * saying the implicit length was used by a build that writes the
+		 * three bytes out in full, and that mutant survived a whole sweep. */
+		if (!(c & 0x70)) wr_copy64k++;
+		{
+			size_t w = 0;
+			for (int i = 0; i < 4; i++) if (c & (1u << i)) w = (size_t)i + 1;
+			if (w > wr_offw) wr_offw = w;
+		}
+		off += k;
+		len -= k;
+	}
+}
+
+/* Blocks of the base are indexed at every DELTA_BLK bytes, so a copy can
+ * only start at a multiple of it and the up-to-15 bytes before a match go
+ * out as literals unless the backwards extension below reclaims them. */
+#define DELTA_BLK 16
+/* shortcut: a bucket is walked no further than this, so a base with many
+ * identical blocks silently gets a worse delta rather than a slower search.
+ * The result is still correct, since every candidate is verified by
+ * comparison. Raise it, or hash more than eight bytes, if the ratio ever
+ * matters more than the time. */
+#define DELTA_CAND 64
+
+static uint32_t dhash8(const uint8_t *p) {
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) v = v << 8 | p[i];
+	v *= 0x9e3779b97f4a7c15ull;
+	return (uint32_t)(v >> 40);
+}
+
+/* Build a delta that turns b into t, appended to out, which must be empty.
+ *
+ * Deterministic, which is the property that makes a test possible at all:
+ * git's own delta search is threaded and gave 76 delta entries one run and
+ * 75 the next over the same objects, which is why every fixture here passes
+ * `--threads=1`. This walks the candidates for one target position in one
+ * fixed order and takes the longest, nearest match. Same objects, same
+ * window, same bytes, every time.
+ *
+ * It is not trying to be git's encoder and the pack it writes is bigger
+ * than git's. What it has to be is correct: the result of applying it is
+ * compared against the object it was built from, by git.
+ */
+static void delta_make(const uint8_t *b, size_t bn,
+                       const uint8_t *t, size_t tn, Buf *out) {
+	pwr_dsize(out, bn);
+	pwr_dsize(out, tn);
+
+	/* A block needs eight bytes to hash, so a base shorter than that
+	 * indexes nothing and the whole target goes out as literals. */
+	size_t nblk = bn >= 8 ? (bn - 8) / DELTA_BLK + 1 : 0;
+	uint32_t hsz = 256;
+	while (hsz < nblk && hsz < (1u << 22)) hsz <<= 1;
+	int32_t *head = malloc((size_t)hsz * sizeof *head);
+	int32_t *next = malloc((nblk ? nblk : 1) * sizeof *next);
+	if (!head || !next) die("out of memory");
+	for (uint32_t i = 0; i < hsz; i++) head[i] = -1;
+	/* Ascending, so each bucket lists its positions descending and the
+	 * nearest block to the end of the base is tried first. */
+	for (size_t k = 0; k < nblk; k++) {
+		uint32_t h = dhash8(b + k * DELTA_BLK) & (hsz - 1);
+		next[k] = head[h];
+		head[h] = (int32_t)k;
+	}
+
+	size_t lit = 0, p = 0;
+	while (p < tn) {
+		size_t bestlen = 0, bestoff = 0;
+		if (tn - p >= 8 && nblk) {
+			uint32_t h = dhash8(t + p) & (hsz - 1);
+			int cand = 0;
+			for (int32_t k = head[h]; k >= 0 && cand < DELTA_CAND;
+			     k = next[k], cand++) {
+				size_t bp = (size_t)k * DELTA_BLK;
+				size_t max = tn - p < bn - bp ? tn - p : bn - bp;
+				size_t m = 0;
+				while (m < max && b[bp + m] == t[p + m]) m++;
+				if (m > bestlen) { bestlen = m; bestoff = bp; }
+			}
+		}
+		if (bestlen < DELTA_BLK) { p++; continue; }
+		/* Backwards, into the literals not yet emitted: the index can only
+		 * offer a match starting on a block boundary, and without this
+		 * every copy pays for up to fifteen literal bytes in front of it. */
+		size_t off = bestoff, q = p, len = bestlen;
+		while (off && q > lit && b[off - 1] == t[q - 1]) { off--; q--; len++; }
+		pwr_ins(out, t + lit, q - lit);
+		pwr_copy(out, off, len);
+		p = q + len;
+		lit = p;
+	}
+	pwr_ins(out, t + lit, tn - lit);
+	free(head);
+	free(next);
+}
+
+/* One object on its way into a pack.
+ *
+ * shortcut: every object is held inflated at once, so writing a pack costs
+ * the size of everything in it plus the compressed copy. That is the same
+ * ceiling readall() already imposes on reading one (see the README on the
+ * 2.5GB pack), and closing it means streaming the objects twice: once for
+ * the delta search and once to write. */
+typedef struct {
+	char hex[41];
+	uint8_t id[20];
+	int type;
+	Buf data;
+	uint64_t off;     /* where this entry starts in the pack */
+	uint32_t crc;     /* over the entry's bytes, which is what the index holds */
+	size_t base;      /* index of the base, when depth > 0 */
+	int depth;        /* 0 stored whole */
+} Pent;
+
+/* Pack order: type, then size descending, then name. Ours, not git's, which
+ * sorts by a hash of the path an object was found at and has no path here.
+ * What matters is that it is total and does not depend on the order the
+ * names arrived in, since an object can only delta against one already
+ * written and that makes the order part of the output. */
+static int pentcmp(const void *va, const void *vb) {
+	const Pent *a = va, *b = vb;
+	if (a->type != b->type) return a->type < b->type ? -1 : 1;
+	if (a->data.n != b->data.n) return a->data.n > b->data.n ? -1 : 1;
+	return memcmp(a->id, b->id, 20);
+}
+
+static int pidcmp(const void *va, const void *vb) {
+	return memcmp(((const Pent *)va)->id, ((const Pent *)vb)->id, 20);
+}
+
+static void filewrite(const char *path, const void *p, size_t n) {
+	FILE *f = fopen(path, "wb");
+	if (!f) die2("cannot create", path);
+	int bad = n && fwrite(p, 1, n, f) != n;
+	if (fclose(f) || bad) die2("write error", path);
+}
+
+/* The 32-bit offset table escapes to a 64-bit one for anything at or above
+ * 2^31, which is the same boundary idx_offset() reads back. */
+#define IDX_BIG 0x80000000ull
+
+/* Write <base>.pack and <base>.idx holding exactly these objects. Returns
+ * the pack's trailing checksum in id. */
+static void pack_write(Pent *v, size_t n, int window, int maxdepth,
+                       const char *base, uint8_t id[20]) {
+	wr_copy = wr_ins = wr_copy64k = wr_offw = 0;
+	qsort(v, n, sizeof *v, pentcmp);
+
+	Buf pk = {0};
+	uint8_t hdr[12] = {'P', 'A', 'C', 'K', 0, 0, 0, 2};
+	hdr[8] = (uint8_t)(n >> 24); hdr[9] = (uint8_t)(n >> 16);
+	hdr[10] = (uint8_t)(n >> 8); hdr[11] = (uint8_t)n;
+	bwrite(&pk, hdr, 12);
+
+	size_t ndelta = 0, deepest = 0;
+	for (size_t i = 0; i < n; i++) {
+		v[i].off = pk.n;
+		v[i].depth = 0;
+
+		/* The search. Back over the already-written entries of the same
+		 * type, no further than the window, keeping the smallest delta.
+		 * A base is only a candidate once it is placed, so its offset is
+		 * known and strictly smaller: an OFS_DELTA chain in what we write
+		 * cannot loop, by construction. */
+		Buf best = {0};
+		size_t bestj = 0;
+		for (int w = 0, j = (int)i - 1; w < window && j >= 0; j--) {
+			if (v[j].type != v[i].type) continue;
+			w++;
+			if (v[j].depth >= maxdepth) continue;
+			Buf d = {0};
+			delta_make(v[j].data.p, v[j].data.n, v[i].data.p, v[i].data.n, &d);
+			/* Worth it only if the delta is smaller than the object by more
+			 * than the entry's own overhead, and only compared against the
+			 * object: comparing two compressed sizes would mean deflating
+			 * every candidate. */
+			if (d.n + 20 < v[i].data.n && (!best.n || d.n < best.n)) {
+				bfree(&best);
+				best = d;
+				bestj = (size_t)j;
+			} else {
+				bfree(&d);
+			}
+		}
+
+		Buf z = {0};
+		if (best.n) {
+			v[i].base = bestj;
+			v[i].depth = v[bestj].depth + 1;
+			if ((size_t)v[i].depth > deepest) deepest = (size_t)v[i].depth;
+			ndelta++;
+			pwr_hdr(&pk, T_OFS_DELTA, best.n);
+			pwr_ofs(&pk, v[i].off - v[bestj].off);
+			zdeflate(best.p, best.n, &z);
+			bfree(&best);
+		} else {
+			pwr_hdr(&pk, v[i].type, v[i].data.n);
+			zdeflate(v[i].data.p, v[i].data.n, &z);
+		}
+		bwrite(&pk, z.p, z.n);
+		bfree(&z);
+		/* The CRC the index carries is over the entry as it sits in the
+		 * pack: the header, the base offset if there is one, and the
+		 * compressed bytes. */
+		v[i].crc = crc32z(pk.p + v[i].off, pk.n - v[i].off);
+	}
+
+	Sha1 s;
+	sha1_init(&s);
+	sha1_update(&s, pk.p, pk.n);
+	sha1_final(&s, id);
+	bwrite(&pk, id, 20);
+
+	/* The index is in name order, which is a different order from the
+	 * pack's, so the offsets it carries are not sorted. */
+	Pent *byid = malloc(n * sizeof *byid);
+	if (!byid) die("out of memory");
+	memcpy(byid, v, n * sizeof *byid);
+	qsort(byid, n, sizeof *byid, pidcmp);
+
+	size_t nbig = 0;
+	for (size_t i = 0; i < n; i++) if (byid[i].off >= IDX_BIG) nbig++;
+
+	Buf ix = {0};
+	uint8_t magic[8] = {0xff, 0x74, 0x4f, 0x63, 0, 0, 0, 2};
+	bwrite(&ix, magic, 8);
+	/* The fanout is cumulative: entry k is how many names have a first
+	 * byte <= k, so a reader gets a half-open range from k-1 and k. */
+	size_t at = 0;
+	for (int k = 0; k < 256; k++) {
+		while (at < n && byid[at].id[0] <= (unsigned)k) at++;
+		uint8_t b4[4] = {(uint8_t)(at >> 24), (uint8_t)(at >> 16),
+		                 (uint8_t)(at >> 8), (uint8_t)at};
+		bwrite(&ix, b4, 4);
+	}
+	for (size_t i = 0; i < n; i++) bwrite(&ix, byid[i].id, 20);
+	for (size_t i = 0; i < n; i++) {
+		uint32_t c = byid[i].crc;
+		uint8_t b4[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16),
+		                 (uint8_t)(c >> 8), (uint8_t)c};
+		bwrite(&ix, b4, 4);
+	}
+	size_t big = 0;
+	for (size_t i = 0; i < n; i++) {
+		uint32_t w;
+		if (byid[i].off >= IDX_BIG) w = 0x80000000u | (uint32_t)big++;
+		else w = (uint32_t)byid[i].off;
+		uint8_t b4[4] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16),
+		                 (uint8_t)(w >> 8), (uint8_t)w};
+		bwrite(&ix, b4, 4);
+	}
+	for (size_t i = 0; i < n; i++) {
+		if (byid[i].off < IDX_BIG) continue;
+		uint64_t o = byid[i].off;
+		uint8_t b8[8];
+		for (int k = 0; k < 8; k++) b8[k] = (uint8_t)(o >> (8 * (7 - k)));
+		bwrite(&ix, b8, 8);
+	}
+	bwrite(&ix, id, 20);
+	uint8_t ixid[20];
+	sha1_init(&s);
+	sha1_update(&s, ix.p, ix.n);
+	sha1_final(&s, ixid);
+	bwrite(&ix, ixid, 20);
+
+	char path[4096];
+	if ((size_t)snprintf(path, sizeof path, "%s.pack", base) >= sizeof path)
+		die("pack path too long");
+	filewrite(path, pk.p, pk.n);
+	snprintf(path, sizeof path, "%s.idx", base);
+	filewrite(path, ix.p, ix.n);
+
+	/* The census is the vacuity guard, same as the reader's. A delta search
+	 * that found nothing writes a perfectly valid pack, and every
+	 * assertion about our deltas would pass over it. */
+	fprintf(stderr, "%zu objects, %zu stored whole, %zu as ofs-delta, "
+	        "deepest chain %zu, %zu pack bytes, %zu idx bytes, "
+	        "%zu of %zu offsets via the 64-bit table, "
+	        "%zu copy and %zu insert instructions, %zu with the length left "
+	        "implicit, "
+	        "widest copy offset %zu byte%s\n",
+	        n, n - ndelta, ndelta, deepest, pk.n, ix.n, nbig, n,
+	        wr_copy, wr_ins, wr_copy64k, wr_offw, wr_offw == 1 ? "" : "s");
+	bfree(&pk);
+	bfree(&ix);
+	free(byid);
+}
+
 /* ------------------------------------------------------------------ main */
 
 static int usage(void) {
@@ -2482,6 +2877,7 @@ static int usage(void) {
 	      "       gitobj packls <pack.idx>\n"
 	      "       gitobj packverify <pack.idx>\n"
 	      "       gitobj unpack <pack.idx> <objdir>\n"
+	      "       gitobj pack <objdir> <outbase> <window> < names\n"
 	      "       gitobj hdr <objdir> <sha> <key>\n"
 	      "       gitobj msg <objdir> <sha>\n", stderr);
 	return 2;
@@ -2687,6 +3083,77 @@ int main(int argc, char **argv) {
 		}
 		pack_census(&p);
 		pack_close(&p);
+		return 0;
+	}
+
+	/* The other direction: a pack of our own, from a list of names on
+	 * stdin, the way `git pack-objects` takes one. <outbase>.pack and
+	 * <outbase>.idx are written and the pack's checksum is printed, which
+	 * is the name git would file it under.
+	 *
+	 * The window is on the command line rather than defaulted because the
+	 * two settings are two different claims: 0 writes every object whole
+	 * and tests the entry header and the index alone, and anything else
+	 * brings the delta encoder in. A fixture built with the wrong one of
+	 * those quietly tests the other, which is exactly how the OFS_DELTA
+	 * corpus here came to be REF_DELTA for a while. */
+	if (!strcmp(cmd, "pack") && argc == 5) {
+		char *end;
+		long window = strtol(argv[4], &end, 10);
+		if (*end || window < 0 || window > 4096) die2("bad window", argv[4]);
+		Odb db;
+		odb_open(argv[2], &db);
+		Buf in = {0};
+		readall(NULL, &in);
+		Pent *v = NULL;
+		size_t n = 0, cap = 0, at = 0;
+		while (at < in.n) {
+			const uint8_t *nl = memchr(in.p + at, '\n', in.n - at);
+			size_t len = nl ? (size_t)(nl - in.p) - at : in.n - at;
+			while (len && (in.p[at + len - 1] == '\r' || in.p[at + len - 1] == ' '))
+				len--;
+			if (len) {
+				char want[64];
+				if (len >= sizeof want) die("object name is too long");
+				memcpy(want, in.p + at, len);
+				want[len] = 0;
+				name_check(want);
+				if (n == cap) {
+					cap = cap ? cap * 2 : 64;
+					Pent *q = realloc(v, cap * sizeof *v);
+					if (!q) die("out of memory");
+					v = q;
+				}
+				memset(&v[n], 0, sizeof v[n]);
+				name_resolve(&db, want, v[n].hex);
+				Obj o = {0, {0}};
+				if (!obj_get(&db, v[n].hex, &o)) die2("object not found", v[n].hex);
+				if (unhexify(v[n].hex, v[n].id)) die2("bad object name", v[n].hex);
+				v[n].type = o.type;
+				v[n].data = o.data;
+				n++;
+			}
+			at += len + (nl ? 1 : 0);
+		}
+		bfree(&in);
+		/* An empty pack is a legal file and a useless one, and a name
+		 * listed twice would put two entries under one name in the index,
+		 * which no reader expects. Both are refusals rather than things to
+		 * paper over, because both mean the caller's list was not what it
+		 * thought it was. */
+		if (!n) die("nothing to pack");
+		qsort(v, n, sizeof *v, pidcmp);
+		for (size_t i = 1; i < n; i++)
+			if (!memcmp(v[i - 1].id, v[i].id, 20))
+				die2("named twice", v[i].hex);
+		uint8_t id[20];
+		char hex[41];
+		pack_write(v, n, (int)window, 10, argv[3], id);
+		hexify(id, hex);
+		printf("%s\n", hex);
+		for (size_t i = 0; i < n; i++) bfree(&v[i].data);
+		free(v);
+		odb_close(&db);
 		return 0;
 	}
 
